@@ -100,6 +100,19 @@ MAX_NIGHT_TOTAL_HOURS = 11.0
 # enough to be socially feasible.
 DEBT_PAYDOWN_FRACTION = 0.5
 
+# Per-chronotype shift (in hours) applied to the recommended bedtime
+# *and* the implied wake target.  Numbers come from Roenneberg et al.
+# 2007 "Epidemiology of the human circadian clock" — morning types
+# ("larks") prefer to sleep ~1 hour earlier than the population mean,
+# evening types ("owls") ~1 hour later.  Conservative ±45 min keeps
+# the nudge perceptible without dragging late types into a 3-AM
+# bedtime that breaks family schedules.
+_CHRONOTYPE_BEDTIME_SHIFT_H = {
+    "morning": -0.75,   # earlier than the wake_window-anchored default
+    "neutral":  0.0,
+    "evening": +0.75,   # later
+}
+
 
 # ---------------------------------------------------------------------------
 # Data containers
@@ -354,7 +367,18 @@ class SleepDebtTracker:
         wake_target: Optional[datetime] = None
         if wake_window is not None:
             wake_target = self._end_of_window(wake_window, ref=ref)
-            tonight_bedtime = wake_target - timedelta(hours=tonight_target)
+            # Apply chronotype-based bedtime shift.  Morning types go
+            # to bed earlier (negative shift), evening types later.
+            chronotype = getattr(self.profile, "chronotype", "neutral")
+            shift_h = _CHRONOTYPE_BEDTIME_SHIFT_H.get(chronotype, 0.0)
+            tonight_bedtime = (
+                wake_target
+                - timedelta(hours=tonight_target)
+                + timedelta(hours=shift_h)
+            )
+            # Clamp: bedtime cannot be after wake_target (sanity).
+            if tonight_bedtime >= wake_target:
+                tonight_bedtime = wake_target - timedelta(hours=tonight_target)
 
         # Keep the *unrounded* target on the dataclass so callers can do
         # arithmetic against ``wake_target - tonight_bedtime`` without

@@ -104,6 +104,9 @@ class TrainingSet:
 @dataclass
 class TestSet:
     """Test dataset"""
+    # Tell pytest not to try collecting this dataclass — its name happens
+    # to start with "Test" but it has nothing to do with unit tests.
+    __test__ = False
     dataset: Dataset
 
 

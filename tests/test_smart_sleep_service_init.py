@@ -41,7 +41,13 @@ def _write_config(tmp_path: Path, natural: dict) -> Path:
     }
     ha["preference_learner"] = {"enabled": False}
     ha["smart_control"] = {"enabled": True, "dry_run": True}
-    ha["natural_sleep"] = natural
+    # Force the user-profile JSON into tmp_path so successive tests
+    # never inherit each other's posterior or birth_year.
+    natural_with_isolation = dict(natural)
+    natural_with_isolation.setdefault(
+        "profile_path", str(tmp_path / "user_profile.json"),
+    )
+    ha["natural_sleep"] = natural_with_isolation
 
     path = tmp_path / "cfg.json"
     path.write_text(json.dumps(cfg), encoding="utf-8")

@@ -176,3 +176,65 @@ class TestRecoveryPhysiology:
             extra = tracker._invert_recovery(target)
             actual = tracker.effective_debt_reduction(extra)
             assert abs(actual - target) < 0.05
+
+
+# ---------------------------------------------------------------------------
+# Chronotype shifts the bedtime suggestion (Roenneberg 2007)
+# ---------------------------------------------------------------------------
+
+
+class TestChronotypeBedtimeShift:
+    """``UserProfile.chronotype`` must move the recommended bedtime."""
+
+    @staticmethod
+    def _bedtime_for(chronotype: str) -> datetime:
+        profile = UserProfile(birth_year=1995, chronotype=chronotype)
+        tracker = SleepDebtTracker(profile)
+        # Mild debt so bedtime gets computed against an 8-h target.
+        tracker.add_night(_make_night("2026-05-10", slept=7.0, target=8.0))
+        plan = tracker.plan_recovery(
+            wake_window=("07:00", "07:30"),
+            now=datetime(2026, 5, 10, 22, 0),
+        )
+        assert plan.tonight_bedtime is not None
+        return plan.tonight_bedtime
+
+    def test_morning_type_goes_to_bed_earlier_than_neutral(self) -> None:
+        m = self._bedtime_for("morning")
+        n = self._bedtime_for("neutral")
+        delta_min = (n - m).total_seconds() / 60
+        # Morning shift is -0.75 h relative to neutral → m should be
+        # earlier by ~45 min.
+        assert 30 < delta_min < 60
+
+    def test_evening_type_goes_to_bed_later_than_neutral(self) -> None:
+        e = self._bedtime_for("evening")
+        n = self._bedtime_for("neutral")
+        delta_min = (e - n).total_seconds() / 60
+        assert 30 < delta_min < 60
+
+    def test_unknown_chronotype_falls_back_to_neutral(self) -> None:
+        n = self._bedtime_for("neutral")
+        weird = self._bedtime_for("astronaut")   # not in the table
+        assert n == weird
+
+    def test_evening_clamped_when_shift_would_exceed_wake_target(self) -> None:
+        """Pathological case: very small target + +45 min could push bedtime
+        past the wake target.  Sanity clamp must restore monotonicity.
+        """
+        # Profile with a very young cohort would have a high target,
+        # but we monkey-patch the recommendation low to force the edge.
+        profile = UserProfile(birth_year=1995, chronotype="evening")
+        # 0.5 h target = bedtime at wake - 0.5 + 0.75 = wake + 0.25 (bad)
+        tracker = SleepDebtTracker(profile)
+        # Force tonight_target tiny via no debt + override profile method.
+        profile.posterior_mean_hours = 0.5
+        profile.posterior_count = 1000
+        # Tracker should still produce bedtime <= wake_target.
+        plan = tracker.plan_recovery(
+            wake_window=("07:00", "07:30"),
+            now=datetime(2026, 5, 10, 22, 0),
+        )
+        assert plan.tonight_bedtime is not None
+        assert plan.wake_target is not None
+        assert plan.tonight_bedtime < plan.wake_target

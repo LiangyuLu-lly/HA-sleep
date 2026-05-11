@@ -292,8 +292,14 @@ class SmartSleepService:
         # All of these are *optional*: if the user didn't configure the
         # relevant fields we leave the attribute as None and the main
         # loop simply skips the corresponding publish / action.
-        self.profile_store = UserProfileStore(_PROFILE_PATH)
         natural_cfg = ha_cfg.get("natural_sleep", {})
+        # ``profile_path`` is normally the supervisor /data volume; tests
+        # override it to keep their fixtures isolated from each other and
+        # from the host's real ``user_profile.json``.
+        profile_path = Path(
+            natural_cfg.get("profile_path") or _PROFILE_PATH,
+        )
+        self.profile_store = UserProfileStore(profile_path)
         self.profile = self.profile_store.load(
             user_id=natural_cfg.get("user_id", "default"),
         )
