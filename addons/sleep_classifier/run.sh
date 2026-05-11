@@ -76,14 +76,25 @@ api = ha.setdefault("api", {})
 api["base_url"] = "http://supervisor/core"
 api["access_token"] = os.environ.get("SUPERVISOR_TOKEN", "")
 api["verify_ssl"] = False
-api["area_filter"] = """$AREA"""
+api["area_filter"] = """$AREA"""    # _norm() applied below where needed
+
+def _norm(value):
+    """Treat literal ``""`` / ``''`` (which users frequently type into the
+    HA Configuration UI thinking it means *empty*) as a real empty
+    string.  Without this, downstream code mistakes a 2-char ``"\""``
+    for a valid entity_id and tries to subscribe to it.
+    """
+    v = (value or "").strip()
+    if v in ('""', "''"):
+        return ""
+    return v
 
 def csv_to_list(s):
-    return [x.strip() for x in s.split(",") if x.strip()]
+    return [v for v in (_norm(x) for x in s.split(",")) if v]
 
 def one(value):
     """Wrap a single non-empty entity_id in a list, otherwise empty list."""
-    v = (value or "").strip()
+    v = _norm(value)
     return [v] if v else []
 
 hr = csv_to_list("""$HR_KEYWORDS""")

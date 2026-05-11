@@ -180,20 +180,25 @@ schema:
   deadband_brightness_pct: float(0,50)
   log_level: list(debug|info|warning|error)
 
-  heart_rate_source: "match(^(sensor|binary_sensor)\\.[a-zA-Z0-9_]+)?"
-  movement_source: "match(^(sensor|binary_sensor)\\.[a-zA-Z0-9_]+)?"
-  breathing_source: "match(^(sensor|binary_sensor)\\.[a-zA-Z0-9_]+)?"
-  temperature_source: "match(^sensor\\.[a-zA-Z0-9_]+)?"
-  humidity_source: "match(^sensor\\.[a-zA-Z0-9_]+)?"
-  illuminance_source: "match(^sensor\\.[a-zA-Z0-9_]+)?"
+  # NOTE: each entity_id field accepts three forms:
+  #   1. an empty string (length 0) — auto-discovery kicks in
+  #   2. the literal two-character "" — same as empty (we tolerate this
+  #      because users frequently copy the placeholder text verbatim)
+  #   3. a real HA entity_id matching the domain regex below
+  heart_rate_source: 'match(^$|^""$|^(sensor|binary_sensor)\.[a-zA-Z0-9_]+$)?'
+  movement_source: 'match(^$|^""$|^(sensor|binary_sensor)\.[a-zA-Z0-9_]+$)?'
+  breathing_source: 'match(^$|^""$|^(sensor|binary_sensor)\.[a-zA-Z0-9_]+$)?'
+  temperature_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
+  humidity_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
+  illuminance_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
 
   light_targets:
-    - "match(^light\\.[a-zA-Z0-9_]+)"
-  climate_target: "match(^climate\\.[a-zA-Z0-9_]+)?"
-  humidifier_target: "match(^humidifier\\.[a-zA-Z0-9_]+)?"
-  fan_target: "match(^fan\\.[a-zA-Z0-9_]+)?"
+    - 'match(^$|^""$|^light\.[a-zA-Z0-9_]+$)'
+  climate_target: 'match(^$|^""$|^climate\.[a-zA-Z0-9_]+$)?'
+  humidifier_target: 'match(^$|^""$|^humidifier\.[a-zA-Z0-9_]+$)?'
+  fan_target: 'match(^$|^""$|^fan\.[a-zA-Z0-9_]+$)?'
   switch_targets:
-    - "match(^switch\\.[a-zA-Z0-9_]+)"
+    - 'match(^$|^""$|^switch\.[a-zA-Z0-9_]+$)'
 
   heart_rate_keywords:
     - str
@@ -209,15 +214,16 @@ schema:
     - str
 
   # Natural-sleep suite ----------------------------------------------------
+  # Same empty-or-literal-"" tolerance as the slot bindings above.
   birth_year: "int(0,2100)?"
   chronotype: "list(morning|evening|neutral)?"
-  wake_window_start: "match(^([01]?\\d|2[0-3]):[0-5]\\d)?"
-  wake_window_end: "match(^([01]?\\d|2[0-3]):[0-5]\\d)?"
+  wake_window_start: 'match(^$|^""$|^([01]?\d|2[0-3]):[0-5]\d$)?'
+  wake_window_end: 'match(^$|^""$|^([01]?\d|2[0-3]):[0-5]\d$)?'
   wake_light_targets:
-    - "match(^light\\.[a-zA-Z0-9_]+)"
-  whitenoise_target: "match(^media_player\\.[a-zA-Z0-9_]+)?"
+    - 'match(^$|^""$|^light\.[a-zA-Z0-9_]+$)'
+  whitenoise_target: 'match(^$|^""$|^media_player\.[a-zA-Z0-9_]+$)?'
   whitenoise_volume_scale: "float(0,2)?"
   whitenoise_track_overrides:
     - str
-  feedback_entity: "match(^input_number\\.[a-zA-Z0-9_]+)?"
+  feedback_entity: 'match(^$|^""$|^input_number\.[a-zA-Z0-9_]+$)?'
   feedback_scale: "int(2,10)?"
