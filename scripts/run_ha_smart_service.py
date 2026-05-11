@@ -69,11 +69,21 @@ from src.preference_learner import (
     SleepSession,
     compute_quality_score,
 )
+from src.sleep_state_publisher import SleepStatePublisher
 from src.smart_environment_controller import (
     SmartControlConfig,
     SmartEnvironmentController,
 )
 from src.training_pipeline import TrainingPipeline
+
+# Buffer persistence path: ``/data`` is the supervisor-managed volume so the
+# file survives add-on upgrades.  Outside the add-on we fall back to the
+# project root so dev runs work too.
+_BUFFER_DIR = Path("/data") if Path("/data").is_dir() else PROJECT_ROOT
+_BUFFER_PATH = _BUFFER_DIR / "inference_buffer.npz"
+# Don't restore a buffer older than this — stale physiology samples from a
+# previous night would mislead the model worse than a fresh cold-start.
+_BUFFER_MAX_AGE_S = 6 * 3600   # 6 hours
 
 logger = logging.getLogger("smart_service")
 
@@ -116,6 +126,72 @@ class _InferenceEngine:
 
     def buffer_ready(self) -> bool:
         return len(self.hr_buf) >= self._WINDOW and len(self.mv_buf) >= self._WINDOW
+
+    # ------------------------------------------------------------------ #
+    # Persistence: keep buffers warm across add-on restarts.            #
+    # ------------------------------------------------------------------ #
+
+    def save_buffers(self, path: Path) -> None:
+        """Atomically write the rolling buffers to ``path``.
+
+        Saves to ``<path>.tmp`` first then renames, so a crash during the
+        write never leaves a half-written file (which numpy would refuse
+        to load on the next boot).
+        """
+        if not self.hr_buf and not self.mv_buf:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # ``np.savez_compressed`` silently appends ``.npz`` if the
+            # destination doesn't already end in that suffix.  We therefore
+            # write to an explicit ``<path>.tmp`` *file handle* so the suffix
+            # logic doesn't kick in and our atomic rename stays predictable.
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "wb") as fh:
+                np.savez_compressed(
+                    fh,
+                    hr=np.asarray(self.hr_buf, dtype=np.float32),
+                    mv=np.asarray(self.mv_buf, dtype=np.float32),
+                    saved_at=np.float64(time.time()),
+                )
+            tmp.replace(path)
+            logger.info(
+                "inference_buffer saved (hr=%d, mv=%d) → %s",
+                len(self.hr_buf), len(self.mv_buf), path,
+            )
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Could not persist inference buffer: %s", exc)
+
+    def restore_buffers(self, path: Path, max_age_s: float) -> bool:
+        """Best-effort restore from ``path`` if the file is fresh enough.
+
+        Returns True iff samples were actually loaded (used by the service
+        to bypass the WS warm-up if we were already warm pre-restart).
+        """
+        if not path.exists():
+            return False
+        try:
+            data = np.load(path, allow_pickle=False)
+            saved_at = float(data["saved_at"]) if "saved_at" in data else 0.0
+            age = time.time() - saved_at
+            if age > max_age_s:
+                logger.info(
+                    "inference_buffer at %s is %.0fs old (>%.0fs) — ignoring",
+                    path, age, max_age_s,
+                )
+                return False
+            for v in data["hr"][-self._WINDOW :]:
+                self.hr_buf.append(float(v))
+            for v in data["mv"][-self._WINDOW :]:
+                self.mv_buf.append(float(v))
+            logger.info(
+                "inference_buffer restored (hr=%d, mv=%d, age=%.0fs)",
+                len(self.hr_buf), len(self.mv_buf), age,
+            )
+            return True
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Could not restore inference buffer: %s", exc)
+            return False
 
     def infer(self) -> tuple[SleepStage, float]:
         if not self.buffer_ready():
@@ -201,6 +277,10 @@ class SmartSleepService:
         }
         self.last_env = EnvironmentParams()
         self.stop_event = asyncio.Event()
+        # The publisher is created once HA is reachable; until then it stays
+        # ``None`` so dry-run and unit-test paths don't accidentally try to
+        # POST to a non-existent server.
+        self.publisher: Optional[SleepStatePublisher] = None
 
     # ------------------------------------------------------------------ #
     # State change handler                                               #
@@ -266,17 +346,58 @@ class SmartSleepService:
         discovery: DiscoveryResult,
         engine: _InferenceEngine,
     ) -> None:
-        try:
-            async for event in ha.iter_state_changes():
-                self._route_state_change(event, discovery, engine)
+        """Stream state-changed events; reconnect with exponential backoff.
+
+        Previously a single WS error tore down the whole service, which on
+        a flaky home network meant the add-on "randomly stopped" every
+        few hours.  We now treat the WS as a best-effort transport: any
+        recoverable error retries after a sleep that doubles up to 5
+        minutes, with a small uniform jitter to avoid synchronised
+        reconnect storms after a HA restart.
+        """
+        backoff = 1.0
+        max_backoff = 300.0
+        while not self.stop_event.is_set():
+            try:
+                async for event in ha.iter_state_changes():
+                    self._route_state_change(event, discovery, engine)
+                    if self.stop_event.is_set():
+                        break
+                    backoff = 1.0   # any successful event resets backoff
                 if self.stop_event.is_set():
-                    break
-        except asyncio.CancelledError:
-            logger.info("WebSocket task cancelled")
-            raise
-        except Exception as exc:    # noqa: BLE001
-            logger.exception("WebSocket task crashed: %s", exc)
-            self.stop_event.set()
+                    return
+                # iter_state_changes returned cleanly but stop_event isn't
+                # set — HA closed the WS.  Try to reconnect.
+                logger.warning("HA WebSocket closed gracefully — reconnecting")
+            except asyncio.CancelledError:
+                logger.info("WebSocket task cancelled")
+                raise
+            except (HAAuthError, HAAPIError) as exc:
+                # Auth errors won't fix themselves; give up loudly.
+                logger.error("WebSocket auth/API error: %s — stopping service", exc)
+                self.stop_event.set()
+                return
+            except Exception as exc:    # noqa: BLE001
+                logger.warning(
+                    "WebSocket transport error (%s); reconnecting in %.1fs",
+                    exc, backoff,
+                )
+            # Sleep with jitter, but bail out fast if a shutdown signal lands.
+            jitter = backoff * 0.2
+            try:
+                await asyncio.wait_for(
+                    self.stop_event.wait(),
+                    timeout=backoff + (jitter * (np.random.random() - 0.5) * 2.0),
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(max_backoff, backoff * 2.0)
+            try:
+                await ha.connect_websocket()
+                await ha.subscribe_state_changes()
+            except Exception as exc:    # noqa: BLE001
+                logger.warning("Reconnect attempt failed: %s", exc)
 
     async def _task_inference_loop(
         self,
@@ -295,6 +416,35 @@ class SmartSleepService:
                 actions = await controller.apply(stage, self.last_env)
                 if actions:
                     logger.info("  → %d HA action(s) planned", len(actions))
+
+                # Mirror diagnostics back to HA so users see the result on
+                # their Lovelace dashboard.  Failures are swallowed inside
+                # the publisher so they never break the inference loop.
+                if self.publisher is not None:
+                    await self.publisher.publish_stage(
+                        stage, conf,
+                        env_temperature_c=self.last_env.temperature_c,
+                        env_humidity_pct=self.last_env.humidity_pct,
+                        env_brightness_pct=self.last_env.brightness_pct,
+                    )
+                    await self.publisher.publish_duration(
+                        time.time() - self.session_started_at,
+                    )
+                    if actions:
+                        first = actions[0]
+                        summary = (
+                            f"{first.get('domain', '?')}."
+                            f"{first.get('service', '?')} → "
+                            f"{first.get('entity_id', '?')}"
+                        )
+                        await self.publisher.publish_last_action(
+                            summary, executed=not self.ctrl_cfg.dry_run,
+                        )
+
+                # Periodic buffer dump so a sudden power loss never wipes
+                # more than ``infer_interval`` seconds of warm-up.
+                engine.save_buffers(_BUFFER_PATH)
+
                 try:
                     await asyncio.wait_for(
                         self.stop_event.wait(),
@@ -356,6 +506,16 @@ class SmartSleepService:
                 "Session %s checkpoint — quality=%.1f (history: %s)",
                 session.session_id, score, self.learner.status(),
             )
+            # Reflect the latest score on the Lovelace card.  We're inside a
+            # sync method here so schedule the coroutine — best-effort.
+            if self.publisher is not None:
+                try:
+                    asyncio.get_event_loop().create_task(
+                        self.publisher.publish_quality(score),
+                    )
+                except RuntimeError:
+                    # No running loop (e.g. last call during shutdown). Skip.
+                    pass
         except Exception as exc:    # noqa: BLE001
             logger.error("Failed to persist session: %s", exc)
 
@@ -411,6 +571,14 @@ class SmartSleepService:
             # Initial environment snapshot
             self._seed_current_env(entities, discovery)
 
+            # Restore any buffer left behind by a previous run.  This
+            # avoids the ~10 minute cold-start window after every add-on
+            # restart — the most common user complaint.
+            engine.restore_buffers(_BUFFER_PATH, max_age_s=_BUFFER_MAX_AGE_S)
+
+            # Diagnostic state publisher — populates HA Lovelace entities.
+            self.publisher = SleepStatePublisher(ha)
+
             await ha.connect_websocket()
             await ha.subscribe_state_changes()
 
@@ -448,6 +616,9 @@ class SmartSleepService:
                         await t
                     except (asyncio.CancelledError, Exception):
                         pass
+                # Save buffer first so even a crash during session persistence
+                # doesn't lose the warm-up samples.
+                engine.save_buffers(_BUFFER_PATH)
                 self._persist_session(controller, partial=False)
         return 0
 

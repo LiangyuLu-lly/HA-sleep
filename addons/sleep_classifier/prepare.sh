@@ -24,26 +24,52 @@ echo "[prepare] target    : $ROOTFS"
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"
 
-copy_dir() {
+# Hard-fails if a critical input is missing; soft-warns on optional ones.
+copy_dir_required() {
     local name="$1"
     if [ -d "$REPO_ROOT/$name" ]; then
         cp -R "$REPO_ROOT/$name" "$ROOTFS/$name"
         echo "[prepare] mirrored $name/"
     else
-        echo "[prepare] WARNING: $name/ not found at repo root"
+        echo "[prepare] ERROR: required directory $name/ not found at $REPO_ROOT/$name" >&2
+        echo "[prepare]        Run this script from a clean repo checkout." >&2
+        exit 1
     fi
 }
 
-copy_dir src
-copy_dir scripts
-copy_dir config
-copy_dir models   # may not exist before training — leaves WARNING but won't fail
+copy_dir_optional() {
+    local name="$1"
+    if [ -d "$REPO_ROOT/$name" ]; then
+        cp -R "$REPO_ROOT/$name" "$ROOTFS/$name"
+        echo "[prepare] mirrored $name/"
+    else
+        echo "[prepare] WARNING: $name/ not found — add-on may use random weights"
+    fi
+}
 
-# The add-on Dockerfile only installs requirements-runtime.txt (no
-# TensorFlow), so we mirror all three files: the runtime list is what
-# pip actually consumes; the train/full lists are kept for developers
-# who SSH into the running container to reproduce training-time errors.
-for req in requirements-runtime.txt requirements-train.txt requirements.txt; do
+# src / scripts / config are baked into the image; without them the
+# Dockerfile's COPY of rootfs/ produces a stub that crashes at startup.
+copy_dir_required src
+copy_dir_required scripts
+copy_dir_required config
+# models/ is optional: the add-on can boot with bootstrap weights and
+# log a clear warning, but a build with no model is still valid for
+# users who train remotely and copy the .h5 in via /share later.
+copy_dir_optional models
+
+# requirements-runtime.txt is the only file the Dockerfile actually
+# pip-installs (no TensorFlow); missing it means a broken image.
+if [ -f "$REPO_ROOT/requirements-runtime.txt" ]; then
+    cp "$REPO_ROOT/requirements-runtime.txt" "$ROOTFS/requirements-runtime.txt"
+    echo "[prepare] copied requirements-runtime.txt"
+else
+    echo "[prepare] ERROR: requirements-runtime.txt missing — the add-on" >&2
+    echo "[prepare]        Dockerfile cannot pip-install without it." >&2
+    exit 1
+fi
+# Train/full lists are nice-to-have for in-container debugging but not
+# strictly required.
+for req in requirements-train.txt requirements.txt; do
     if [ -f "$REPO_ROOT/$req" ]; then
         cp "$REPO_ROOT/$req" "$ROOTFS/$req"
         echo "[prepare] copied $req"

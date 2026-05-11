@@ -303,6 +303,39 @@ class HomeAssistantClient:
         path = f"{self.REST_PREFIX}/services/{domain}/{service}"
         return await self._rest("POST", path, json_body=body)
 
+    async def update_state(
+        self,
+        entity_id: str,
+        state: Any,
+        *,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> HAEntity:
+        """Publish or update an entity's state directly via the REST API.
+
+        Unlike :meth:`call_service`, this does not invoke a domain service —
+        it writes a "virtual" entity that lives only in HA's state machine.
+        The add-on uses this to expose its own diagnostics (sleep stage,
+        confidence, session duration, …) so they appear on Lovelace
+        dashboards without the user having to set up MQTT discovery.
+
+        HA recognises the following payload schema for ``POST /api/states/<id>``:
+
+            {"state": "DEEP", "attributes": {"friendly_name": "Sleep stage", ...}}
+
+        Returns the HAEntity HA echoes back, which now includes the
+        canonical ``last_changed`` / ``last_updated`` timestamps.
+        """
+        body: Dict[str, Any] = {"state": str(state)}
+        if attributes:
+            body["attributes"] = dict(attributes)
+        path = f"{self.REST_PREFIX}/states/{entity_id}"
+        raw = await self._rest("POST", path, json_body=body)
+        if not isinstance(raw, dict):
+            raise HAAPIError(
+                f"Unexpected /api/states/{entity_id} payload (not a dict)"
+            )
+        return HAEntity.from_dict(raw)
+
     # ------------------------------------------------------------------ #
     # WebSocket                                                          #
     # ------------------------------------------------------------------ #

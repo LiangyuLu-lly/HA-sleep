@@ -27,20 +27,49 @@ echo [prepare] target    : %ROOTFS%
 if exist "%ROOTFS%" rmdir /s /q "%ROOTFS%"
 mkdir "%ROOTFS%"
 
-for %%D in (src scripts config models) do (
+:: Critical inputs the Dockerfile relies on -- missing means the add-on
+:: image will be broken at build time, so we want to fail loudly here
+:: rather than 30 minutes later on the Pi.
+for %%D in (src scripts config) do (
+    if exist "%REPO_ROOT%\%%D" (
+        xcopy /e /i /q /y "%REPO_ROOT%\%%D" "%ROOTFS%\%%D" >nul
+        if errorlevel 1 (
+            echo [prepare] ERROR: xcopy failed for %%D\
+            exit /b 2
+        )
+        echo [prepare] mirrored %%D\
+    ) else (
+        echo [prepare] ERROR: required directory %%D\ not found at %REPO_ROOT%\%%D
+        echo [prepare]        Run this script from a clean repo checkout.
+        exit /b 1
+    )
+)
+
+:: Optional inputs -- missing is a soft warning so users without a trained
+:: model can still package the add-on and have it fall back to bootstrap
+:: weights at runtime.
+for %%D in (models) do (
     if exist "%REPO_ROOT%\%%D" (
         xcopy /e /i /q /y "%REPO_ROOT%\%%D" "%ROOTFS%\%%D" >nul
         echo [prepare] mirrored %%D\
     ) else (
-        echo [prepare] WARNING: %%D\ not found at repo root
+        echo [prepare] WARNING: %%D\ not found -- add-on will use random weights
     )
 )
 
-:: The add-on Dockerfile only installs requirements-runtime.txt (no
-:: TensorFlow), so mirror all three files: runtime is what pip actually
-:: consumes; train/full lists are kept for devs who need to reproduce
-:: training-time errors inside the running container.
-for %%R in (requirements-runtime.txt requirements-train.txt requirements.txt) do (
+:: requirements-runtime.txt is the only file the Dockerfile actually
+:: pip-installs (no TensorFlow); missing it would yield a broken image
+:: so we hard-fail.  The train + full lists are nice-to-have for users
+:: who SSH into the running container to reproduce training-time errors.
+if exist "%REPO_ROOT%\requirements-runtime.txt" (
+    copy /y "%REPO_ROOT%\requirements-runtime.txt" "%ROOTFS%\requirements-runtime.txt" >nul
+    echo [prepare] copied requirements-runtime.txt
+) else (
+    echo [prepare] ERROR: requirements-runtime.txt missing -- the add-on Dockerfile
+    echo [prepare]        cannot pip-install without it.
+    exit /b 1
+)
+for %%R in (requirements-train.txt requirements.txt) do (
     if exist "%REPO_ROOT%\%%R" (
         copy /y "%REPO_ROOT%\%%R" "%ROOTFS%\%%R" >nul
         echo [prepare] copied %%R

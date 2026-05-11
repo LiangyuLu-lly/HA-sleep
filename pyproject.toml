@@ -1,0 +1,67 @@
+# Centralised tooling configuration for the Sleep Classifier project.
+#
+# Why this file exists
+# --------------------
+# The repo previously had no pyproject.toml / pytest.ini, so:
+#   * pytest-asyncio could not be auto-discovered, every ``@pytest.mark.asyncio``
+#     test ERRORed with "Unknown pytest.mark.asyncio - is this a typo?";
+#   * 14 tests across test_ha_api_client.py and test_smart_environment_controller.py
+#     were silently broken on every CI run.
+#
+# We use the modern PEP 621 layout but keep dependency lists in
+# requirements*.txt because the HA add-on Dockerfile reads those directly.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sleep-classifier"
+version = "1.1.0"
+description = "CNN-BiLSTM sleep stage classifier with closed-loop HA integration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# ``auto`` means every ``async def`` test function is treated as an asyncio
+# test, so we can drop ``@pytest.mark.asyncio`` everywhere.  ``strict`` keeps
+# legacy mark usage explicit; we choose ``auto`` to avoid relying on a single
+# decorator that was easy to forget.
+asyncio_mode = "auto"
+# Surface unhandled coroutines and resource warnings during local dev.
+filterwarnings = [
+    "ignore::DeprecationWarning:tensorflow.*",
+    "ignore::DeprecationWarning:keras.*",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+# Sane defaults so a bare ``pytest`` doesn't hang on a stuck async test.
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--timeout=60",
+]
+markers = [
+    "slow: marks tests as slow (skip with -m 'not slow')",
+    "integration: end-to-end tests requiring all subsystems",
+]
+
+# ---------------------------------------------------------------------------
+# coverage (opt-in: ``pytest --cov=src``)
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+source = ["src", "scripts"]
+omit = ["src/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

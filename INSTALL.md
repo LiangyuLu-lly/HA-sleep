@@ -89,30 +89,43 @@ git push -u origin main
 
 1. 点 **Sleep Classifier** 卡片 → **INSTALL**
 2. **等待**。第一次 build 在 Pi 4B 上大约 **3–5 分钟**(下载 numpy /
-   scipy / h5py wheel 约 30 MB,piwheels 直接提供 arm64 预编译包)。
-   可以打开 **Log** tab 看进度。
+   scipy / h5py / aiohttp wheel 约 30 MB,piwheels 直接提供 arm64 预编译包,
+   不装 TensorFlow)。可以打开 **Log** tab 看进度。
 3. Build 完成后会看到 **START / STOP / RESTART** 按钮可以点了。
 
 ## 5. 配置 add-on
 
-切到 **Configuration** tab。每个字段都有说明,可改可不改。最重要的是:
+切到 **Configuration** tab。**v1.1.0 默认 `dry_run: true`**,你可以直接
+Save + Start 试跑。最少要改的只有 sensor 槽位:
 
 ```yaml
-area: bedroom                       # 改成你的房间名(area_id)
-infer_interval: 30                  # 30 秒推一次,默认即可
-dry_run: false                      # 第一次先设 true 跑测试!
-controllable_domains:
-  - light
-  - climate
-  - humidifier
-  # 删掉 fan / switch / media_player 如果你不想让它碰这些
+# ---- 选填:留空就走自动发现 + 中文/英文双语关键字扫描 ----
+area: ""                            # 留空 = 扫全 HA;填了用作软过滤
+
+# ---- 强烈建议:把雷达 / 手环 entity_id 直接钉到槽位 ----
+# Developer Tools → States 搜你的设备名,把 entity_id 拷过来
+heart_rate_source: sensor.xiaomi_smart_band_9_pro_heart_rate
+movement_source: sensor.sleepradar_r60abd1_ts5_yundong_zhuangtai
+breathing_source: sensor.sleepradar_r60abd1_ts6_huxi_xinxi
+
+# ---- 你想让 add-on 控的设备 ----
+light_targets:
+  - light.bedroom_main
+  - light.bedroom_bedside
+climate_target: climate.bedroom_ac
+humidifier_target: humidifier.bedroom_humidifier
+
+dry_run: true                       # 第一晚保持 true!确认无误再关
 ```
 
-**强烈建议第一次先 `dry_run: true`**,启动后看 **Log** tab:
+**第一次 `dry_run: true`** 启动后看 **Log** tab:
 
-- 它列出了识别到的传感器(应该有你的手环、温湿度计…)
-- 它列出了识别到的可控设备(应该有你卧室的灯、空调…)
-- 每 30 秒推理一次 + 打印"如果不是 dry_run 我会调用 xxx"
+- 列出识别到的传感器(应有你的手环、雷达、温湿度计…)
+- 列出识别到的可控设备(应有卧室灯、空调…)
+- 每 30 秒推理一次 + 打印"planned"动作(没真发出)
+
+如果 0 命中,日志会**自动列出候选 entity_id**,直接拷到 Configuration
+对应的 `*_source` 槽位就行。
 
 确认无误后改回 `dry_run: false`,RESTART。
 
@@ -122,15 +135,29 @@ controllable_domains:
 * 切到 **Log tab**, 等 30 秒应该看到:
 
   ```text
+  [run.sh] slot bindings active: 5 role(s)
   smart_service | Fetching entity registry from HA …
   smart_service | HA exposes 187 entities
   src.device_discovery | Device discovery — sensor sources
-    heart_rate   → 1 entities: ['sensor.mi_band_5_heart_rate']
-    movement     → 1 entities: ['sensor.bedroom_mmwave_motion']
-  ...
+    heart_rate   → 1 entities: ['sensor.xiaomi_smart_band_9_pro_heart_rate']
+    movement     → 1 entities: ['sensor.sleepradar_r60abd1_ts5_yundong_zhuangtai']
+    breathing    → 1 entities: ['sensor.sleepradar_r60abd1_ts6_huxi_xinxi']
+  smart_service | inference_buffer restored (hr=512, mv=512, age=120s)
   smart_service | infer stage=LIGHT conf=0.91  env(T=22.5 H=48.0)
   smart_service |   → 3 HA action(s) planned
   ```
+
+* 在 HA UI 看睡眠数据:**Developer Tools → States → 搜 sleep_classifier**
+  应能看到 4 个新实体:
+
+  ```text
+  sensor.sleep_classifier_stage              # AWAKE / LIGHT / DEEP / REM
+  sensor.sleep_classifier_confidence         # 0..100 %
+  sensor.sleep_classifier_quality_score      # 最近一次睡眠质量评分
+  sensor.sleep_classifier_session_duration   # 当前会话累计秒数
+  ```
+
+  把它们拖到 Lovelace 卡片(参见下文示例)就能在 dashboard 看睡眠分期实时变化。
 
 * 开 **Settings → Devices & Services → Logbook**, 应该看到本 add-on 调用
   `light.turn_on` / `climate.set_temperature` 等的记录。
@@ -146,12 +173,59 @@ controllable_domains:
 
 ---
 
+## Lovelace 卡片(直接复制粘贴)
+
+在你的 Dashboard 右上角 ⋮ → Edit dashboard → 加卡片 → Manual,
+粘贴下面 YAML:
+
+```yaml
+type: vertical-stack
+cards:
+  - type: glance
+    title: 睡眠监测
+    entities:
+      - entity: sensor.sleep_classifier_stage
+        name: 当前阶段
+      - entity: sensor.sleep_classifier_confidence
+        name: 置信度
+      - entity: sensor.sleep_classifier_quality_score
+        name: 上次评分
+      - entity: sensor.sleep_classifier_session_duration
+        name: 本次时长
+  - type: history-graph
+    title: 整夜睡眠分期
+    hours_to_show: 12
+    entities:
+      - sensor.sleep_classifier_stage
+      - sensor.sleep_classifier_confidence
+```
+
+**进阶**:用 stage 变化触发 automation,例如深睡时静音电视:
+
+```yaml
+alias: "深睡静音电视"
+trigger:
+  - platform: state
+    entity_id: sensor.sleep_classifier_stage
+    to: "DEEP"
+action:
+  - service: media_player.volume_mute
+    target:
+      entity_id: media_player.bedroom_tv
+    data:
+      is_volume_muted: true
+```
+
 ## 长期保养
 
-* **自动重启**: 在 Info tab 打开 **Watchdog** 和 **Auto update** 开关。
-* **看实时日志**: 浏览器留着 Log tab 即可,自动滚动。
-* **升级 add-on**: 当你 push 新版本到 GitHub 并改 `addons/sleep_classifier/config.yaml`
-  的 `version` 字段后,HA 会自动检测更新并在 Info tab 显示 "UPDATE" 按钮。
+- **自动重启**:Info tab 打开 **Watchdog** 和 **Auto update** 开关。
+- **看实时日志**:浏览器留着 Log tab 即可,自动滚动。
+- **升级 add-on**:push 新版本 + 改 `addons/sleep_classifier/config.yaml`
+  的 `version` 字段,HA 会自动检测并在 Info tab 显示 **UPDATE** 按钮。
+- **WS 自动重连**:网络抖动 add-on 自动指数回退重连(1 → 2 → 4 → … → 5 min),
+  不会再因网络问题假死退出。
+- **重启秒恢复**:推理 buffer 持久化到 `/data/inference_buffer.npz`,
+  重启 add-on 不再要等 10 分钟冷启动(只要上次保存 < 6 小时前)。
 
 ---
 
@@ -177,10 +251,35 @@ controllable_domains:
 | Build 卡在 `installing scipy/h5py` | 网络慢或 piwheels 临时不可用 | 等待,或检查 Pi 网络 |
 | Build 失败:`no matching distribution for h5py` | 极少见的非主流 arch | 看 Log 找具体报错,issue 给我 |
 | 启动时 `TENSORFLOW not available — using numpy-based ...` 警告 | 正常,这是预期行为 | 忽略,推理走 numpy 路径,与训练时数值等价 |
-| Start 后立刻 stop | Log 里会有原因,常见是 `No HR/movement sensors` | 加 `explicit_includes` 把你的实体 ID 强制塞进去 |
-| 灯/空调没反应 | dry_run=true,或 deadband 卡住 | 检查 Configuration,看 Log 里"planned" vs "Executed" |
+| Start 后立刻 stop,日志说 `No HR/movement/breathing sensor found` | sensor 没识别到 | 看 Log 末尾的"Suggested entity_ids"列表,把对应 entity_id 拷到 Configuration 的 `*_source` 槽位 |
+| 灯/空调没反应 | dry_run=true,或 deadband 卡住 | 检查 Configuration,看 Log 里"planned" vs "Executed";HA Logbook 也会显示真实调用 |
+| HA UI 看不到 `sensor.sleep_classifier_*` 实体 | 还没出现首次推理 | 等 ~10 分钟(冷启动)或确认 buffer 已恢复;`dry_run` 也会创建实体 |
+| 日志反复 `WebSocket transport error` | HA 或网络抖动 | 自动重连,只要不是 401/403 不用管;持续抖动看 supervisor 日志 |
 
 ---
+
+## 多房间 / 多床位(夫妻房 + 客房)
+
+HA Supervisor 不允许同一 slug 的 add-on 装两份,所以如果你想在两个
+房间同时跑模型,需要在仓库里**复制一份 add-on 目录**:
+
+```bash
+cp -r addons/sleep_classifier addons/sleep_classifier_guest
+# 编辑 addons/sleep_classifier_guest/config.yaml,只改两处:
+#   slug: sleep_classifier_guest
+#   name: Sleep Classifier (Guest)
+# 重跑 prepare:
+addons/sleep_classifier_guest/prepare.sh   # 或 .bat
+git add -A; git commit -m "feat: guest-room instance"; git push
+```
+
+刷新 Add-on Store,你会看到两个 Sleep Classifier 卡片。每个独立 build、
+独立 Configuration tab,独立 `*_source` 槽位 → 互不干扰。
+
+> ⚠️ 两个实例发布的 HA 实体 ID 默认相同
+> (`sensor.sleep_classifier_stage`),会互相覆盖。复制后请编辑
+> `addons/sleep_classifier_guest/rootfs/src/sleep_state_publisher.py`
+> 把 `ENTITY_*` 常量加上 `_guest` 后缀,然后 prepare 一遍。
 
 ## 不想用 Add-on?
 

@@ -1,0 +1,115 @@
+name: Test & Validate
+
+# Why this workflow exists
+# ------------------------
+# Three real failure modes the project has hit during development, each of
+# which now blocks the PR/merge here:
+#
+#   1. Forgotten ``prepare.sh`` run leaves rootfs/ stale, so the add-on
+#      builds against the *previous* version of src/.  See "rootfs sync"
+#      job below — it re-runs prepare in a clean clone and fails if any
+#      diff appears.
+#   2. ``pytest.mark.asyncio`` was silently broken for months because
+#      pytest-asyncio wasn't a dev-dep.  Pinned in requirements-train.txt
+#      now and the unit-tests job below installs it.
+#   3. ``config.yaml`` schema typos surface only when HA Supervisor tries
+#      to load the add-on on a real Pi.  We run the official
+#      home-assistant/actions/helpers add-on linter to catch them at PR
+#      time instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # -------------------------------------------------------------------- #
+  # Unit + integration tests on the matrix of Python versions we support.
+  # -------------------------------------------------------------------- #
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 = Alpine HA base image (production runtime)
+        # 3.12 / 3.13 = developer machines
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-runtime.txt
+            requirements-train.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install runtime deps (numpy/scipy/h5py/PyWavelets/aiohttp) —
+          # these are what production actually uses.
+          pip install -r requirements-runtime.txt
+          # Install dev/test extras separately so we never accidentally
+          # ship TensorFlow into the add-on image.
+          pip install pytest pytest-asyncio pytest-timeout hypothesis
+
+      - name: Run pytest (no TF — numpy fallback path)
+        run: pytest tests/ --timeout=60 -q
+
+  # -------------------------------------------------------------------- #
+  # Catches the #1 gotcha: forgetting to mirror src/ → addons/.../rootfs/
+  # before pushing.  The HA Supervisor would happily build a stale image.
+  # -------------------------------------------------------------------- #
+  rootfs-sync:
+    name: rootfs/ is in sync with src/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run prepare.sh and check for unstaged changes
+        run: |
+          chmod +x addons/sleep_classifier/prepare.sh
+          addons/sleep_classifier/prepare.sh
+          if ! git diff --quiet -- addons/sleep_classifier/rootfs; then
+            echo "::error::rootfs/ is out of sync with the project sources."
+            echo "Run addons/sleep_classifier/prepare.sh locally before pushing."
+            git --no-pager diff --stat -- addons/sleep_classifier/rootfs
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------- #
+  # Add-on metadata validation.  The Supervisor schema lives in the
+  # frenck/action-addon-linter image and parses config.yaml exactly the
+  # way HA does at install time.
+  # -------------------------------------------------------------------- #
+  addon-lint:
+    name: Add-on schema lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate config.yaml
+        uses: frenck/action-addon-linter@v2
+        with:
+          path: ./addons/sleep_classifier
+
+  # -------------------------------------------------------------------- #
+  # Optional: shellcheck on run.sh / prepare.sh.  Catches ``set -e``
+  # bypasses and unquoted variable expansions before they bite on a Pi.
+  # -------------------------------------------------------------------- #
+  shellcheck:
+    name: shellcheck (run.sh, prepare.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: ./addons/sleep_classifier
+          severity: warning
