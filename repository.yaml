@@ -7,5 +7,5 @@
 #
 # Reference: https://developers.home-assistant.io/docs/add-ons/repository
 name: CNN-BiLSTM Sleep Model Add-ons
-url: https://github.com/yourname/sleep-classifier-ha
-maintainer: Sleep Classifier project <maintainer@example.com>
+url: https://github.com/LiangyuLu-lly/HA-sleep
+maintainer: LiangyuLu-lly <liangyulu781@gmail.com>
