@@ -1,0 +1,17 @@
+# Files that should NEVER end up inside the add-on image.
+# Keeps the on-Pi rebuild fast and the image small (~200 MB instead of ~3 GB).
+data/sleep-edf-telemetry/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.git/
+.pytest_cache/
+.idea/
+.vscode/
+venv/
+env/
+notebooks/
+tests/
+docs/
+*.md
+!addons/sleep_classifier/DOCS.md

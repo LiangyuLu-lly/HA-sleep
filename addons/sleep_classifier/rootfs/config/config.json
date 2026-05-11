@@ -1,0 +1,101 @@
+{
+  "data_processing": {
+    "normalization": {
+      "method": "z-score"
+    },
+    "wavelet_denoising": {
+      "wavelet_type": "db5",
+      "decomposition_level": 5
+    },
+    "movement_filter": {
+      "enabled": true,
+      "cutoff_frequency": 10.0
+    }
+  },
+  "model": {
+    "cnn": {
+      "num_conv_layers": 2,
+      "kernel_size": [3, 3],
+      "num_filters": [32, 64],
+      "pool_size": [2, 2]
+    },
+    "bilstm": {
+      "hidden_units": 128,
+      "memory_window_seconds": 1800
+    },
+    "classifier": {
+      "num_classes": 4
+    }
+  },
+  "mqtt": {
+    "broker_address": "localhost",
+    "broker_port": 1883,
+    "username": "",
+    "password": "",
+    "topics": {
+      "heart_rate": "sensors/heart_rate",
+      "movement": "sensors/movement",
+      "sleep_stage": "sleep/stage",
+      "lighting_control": "control/lighting",
+      "temperature_control": "control/temperature",
+      "humidity_control": "control/humidity",
+      "smoke_sensor": "sensors/smoke",
+      "gas_sensor": "sensors/gas",
+      "smoke_alert": "alert/smoke",
+      "gas_alert": "alert/gas",
+      "sensor_fault": "system/sensor_fault"
+    }
+  },
+  "home_assistant": {
+    "enabled": true,
+    "discovery_prefix": "homeassistant",
+    "device_id": "sleep_classifier_bedroom",
+    "device_name": "Bedroom Sleep Classifier",
+    "device_manufacturer": "CNN-BiLSTM Sleep Project",
+    "device_model": "CNN-BiLSTM-v1",
+    "device_sw_version": "1.0.0",
+    "state_topic": "sleep_classifier/state",
+    "availability_topic": "sleep_classifier/availability",
+    "publish_interval_seconds": 30,
+    "expire_after_seconds": 120,
+    "api": {
+      "base_url": "http://homeassistant.local:8123",
+      "access_token": "",
+      "verify_ssl": true,
+      "area_filter": "bedroom",
+      "heart_rate_keywords": ["heart_rate", "hr", "heartrate", "pulse", "心率"],
+      "movement_keywords": ["movement", "motion", "activity", "accel", "运动"],
+      "temperature_keywords": ["temperature", "temp", "气温", "室温"],
+      "humidity_keywords": ["humidity", "湿度"],
+      "illuminance_keywords": ["illuminance", "lux", "光照", "亮度"],
+      "controllable_domains": ["light", "climate", "fan", "humidifier", "switch", "media_player"]
+    },
+    "preference_learner": {
+      "enabled": true,
+      "history_path": "data/user_preferences.json",
+      "min_sessions_for_personalisation": 3,
+      "quality_quantile": 0.7,
+      "max_sessions_kept": 60,
+      "exploration_rate": 0.1
+    },
+    "smart_control": {
+      "enabled": true,
+      "min_seconds_between_actions": 120,
+      "deadband_temperature_c": 0.5,
+      "deadband_humidity_pct": 5,
+      "deadband_brightness_pct": 10,
+      "dry_run": false
+    }
+  },
+  "disaster_monitoring": {
+    "smoke_threshold": 100.0,
+    "gas_threshold": 50.0
+  },
+  "training": {
+    "batch_size": 32,
+    "epochs": 100,
+    "learning_rate": 0.001,
+    "early_stopping_patience": 5,
+    "k_fold": 5
+  }
+}

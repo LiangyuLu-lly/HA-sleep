@@ -1,0 +1,23 @@
+# Runtime-only dependencies for the lightweight HA add-on / deployment.
+#
+# IMPORTANT
+# ---------
+# This file is consumed by the add-on Dockerfile to build a TensorFlow-free
+# image (~30 MB instead of ~650 MB).  Adding anything that pulls in TF
+# transitively here defeats the purpose.
+#
+# Required invariant: ``import src.inference_pipeline`` must succeed using
+# only the packages listed below.  The Keras path inside cnn_extractor /
+# bilstm_analyzer / sleep_classifier silently degrades to the numpy fallback
+# when TENSORFLOW_AVAILABLE is False; that fallback is what runs in
+# production on the Pi.
+#
+# Numerical equivalence between the Keras path (used at training time) and
+# the numpy path (used at runtime) is guaranteed by
+# ``tests/test_numpy_keras_equivalence.py``.
+numpy>=1.24.0
+scipy>=1.11.0
+h5py>=3.9.0
+PyWavelets>=1.4.1
+paho-mqtt>=1.6.1
+aiohttp>=3.9.0

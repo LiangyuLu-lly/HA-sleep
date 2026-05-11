@@ -1,0 +1,11 @@
+# Home Assistant add-on repository metadata.
+#
+# This file lives at the *root* of the Git repository so that when a user
+# adds the repository URL in HA → Settings → Add-ons → Add-on Store → ⋮ →
+# Repositories, the supervisor recognises it and surfaces every sub-folder
+# of ./addons/ as an installable add-on.
+#
+# Reference: https://developers.home-assistant.io/docs/add-ons/repository
+name: CNN-BiLSTM Sleep Model Add-ons
+url: https://github.com/yourname/sleep-classifier-ha
+maintainer: Sleep Classifier project <maintainer@example.com>

@@ -1,0 +1,99 @@
+# Home Assistant add-on manifest for the CNN-BiLSTM Sleep Classifier.
+#
+# Reference: https://developers.home-assistant.io/docs/add-ons/configuration/
+#
+# After publishing this repository to GitHub, the user adds the repo URL in
+# Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
+# The store then offers this add-on as "Sleep Classifier".
+name: Sleep Classifier
+version: "1.0.0"
+slug: sleep_classifier
+description: >-
+  Deep-learning sleep stage classifier (CNN-BiLSTM) with closed-loop smart
+  home control.  Automatically discovers HR / motion sensors and tunable
+  devices (lights, AC, humidifier, fan), then adapts your bedroom to the
+  conditions you historically sleep best in.
+
+# This add-on is built locally (no pre-built image).  Both Pi 4B (aarch64)
+# and amd64 are supported; the others are excluded to keep the build matrix
+# small.  Add more if you deploy on different hardware.
+arch:
+  - aarch64
+  - amd64
+
+# Auto-start when HA boots; restart if the process dies.
+boot: auto
+startup: services
+init: false
+
+# We talk to the HA Core API via the Supervisor proxy.  This grants us a
+# session token via the SUPERVISOR_TOKEN env var, so the user never has to
+# create a Long-Lived Access Token.
+homeassistant_api: true
+hassio_api: false
+
+# Add-on container needs outbound network for piwheels / pip during build.
+host_network: false
+host_pid: false
+
+# Persistent storage:
+#   /share        — public to other add-ons (used to drop a model file in)
+#   /data         — private add-on data (preference history JSON lives here)
+map:
+  - share:rw
+
+# Resource hints for the supervisor scheduler.  TF inference benefits from
+# more memory; the Pi 4B 4 GB SKU is the recommended floor.
+ingress: false
+
+# User-facing configuration form rendered in the add-on UI.
+# Default values match config/config.json defaults.
+options:
+  area: "bedroom"
+  infer_interval: 30
+  session_interval: 1800
+  dry_run: false
+  exploration_rate: 0.1
+  min_seconds_between_actions: 120
+  deadband_temperature_c: 0.5
+  deadband_humidity_pct: 5
+  deadband_brightness_pct: 10
+  log_level: "info"
+  heart_rate_keywords:
+    - "heart_rate"
+    - "hr"
+    - "pulse"
+  movement_keywords:
+    - "movement"
+    - "motion"
+    - "activity"
+  controllable_domains:
+    - "light"
+    - "climate"
+    - "fan"
+    - "humidifier"
+  explicit_includes: []
+  explicit_excludes: []
+
+# Schema validates user input in the UI.
+schema:
+  area: str
+  infer_interval: int(5,300)
+  session_interval: int(60,86400)
+  dry_run: bool
+  exploration_rate: float(0,1)
+  min_seconds_between_actions: int(0,3600)
+  deadband_temperature_c: float(0,5)
+  deadband_humidity_pct: float(0,30)
+  deadband_brightness_pct: float(0,50)
+  log_level: list(debug|info|warning|error)
+  heart_rate_keywords:
+    - str
+  movement_keywords:
+    - str
+  controllable_domains:
+    - list(light|climate|fan|humidifier|switch|media_player)
+  explicit_includes:
+    - str
+  explicit_excludes:
+    - str

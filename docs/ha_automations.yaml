@@ -1,0 +1,218 @@
+# =============================================================================
+# Home Assistant automations — Sleep Classifier
+# =============================================================================
+# 把本文件中的 automation 复制粘贴到 HA 的 configuration.yaml,
+# 或者放到 /config/automations.yaml 然后 `automation: !include automations.yaml`。
+#
+# 前提条件:
+#   1. 已部署本项目的 scripts/run_ha_service.py(详见 docs/HA_DEPLOYMENT.md)。
+#   2. Home Assistant 已配置 MQTT integration(Settings → Devices & Services →
+#      Add Integration → MQTT),指向同一个 broker。
+#   3. 看到 HA 设备清单中出现 "Bedroom Sleep Classifier",含 6 个实体。
+#
+# 把下面 entity_id 中的 `bedroom_*` 替换成你自己的设备:
+#   light.bedroom        → 你的卧室灯
+#   climate.bedroom_ac   → 你的空调 / 温控器
+#   humidifier.bedroom   → 你的加湿器
+#   media_player.bedroom → 你的音箱(用于报警广播)
+#
+# 所有 automation 都基于 sensor.sleep_classifier_bedroom_sleep_stage 的 4 种取值:
+#   AWAKE / LIGHT / DEEP / REM
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. 进入深睡/REM → 关灯 + 调温度到 19°C + 加湿到 55%
+# -----------------------------------------------------------------------------
+- id: sleep_enter_deep_or_rem
+  alias: "Sleep · 进入深睡/REM"
+  description: "睡眠分类器检测到 DEEP 或 REM,关灯并降温"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.sleep_classifier_bedroom_sleep_stage
+      to:
+        - "DEEP"
+        - "REM"
+  condition:
+    # 防止白天误触(只在晚上 9 点到早上 8 点之间生效)
+    - condition: time
+      after: "21:00:00"
+      before: "08:00:00"
+    # 置信度高于 50% 才执行
+    - condition: numeric_state
+      entity_id: sensor.sleep_classifier_bedroom_sleep_confidence
+      above: 50
+  action:
+    - service: light.turn_off
+      target:
+        entity_id: light.bedroom
+    - service: climate.set_temperature
+      target:
+        entity_id: climate.bedroom_ac
+      data:
+        temperature: 19
+        hvac_mode: cool
+    - service: humidifier.set_humidity
+      target:
+        entity_id: humidifier.bedroom
+      data:
+        humidity: 55
+    - service: notify.persistent_notification
+      data:
+        title: "睡眠模式"
+        message: "检测到 {{ trigger.to_state.state }},已自动关灯并调节温湿度。"
+
+
+# -----------------------------------------------------------------------------
+# 2. 浅睡 → 暗灯(10% 亮度,暖色) + 温度 21°C
+# -----------------------------------------------------------------------------
+- id: sleep_enter_light
+  alias: "Sleep · 进入浅睡"
+  description: "保留微弱夜灯,温度略升一档"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.sleep_classifier_bedroom_sleep_stage
+      to: "LIGHT"
+  condition:
+    - condition: time
+      after: "21:00:00"
+      before: "08:00:00"
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: light.bedroom
+      data:
+        brightness_pct: 10
+        kelvin: 2200    # 暖色,不刺激入睡
+    - service: climate.set_temperature
+      target:
+        entity_id: climate.bedroom_ac
+      data:
+        temperature: 21
+        hvac_mode: cool
+
+
+# -----------------------------------------------------------------------------
+# 3. 醒来(AWAKE 且当前是早晨) → 渐亮日光灯模拟
+# -----------------------------------------------------------------------------
+- id: sleep_wake_morning
+  alias: "Sleep · 早晨醒来"
+  description: "检测到清醒状态,且时间在早 5 - 9 点,渐亮灯并恢复温度"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: sensor.sleep_classifier_bedroom_sleep_stage
+      to: "AWAKE"
+      for: "00:02:00"   # 持续 2 分钟才认定真的醒了
+  condition:
+    - condition: time
+      after: "05:00:00"
+      before: "09:00:00"
+  action:
+    - service: light.turn_on
+      target:
+        entity_id: light.bedroom
+      data:
+        brightness_pct: 50
+        kelvin: 4000
+        transition: 60   # 60 秒渐亮
+    - service: climate.set_temperature
+      target:
+        entity_id: climate.bedroom_ac
+      data:
+        temperature: 23
+    - service: media_player.play_media
+      target:
+        entity_id: media_player.bedroom
+      data:
+        media_content_type: music
+        media_content_id: "https://example.com/morning_playlist.m3u"
+
+
+# -----------------------------------------------------------------------------
+# 4. 烟雾报警 → 全屋亮灯 + 关闭空调 + 推送通知
+# -----------------------------------------------------------------------------
+- id: sleep_smoke_alarm
+  alias: "Disaster · 烟雾报警"
+  description: "binary_sensor.sleep_classifier_bedroom_smoke_alarm 触发"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.sleep_classifier_bedroom_smoke_alarm
+      to: "on"
+  action:
+    - service: light.turn_on
+      target:
+        area_id: bedroom
+      data:
+        brightness_pct: 100
+        color_name: red
+    - service: climate.turn_off
+      target:
+        entity_id: climate.bedroom_ac
+    - service: notify.mobile_app   # 替换成你手机的 notify service
+      data:
+        title: "⚠️ 烟雾报警"
+        message: "卧室检测到烟雾,请立即检查!"
+        data:
+          priority: high
+          ttl: 0
+
+
+# -----------------------------------------------------------------------------
+# 5. 燃气报警(同烟雾,但调用排气扇 + 切阀)
+# -----------------------------------------------------------------------------
+- id: sleep_gas_alarm
+  alias: "Disaster · 燃气报警"
+  description: "binary_sensor.sleep_classifier_bedroom_gas_alarm 触发"
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.sleep_classifier_bedroom_gas_alarm
+      to: "on"
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.kitchen_exhaust_fan
+    - service: switch.turn_off
+      target:
+        entity_id: switch.gas_valve   # 智能燃气阀
+    - service: notify.mobile_app
+      data:
+        title: "⚠️ 燃气泄漏"
+        message: "已自动关阀并开排气,请立即开窗通风!"
+
+
+# -----------------------------------------------------------------------------
+# 6. 异常心率守护(可选)
+# -----------------------------------------------------------------------------
+- id: sleep_abnormal_heart_rate
+  alias: "Health · 异常心率"
+  description: "睡眠期间心率持续过低或过高,触发健康提醒"
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.sleep_classifier_bedroom_heart_rate
+      below: 40
+      for: "00:05:00"
+    - platform: numeric_state
+      entity_id: sensor.sleep_classifier_bedroom_heart_rate
+      above: 120
+      for: "00:05:00"
+  condition:
+    # 睡眠期间才报警(清醒时心率高是正常的)
+    - condition: state
+      entity_id: sensor.sleep_classifier_bedroom_sleep_stage
+      state:
+        - "LIGHT"
+        - "DEEP"
+        - "REM"
+  action:
+    - service: notify.mobile_app
+      data:
+        title: "心率异常"
+        message: >
+          当前心率 {{ states('sensor.sleep_classifier_bedroom_heart_rate') }} bpm
+          (阶段: {{ states('sensor.sleep_classifier_bedroom_sleep_stage') }})。

@@ -1,0 +1,11 @@
+# Default dev/CI install — pulls in everything (training + runtime + tests).
+#
+# Deployment layers (smallest → largest):
+#   * requirements-runtime.txt   — numpy-only inference  (~30 MB image)
+#   * requirements-train.txt     — adds TensorFlow/Keras + pytest/hypothesis
+#   * requirements.txt           — convenience alias for requirements-train.txt
+#
+# The Pi 4B add-on intentionally installs ONLY requirements-runtime.txt to
+# keep the image lean.  Numerical parity with the Keras path is enforced
+# by tests/test_numpy_keras_equivalence.py.
+-r requirements-train.txt
