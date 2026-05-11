@@ -234,6 +234,21 @@ class SmartSleepService:
                 engine.hr_buf.append(engine.hr_buf[-1])
             else:
                 engine.push_hr(75.0)
+        elif (
+            not discovery.sensors.heart_rate
+            and any(e.entity_id == eid for e in discovery.sensors.breathing)
+        ):
+            # mmWave radars expose respiration rate (~12-20 rpm) which is
+            # numerically unlike a heart-rate (~50-90 bpm) but carries the
+            # same physiological-rhythm signal.  Scale to roughly the HR
+            # range so the trained normaliser doesn't clip it before
+            # routing it to the HR buffer.  This branch only fires when
+            # the user has *not* bound a real HR source.
+            engine.push_hr(float(value) * 4.0)
+            if engine.mv_buf:
+                engine.mv_buf.append(engine.mv_buf[-1])
+            else:
+                engine.push_movement(0.0)
         elif any(e.entity_id == eid for e in discovery.sensors.temperature):
             self.last_env.temperature_c = value
         elif any(e.entity_id == eid for e in discovery.sensors.humidity):
@@ -378,10 +393,11 @@ class SmartSleepService:
             discovery.log_summary()
 
             if not discovery.has_minimum_sensors():
+                self._log_binding_help(entities)
                 logger.error(
-                    "No heart-rate or movement sensors found in area '%s'. "
-                    "Adjust --area or the keywords in config.json.",
-                    self.disc_cfg.area_filter,
+                    "No heart-rate / movement / breathing sensor found. "
+                    "Open the add-on Configuration tab and fill the *_source "
+                    "slot fields with one of the candidate entity_ids above.",
                 )
                 return 3
 
@@ -434,6 +450,39 @@ class SmartSleepService:
                         pass
                 self._persist_session(controller, partial=False)
         return 0
+
+    def _log_binding_help(self, entities: List[HAEntity]) -> None:
+        """Print top candidate entity_ids per slot to help the user bind them.
+
+        Triggered when discovery finds no usable sensor.  The candidates are
+        produced by re-running discovery with the area filter disabled, so
+        the user sees suggestions from the entire HA registry even if they
+        haven't assigned anything to an area yet.
+        """
+        try:
+            suggestions = DeviceDiscovery.suggest_candidates(
+                entities, self.disc_cfg, limit_per_bucket=5,
+            )
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Could not build suggestion list: %s", exc)
+            return
+        if not any(suggestions.values()):
+            logger.warning(
+                "No candidate sensors anywhere in HA either. The most likely "
+                "causes are (a) your sensors aren't yet integrated into HA, "
+                "or (b) their entity_ids and friendly_names don't contain any "
+                "of the bilingual keywords. You can extend the keyword lists "
+                "in the add-on Configuration tab, or just paste the entity_id "
+                "of your sensor into the matching *_source field.",
+            )
+            return
+        logger.error("=" * 60)
+        logger.error("Suggested entity_ids — paste them into the matching ")
+        logger.error("slot fields in the add-on Configuration tab:")
+        for slot, ids in suggestions.items():
+            if ids:
+                logger.error("  %-13s → %s", slot, ids)
+        logger.error("=" * 60)
 
     def _seed_current_env(
         self,

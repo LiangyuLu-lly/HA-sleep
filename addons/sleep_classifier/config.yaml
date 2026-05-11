@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.0.0"
+version: "1.1.0"
 slug: sleep_classifier
 description: >-
   Deep-learning sleep stage classifier (CNN-BiLSTM) with closed-loop smart
@@ -47,37 +47,92 @@ map:
 ingress: false
 
 # User-facing configuration form rendered in the add-on UI.
-# Default values match config/config.json defaults.
+#
+# Resolution order for entity selection (highest wins):
+#   1. Slot bindings  —  the *_source / *_target / *_targets fields below.
+#      Filling any of these pins that role to a specific HA entity_id and
+#      tells discovery to *skip* keyword scanning for that bucket.
+#   2. Keyword scan  —  bilingual (English + Chinese + pinyin) substring
+#      match against the entity_id and friendly_name of every entity in
+#      the configured area.
+#   3. Global fallback  —  if no critical sensor matched in step 2, the
+#      add-on will rescan all HA entities (ignoring the area filter) and
+#      log the top candidates so you can copy them into the slot fields.
+#
+# Tips:
+#   * Leave a *_source field empty to use auto-discovery for that role.
+#   * Use Developer Tools → States in HA to find the exact entity_id of a
+#     sensor (e.g. ``sensor.xiaomi_smart_band_9_pro_heart_rate``).
 options:
-  area: "bedroom"
+  # ---- General -----------------------------------------------------------
+  area: ""                       # leave blank to scan all rooms
   infer_interval: 30
   session_interval: 1800
-  dry_run: false
+  dry_run: true                  # ALWAYS start in dry-run for first install
   exploration_rate: 0.1
   min_seconds_between_actions: 120
   deadband_temperature_c: 0.5
   deadband_humidity_pct: 5
   deadband_brightness_pct: 10
   log_level: "info"
+
+  # ---- Slot bindings: sensors -------------------------------------------
+  # Pin a single entity_id per slot.  Empty string = auto-discover.
+  heart_rate_source: ""          # e.g. sensor.xiaomi_smart_band_9_pro_heart_rate
+  movement_source: ""            # e.g. sensor.sleepradar_r60abd1_ts5_yundong_zhuangtai
+  breathing_source: ""           # e.g. sensor.sleepradar_r60abd1_ts6_huxi_xinxi
+  temperature_source: ""         # e.g. sensor.bedroom_temperature
+  humidity_source: ""            # e.g. sensor.bedroom_humidity
+  illuminance_source: ""         # e.g. sensor.bedroom_illuminance
+
+  # ---- Slot bindings: actionable devices --------------------------------
+  # Lists allow multiple targets per role (e.g. main + bedside light).
+  light_targets: []              # e.g. [light.bedroom_main, light.bedroom_bedside]
+  climate_target: ""             # e.g. climate.bedroom_ac
+  humidifier_target: ""          # e.g. humidifier.bedroom_humidifier
+  fan_target: ""                 # e.g. fan.bedroom_fan
+  switch_targets: []             # general-purpose switches you let us toggle
+
+  # ---- Auto-discovery tunables ------------------------------------------
+  # Bilingual defaults (English + Chinese + pinyin) cover Mi Band, Apple
+  # Watch, Garmin, ESPHome mmWave radars (R60ABD1), Aqara FP1/FP2, etc.
+  # Override only if you have a vendor with very unusual naming.
   heart_rate_keywords:
-    - "heart_rate"
-    - "hr"
-    - "pulse"
+    - heart_rate
+    - hr
+    - pulse
+    - bpm
+    - 心率
+    - 脉搏
   movement_keywords:
-    - "movement"
-    - "motion"
-    - "activity"
+    - motion
+    - movement
+    - activity
+    - presence
+    - occupancy
+    - 运动
+    - 体动
+    - 人体
+  breathing_keywords:
+    - breath
+    - breathing
+    - respiration
+    - 呼吸
   controllable_domains:
-    - "light"
-    - "climate"
-    - "fan"
-    - "humidifier"
-  explicit_includes: []
-  explicit_excludes: []
+    - light
+    - climate
+    - fan
+    - humidifier
+  explicit_includes: []           # entity_ids to force-include in scan
+  explicit_excludes: []           # entity_ids to never touch
 
 # Schema validates user input in the UI.
+#
+# The trailing ``?`` in ``match(...)?`` makes a field optional (allows the
+# empty string).  Without it, leaving a slot blank would be flagged as a
+# validation error and prevent the add-on from starting.
 schema:
-  area: str
+  area: str?
   infer_interval: int(5,300)
   session_interval: int(60,86400)
   dry_run: bool
@@ -87,9 +142,27 @@ schema:
   deadband_humidity_pct: float(0,30)
   deadband_brightness_pct: float(0,50)
   log_level: list(debug|info|warning|error)
+
+  heart_rate_source: "match(^(sensor|binary_sensor)\\.[a-zA-Z0-9_]+)?"
+  movement_source: "match(^(sensor|binary_sensor)\\.[a-zA-Z0-9_]+)?"
+  breathing_source: "match(^(sensor|binary_sensor)\\.[a-zA-Z0-9_]+)?"
+  temperature_source: "match(^sensor\\.[a-zA-Z0-9_]+)?"
+  humidity_source: "match(^sensor\\.[a-zA-Z0-9_]+)?"
+  illuminance_source: "match(^sensor\\.[a-zA-Z0-9_]+)?"
+
+  light_targets:
+    - "match(^light\\.[a-zA-Z0-9_]+)"
+  climate_target: "match(^climate\\.[a-zA-Z0-9_]+)?"
+  humidifier_target: "match(^humidifier\\.[a-zA-Z0-9_]+)?"
+  fan_target: "match(^fan\\.[a-zA-Z0-9_]+)?"
+  switch_targets:
+    - "match(^switch\\.[a-zA-Z0-9_]+)"
+
   heart_rate_keywords:
     - str
   movement_keywords:
+    - str
+  breathing_keywords:
     - str
   controllable_domains:
     - list(light|climate|fan|humidifier|switch|media_player)

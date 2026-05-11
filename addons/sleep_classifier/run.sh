@@ -14,7 +14,8 @@ opt() { jq -r "$1" /data/options.json; }
 opt_array_to_csv() { jq -r "$1 | join(\",\")" /data/options.json; }
 
 # ── Read user options ───────────────────────────────────────────────────────
-AREA=$(opt '.area // "bedroom"')
+# General behaviour
+AREA=$(opt '.area // ""')
 INFER_INTERVAL=$(opt '.infer_interval // 30')
 SESSION_INTERVAL=$(opt '.session_interval // 1800')
 DRY_RUN=$(opt '.dry_run // false')
@@ -25,8 +26,25 @@ DEADBAND_H=$(opt '.deadband_humidity_pct // 5')
 DEADBAND_B=$(opt '.deadband_brightness_pct // 10')
 LOG_LEVEL=$(opt '.log_level // "info"')
 
+# Slot bindings — sensors (single entity_id each, empty means auto-discover)
+HR_SOURCE=$(opt '.heart_rate_source // ""')
+MV_SOURCE=$(opt '.movement_source // ""')
+BR_SOURCE=$(opt '.breathing_source // ""')
+TEMP_SOURCE=$(opt '.temperature_source // ""')
+HUM_SOURCE=$(opt '.humidity_source // ""')
+LUX_SOURCE=$(opt '.illuminance_source // ""')
+
+# Slot bindings — actionable devices (lists OR single entity_id)
+LIGHT_TARGETS=$(opt_array_to_csv '.light_targets // []')
+CLIMATE_TARGET=$(opt '.climate_target // ""')
+HUMIDIFIER_TARGET=$(opt '.humidifier_target // ""')
+FAN_TARGET=$(opt '.fan_target // ""')
+SWITCH_TARGETS=$(opt_array_to_csv '.switch_targets // []')
+
+# Auto-discovery tunables
 HR_KEYWORDS=$(opt_array_to_csv '.heart_rate_keywords // []')
 MV_KEYWORDS=$(opt_array_to_csv '.movement_keywords // []')
+BR_KEYWORDS=$(opt_array_to_csv '.breathing_keywords // []')
 DOMAINS=$(opt_array_to_csv '.controllable_domains // []')
 INCLUDES=$(opt_array_to_csv '.explicit_includes // []')
 EXCLUDES=$(opt_array_to_csv '.explicit_excludes // []')
@@ -50,17 +68,42 @@ api["area_filter"] = """$AREA"""
 def csv_to_list(s):
     return [x.strip() for x in s.split(",") if x.strip()]
 
+def one(value):
+    """Wrap a single non-empty entity_id in a list, otherwise empty list."""
+    v = (value or "").strip()
+    return [v] if v else []
+
 hr = csv_to_list("""$HR_KEYWORDS""")
 mv = csv_to_list("""$MV_KEYWORDS""")
+br = csv_to_list("""$BR_KEYWORDS""")
 domains = csv_to_list("""$DOMAINS""")
 inc = csv_to_list("""$INCLUDES""")
 exc = csv_to_list("""$EXCLUDES""")
 
 if hr: api["heart_rate_keywords"] = hr
 if mv: api["movement_keywords"] = mv
+if br: api["breathing_keywords"] = br
 if domains: api["controllable_domains"] = domains
 if inc: api["explicit_includes"] = inc
 if exc: api["explicit_excludes"] = exc
+
+# ----- Slot bindings -----------------------------------------------------
+# Each slot maps to a list of entity_ids; empty list ⇒ keyword scan owns it.
+slot_bindings = {
+    "heart_rate":     one("""$HR_SOURCE"""),
+    "movement":       one("""$MV_SOURCE"""),
+    "breathing":      one("""$BR_SOURCE"""),
+    "temperature":    one("""$TEMP_SOURCE"""),
+    "humidity":       one("""$HUM_SOURCE"""),
+    "illuminance":    one("""$LUX_SOURCE"""),
+    "lights":         csv_to_list("""$LIGHT_TARGETS"""),
+    "climates":       one("""$CLIMATE_TARGET"""),
+    "humidifiers":    one("""$HUMIDIFIER_TARGET"""),
+    "fans":           one("""$FAN_TARGET"""),
+    "switches":       csv_to_list("""$SWITCH_TARGETS"""),
+}
+# Drop empty slots so DiscoveryConfig.from_dict gets a tidy dict.
+api["slot_bindings"] = {k: v for k, v in slot_bindings.items() if v}
 
 sc = ha.setdefault("smart_control", {})
 sc["dry_run"] = """$DRY_RUN""" == "true"
@@ -80,7 +123,9 @@ learner["history_path"] = "/data/user_preferences.json"
 out_path = Path("/data/effective_config.json")
 out_path.write_text(json.dumps(base, indent=2, ensure_ascii=False),
                     encoding="utf-8")
+bound = sum(1 for v in api["slot_bindings"].values() if v)
 print(f"[run.sh] effective config written to {out_path}")
+print(f"[run.sh] slot bindings active: {bound} role(s)")
 PY
 
 # ── Map log level ───────────────────────────────────────────────────────────
@@ -92,7 +137,8 @@ case "$LOG_LEVEL" in
   *)       PY_LOG_FLAG="" ;;
 esac
 
-echo "[run.sh] Starting Sleep Classifier add-on (area=$AREA, infer_interval=${INFER_INTERVAL}s)"
+AREA_LABEL="${AREA:-<all rooms>}"
+echo "[run.sh] Starting Sleep Classifier add-on (area=$AREA_LABEL, infer_interval=${INFER_INTERVAL}s, dry_run=$DRY_RUN)"
 echo "[run.sh] Using SUPERVISOR_TOKEN to authenticate against http://supervisor/core"
 
 # ── Hand off to the Python service ──────────────────────────────────────────
