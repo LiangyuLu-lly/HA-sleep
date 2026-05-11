@@ -22,19 +22,16 @@ arch:
   - amd64
 
 # Auto-start when HA boots; restart if the process dies.
-boot: auto
+# (``boot: auto`` is the schema default so the linter wants it omitted.)
 startup: services
 init: false
 
 # We talk to the HA Core API via the Supervisor proxy.  This grants us a
 # session token via the SUPERVISOR_TOKEN env var, so the user never has to
 # create a Long-Lived Access Token.
+# (``hassio_api``, ``host_network``, ``host_pid`` all default to false and
+# the addon-linter complains if we restate the defaults — omitted.)
 homeassistant_api: true
-hassio_api: false
-
-# Add-on container needs outbound network for piwheels / pip during build.
-host_network: false
-host_pid: false
 
 # Persistent storage:
 #   /share        — public to other add-ons (used to drop a model file in)
@@ -47,8 +44,8 @@ map:
 # inside the add-on listens on :8099; HA Supervisor handles auth +
 # reverse-proxy via the Ingress feature, so the user clicks "Open Web
 # UI" in the add-on detail page and gets in without an extra login.
+# (``ingress_port`` defaults to 8099 — omitted to satisfy the linter.)
 ingress: true
-ingress_port: 8099
 panel_icon: mdi:bed-clock
 panel_title: Sleep Classifier
 

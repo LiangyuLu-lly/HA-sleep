@@ -21,6 +21,20 @@ echo "[prepare] repo root : $REPO_ROOT"
 echo "[prepare] add-on    : $SCRIPT_DIR"
 echo "[prepare] target    : $ROOTFS"
 
+# Snapshot any pre-existing model weights *before* the wipe so they survive
+# even when the source ``models/*.h5`` is hidden by .gitignore.  This is
+# the common case on a fresh CI checkout where the repo intentionally
+# refuses to track 9 MB of binary weights at the project root but does
+# track the same file under ``rootfs/models/`` (so the Docker COPY works).
+SNAPSHOT_DIR="$(mktemp -d -t sleep_classifier_models.XXXXXX)"
+if [ -d "$ROOTFS/models" ]; then
+    find "$ROOTFS/models" -maxdepth 1 -type f \( -name '*.h5' -o -name '*.hdf5' \) \
+         -exec cp -p {} "$SNAPSHOT_DIR/" \;
+    if [ -n "$(ls -A "$SNAPSHOT_DIR" 2>/dev/null)" ]; then
+        echo "[prepare] snapshotted $(ls "$SNAPSHOT_DIR" | wc -l | tr -d ' ') model weight file(s) for restore"
+    fi
+fi
+
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"
 
@@ -56,6 +70,27 @@ copy_dir_required config
 # log a clear warning, but a build with no model is still valid for
 # users who train remotely and copy the .h5 in via /share later.
 copy_dir_optional models
+
+# Restore any *.h5 / *.hdf5 weights we snapshotted earlier if (and only
+# if) the freshly copied source didn't already provide them.  This is
+# what keeps CI green: the source ``models/*.h5`` is invisible to git
+# (gitignored) but the previous rootfs snapshot has the real bytes.
+if [ -n "$(ls -A "$SNAPSHOT_DIR" 2>/dev/null)" ]; then
+    mkdir -p "$ROOTFS/models"
+    restored=0
+    for f in "$SNAPSHOT_DIR"/*; do
+        [ -f "$f" ] || continue
+        name="$(basename "$f")"
+        if [ ! -f "$ROOTFS/models/$name" ]; then
+            cp -p "$f" "$ROOTFS/models/$name"
+            restored=$((restored + 1))
+        fi
+    done
+    if [ "$restored" -gt 0 ]; then
+        echo "[prepare] restored $restored model weight file(s) from snapshot"
+    fi
+fi
+rm -rf "$SNAPSHOT_DIR"
 
 # requirements-runtime.txt is the only file the Dockerfile actually
 # pip-installs (no TensorFlow); missing it means a broken image.

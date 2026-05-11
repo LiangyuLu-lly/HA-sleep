@@ -15,12 +15,11 @@
 #
 # Bump these tags only after re-running the full pytest suite locally
 # against the matching Python version (currently 3.11 on Alpine 3.19).
+# armhf / armv7 / i386 dropped — HA 2025.12 (2025-12-03) drops support
+# and the addon-linter rejects them.  Pi 4B is aarch64.
 build_from:
   aarch64: ghcr.io/home-assistant/aarch64-base:3.19
   amd64: ghcr.io/home-assistant/amd64-base:3.19
-  armhf: ghcr.io/home-assistant/armhf-base:3.19
-  armv7: ghcr.io/home-assistant/armv7-base:3.19
-  i386: ghcr.io/home-assistant/i386-base:3.19
 
 # Image labels — picked up by HA Supervisor's UI badges.
 labels:

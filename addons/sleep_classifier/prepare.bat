@@ -24,6 +24,22 @@ echo [prepare] repo root : %REPO_ROOT%
 echo [prepare] add-on    : %SCRIPT_DIR%
 echo [prepare] target    : %ROOTFS%
 
+:: Snapshot any pre-existing model weights *before* the wipe so they
+:: survive even when the source models\*.h5 is hidden by .gitignore.
+:: See prepare.sh for the long-form explanation.
+set "SNAPSHOT_DIR=%TEMP%\sleep_classifier_models_%RANDOM%%RANDOM%"
+if exist "%ROOTFS%\models" (
+    mkdir "%SNAPSHOT_DIR%" >nul 2>&1
+    for %%E in (h5 hdf5) do (
+        for %%F in ("%ROOTFS%\models\*.%%E") do (
+            if exist "%%F" (
+                copy /y "%%F" "%SNAPSHOT_DIR%\" >nul
+                echo [prepare] snapshotted %%~nxF
+            )
+        )
+    )
+)
+
 if exist "%ROOTFS%" rmdir /s /q "%ROOTFS%"
 mkdir "%ROOTFS%"
 
@@ -55,6 +71,19 @@ for %%D in (models) do (
     ) else (
         echo [prepare] WARNING: %%D\ not found -- add-on will use random weights
     )
+)
+
+:: Restore any *.h5 / *.hdf5 weights from snapshot whose corresponding
+:: source was hidden by .gitignore on this checkout.
+if exist "%SNAPSHOT_DIR%" (
+    if not exist "%ROOTFS%\models" mkdir "%ROOTFS%\models"
+    for %%F in ("%SNAPSHOT_DIR%\*") do (
+        if not exist "%ROOTFS%\models\%%~nxF" (
+            copy /y "%%F" "%ROOTFS%\models\%%~nxF" >nul
+            echo [prepare] restored %%~nxF from snapshot
+        )
+    )
+    rmdir /s /q "%SNAPSHOT_DIR%"
 )
 
 :: requirements-runtime.txt is the only file the Dockerfile actually
