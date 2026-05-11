@@ -72,18 +72,34 @@ class Soundscape(str, Enum):
     DAWN_CHORUS = "dawn_chorus"    # gentle birdsong + soft bells
 
 
-# Default URL/URI per soundscape.  The supervisor exposes ``/share`` to
-# add-ons via the ``map: share:rw`` directive in config.yaml; HA Core
-# can fetch from there directly via ``http://supervisor/share/...``.
-DEFAULT_TRACKS: Dict[Soundscape, str] = {
-    Soundscape.PINK_NOISE:   "/share/sleep_classifier/sounds/pink_noise.mp3",
-    Soundscape.BROWN_NOISE:  "/share/sleep_classifier/sounds/brown_noise.mp3",
-    Soundscape.WHITE_NOISE:  "/share/sleep_classifier/sounds/white_noise.mp3",
-    Soundscape.RAIN:         "/share/sleep_classifier/sounds/rain.mp3",
-    Soundscape.WIND:         "/share/sleep_classifier/sounds/wind.mp3",
-    Soundscape.OCEAN:        "/share/sleep_classifier/sounds/ocean.mp3",
-    Soundscape.DAWN_CHORUS:  "/share/sleep_classifier/sounds/dawn_chorus.mp3",
-}
+# Default URL/URI per soundscape.
+#
+# Why these are *empty by default*
+# --------------------------------
+# Earlier versions shipped hard-coded ``/share/sleep_classifier/sounds/*.mp3``
+# paths, but the add-on does not bundle audio assets — that would have
+# made the image 50+ MB larger and put us into licensing territory for
+# every track.  Pointing at non-existent files just produces silent
+# ``media_player`` 404s in production.
+#
+# We therefore ship an empty catalogue and surface it to the user as a
+# **required Configuration field** if they enable the soundscape feature.
+# The user supplies their own URLs via ``track_overrides`` — typical
+# values:
+#
+#   * ``media-source://media_source/local/sleep/pink.mp3``
+#     (file dropped into HA's "media" folder)
+#   * ``http://192.168.1.10/sounds/rain.mp3``
+#     (hosted on a NAS or local web server)
+#   * ``spotify:track:0VjIjW4GlUZAMYd2vXMi3b``
+#     (Spotify integration installed)
+#   * ``https://www.soundjay.com/.../pink-noise-1.mp3``
+#     (any public CC-licensed source)
+#
+# When a soundscape has no URL, the matcher silently skips
+# ``play_media`` (it still publishes the policy to HA Lovelace so the
+# user knows it *would* have switched).
+DEFAULT_TRACKS: Dict[Soundscape, str] = {}
 
 
 # ---------------------------------------------------------------------------

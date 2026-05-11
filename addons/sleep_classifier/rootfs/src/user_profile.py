@@ -171,11 +171,10 @@ class UserProfile:
         if self.birth_year is None:
             return None
         # Use the wall clock; fractional years for sub-toddler accuracy.
-        seconds_per_year = 365.25 * 24 * 3600
-        # ``time.time()`` in seconds since epoch; the year part of the
-        # birth date is enough granularity for the cohort table.
-        from datetime import datetime
-        now = datetime.utcnow()
+        # Local time is fine here — the year part of the birth date is
+        # enough granularity for the cohort table.
+        from src._time_utils import now_local
+        now = now_local()
         approx = now.year + (now.timetuple().tm_yday - 1) / 365.25 - self.birth_year
         return max(0.0, approx)
 

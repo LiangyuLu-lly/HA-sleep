@@ -17,10 +17,14 @@ import pytest
 from src.data_structures import SleepStage
 from src.sleep_state_publisher import (
     ENTITY_CONFIDENCE,
+    ENTITY_DEBT,
     ENTITY_DURATION,
     ENTITY_LAST_ACTION,
     ENTITY_QUALITY,
+    ENTITY_RECOMMENDED_BEDTIME,
+    ENTITY_SOUNDSCAPE,
     ENTITY_STAGE,
+    ENTITY_WAKE_DECISION,
     SleepStatePublisher,
 )
 
@@ -181,3 +185,121 @@ class TestAuxiliaryPublishers:
             if c.args[0] == ENTITY_LAST_ACTION
         )
         assert call.kwargs["attributes"]["executed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Natural-sleep entities (v1.2.0)
+# ---------------------------------------------------------------------------
+
+
+class TestNaturalSleepPublishers:
+    """publish_debt / publish_recommended_bedtime / publish_wake_decision /
+    publish_soundscape — added in v1.2.0 alongside the 6 new modules.
+    """
+
+    async def test_publish_debt_writes_value_and_severity(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_debt(
+            3.4, severity="moderate",
+            target_hours=8.0, nights_to_full_recovery=2,
+        )
+        call = next(
+            c for c in ha_client.update_state.call_args_list
+            if c.args[0] == ENTITY_DEBT
+        )
+        assert call.args[1] == 3.4
+        attrs = call.kwargs["attributes"]
+        assert attrs["severity"] == "moderate"
+        assert attrs["nightly_target_hours"] == 8.0
+        assert attrs["nights_to_full_recovery"] == 2
+
+    async def test_publish_recommended_bedtime_iso(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        from datetime import datetime
+        bedtime = datetime(2026, 5, 12, 23, 35)
+        await publisher.publish_recommended_bedtime(
+            bedtime, tonight_target_hours=7.5, reason="MILD",
+        )
+        call = next(
+            c for c in ha_client.update_state.call_args_list
+            if c.args[0] == ENTITY_RECOMMENDED_BEDTIME
+        )
+        # HA's timestamp device_class needs an ISO string.
+        assert call.args[1] == "2026-05-12T23:35:00"
+        attrs = call.kwargs["attributes"]
+        assert attrs["tonight_target_hours"] == 7.5
+        assert attrs["reason"] == "MILD"
+
+    async def test_publish_recommended_bedtime_none_writes_unknown(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_recommended_bedtime(None)
+        call = next(
+            c for c in ha_client.update_state.call_args_list
+            if c.args[0] == ENTITY_RECOMMENDED_BEDTIME
+        )
+        assert call.args[1] == "unknown"
+
+    async def test_publish_wake_decision_includes_alarm_iso(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        from datetime import datetime
+        await publisher.publish_wake_decision(
+            "fire_now",
+            reason="post-REM transition into LIGHT",
+            alarm_time=datetime(2026, 5, 12, 7, 22),
+            light_ramp_start=datetime(2026, 5, 12, 7, 0),
+            matched_stage="LIGHT",
+        )
+        call = next(
+            c for c in ha_client.update_state.call_args_list
+            if c.args[0] == ENTITY_WAKE_DECISION
+        )
+        assert call.args[1] == "fire_now"
+        attrs = call.kwargs["attributes"]
+        assert attrs["alarm_time"] == "2026-05-12T07:22:00"
+        assert attrs["light_ramp_start"] == "2026-05-12T07:00:00"
+        assert attrs["matched_stage"] == "LIGHT"
+
+    async def test_publish_soundscape_writes_volume(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_soundscape(
+            "brown_noise", volume_pct=18.5, reason="DEEP / SWA support",
+        )
+        call = next(
+            c for c in ha_client.update_state.call_args_list
+            if c.args[0] == ENTITY_SOUNDSCAPE
+        )
+        assert call.args[1] == "brown_noise"
+        attrs = call.kwargs["attributes"]
+        assert attrs["volume_pct"] == 18.5
+        assert attrs["reason"] == "DEEP / SWA support"
+
+
+class TestInitialPlaceholders:
+    """Boot-time seeding: every owned entity must get a state immediately."""
+
+    async def test_publishes_all_nine_entities(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_initial_placeholders()
+        called = {c.args[0] for c in ha_client.update_state.call_args_list}
+        # Five legacy + four natural-sleep = nine entities.
+        expected = {
+            ENTITY_STAGE, ENTITY_CONFIDENCE, ENTITY_QUALITY, ENTITY_DURATION,
+            ENTITY_LAST_ACTION, ENTITY_DEBT, ENTITY_RECOMMENDED_BEDTIME,
+            ENTITY_WAKE_DECISION, ENTITY_SOUNDSCAPE,
+        }
+        assert called == expected
+
+    async def test_failures_do_not_propagate(
+        self, ha_client: AsyncMock,
+    ) -> None:
+        ha_client.update_state.side_effect = RuntimeError("HA is down")
+        publisher = SleepStatePublisher(ha_client)
+        # Must not raise, even though every single update fails.
+        await publisher.publish_initial_placeholders()
+        assert publisher.stats.failures == 9

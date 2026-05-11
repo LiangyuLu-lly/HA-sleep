@@ -62,6 +62,7 @@ from src.ha_api_client import (
     HomeAssistantClient,
     StateChangeEvent,
 )
+from src._time_utils import now_local
 from src.feedback_input import SubjectiveFeedbackListener
 from src.preference_learner import (
     EnvironmentParams,
@@ -329,6 +330,7 @@ class SmartSleepService:
                 media_player_entity=str(media_target),
                 user_overrides=natural_cfg.get("whitenoise_overrides") or {},
                 volume_scale=float(natural_cfg.get("whitenoise_volume_scale", 1.0)),
+                track_overrides=natural_cfg.get("whitenoise_track_overrides") or {},
                 is_pre_wake=self._is_pre_wake,
             )
         self._last_soundscape: Optional[str] = None
@@ -713,8 +715,15 @@ class SmartSleepService:
             # Diagnostic state publisher — populates HA Lovelace entities.
             self.publisher = SleepStatePublisher(ha)
 
+            # Seed every entity at boot so Lovelace cards stop showing
+            # "Entity not available" for the first ~10 minutes.
+            try:
+                await self.publisher.publish_initial_placeholders()
+            except Exception as exc:    # noqa: BLE001
+                logger.warning("Initial placeholder publish failed: %s", exc)
+
             # Publish an initial debt/bedtime snapshot so Lovelace has
-            # something to show before the first session ends.
+            # something better than the placeholder once history exists.
             try:
                 await self._publish_debt_and_bedtime()
             except Exception as exc:    # noqa: BLE001
@@ -775,8 +784,8 @@ class SmartSleepService:
         """
         if self.wake_planner is None:
             return False
-        from datetime import datetime, timedelta
-        if not isinstance(now, datetime):
+        from datetime import datetime as _dt, timedelta
+        if not isinstance(now, _dt):
             return False
         ramp_start = self.wake_planner.window.end - timedelta(
             minutes=self.wake_planner.light_ramp_min,
@@ -817,8 +826,7 @@ class SmartSleepService:
         if planner is None:
             return
         planner.observe_stage(stage, conf)
-        from datetime import datetime
-        plan = planner.tick(now=datetime.utcnow())
+        plan = planner.tick(now=now_local())
 
         # Publish the decision regardless so the user sees progress.
         if self.publisher is not None:
@@ -834,7 +842,7 @@ class SmartSleepService:
         if plan.decision in (WakeDecision.PRE_RAMP, WakeDecision.OPEN_WINDOW):
             if plan.light_ramp_start and plan.alarm_time and self._wake_light_targets:
                 brightness = light_ramp_brightness(
-                    now=datetime.utcnow(),
+                    now=now_local(),
                     ramp_start=plan.light_ramp_start,
                     ramp_end=plan.alarm_time,
                 )
@@ -876,9 +884,8 @@ class SmartSleepService:
         """Push the stage-appropriate soundscape to the user's speaker."""
         if self.sound_matcher is None:
             return
-        from datetime import datetime
         policy = self.sound_matcher.policy_for(
-            stage, conf, now=datetime.utcnow(),
+            stage, conf, now=now_local(),
         )
         current_id = f"{policy.soundscape.value}@{int(policy.volume_pct)}"
         # Only act on genuine transitions.
@@ -925,7 +932,7 @@ class SmartSleepService:
         if self.learner is None or self.publisher is None:
             return
         try:
-            sessions = self.learner._load()    # type: ignore[attr-defined]
+            sessions = self.learner.sessions()
             tracker = SleepDebtTracker.from_sessions(self.profile, sessions)
             plan = tracker.plan_recovery(wake_window=self._wake_window_strs)
             await self.publisher.publish_debt(

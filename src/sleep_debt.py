@@ -62,6 +62,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from src._time_utils import date_from_timestamp_local, now_local
+
 logger = logging.getLogger(__name__)
 
 
@@ -248,7 +250,7 @@ class SleepDebtTracker:
         """
         if not self._nights:
             return 0.0
-        ref = (now or datetime.utcnow()).date()
+        ref = (now or now_local()).date()
         debt = 0.0
         for night in self._nights:
             try:
@@ -314,7 +316,7 @@ class SleepDebtTracker:
         target = float(self.profile.recommended_total_sleep_hours())
         debt = self.current_debt_hours(now=now)
         sev = _severity(debt)
-        ref = now or datetime.utcnow()
+        ref = now or now_local()
 
         # ---- Decide tonight's sleep duration --------------------------
         if debt <= 0.5:
@@ -483,7 +485,9 @@ class SleepDebtTracker:
             except AttributeError:
                 continue
             actual_hours = max(0.0, (ended - started) / 3600.0)
-            wake_day = datetime.utcfromtimestamp(ended).date().isoformat()
+            # Bucket sessions by *local* wake date so a 23:30 → 06:00
+            # sleep is filed under the morning the user thinks of as today.
+            wake_day = date_from_timestamp_local(ended).isoformat()
             tracker.add_night(NightRecord(
                 date=wake_day,
                 target_hours=target,

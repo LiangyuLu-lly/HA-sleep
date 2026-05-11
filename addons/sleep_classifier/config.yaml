@@ -148,6 +148,13 @@ options:
   # via whitenoise_overrides (see DOCS.md).
   whitenoise_target: ""           # e.g. media_player.bedroom_speaker
   whitenoise_volume_scale: 1.0    # global multiplier on per-stage defaults
+  # Provide one entry per stage you want audio for, in ``key=value`` form.
+  # Stage keys: pink_noise / brown_noise / white_noise / rain / wind /
+  # ocean / dawn_chorus.  Values can be any HA-recognised media URI:
+  #   media-source://media_source/local/sleep/pink.mp3
+  #   http://192.168.1.10/sounds/rain.mp3
+  #   spotify:track:0VjIjW4GlUZAMYd2vXMi3b
+  whitenoise_track_overrides: []  # e.g. ["pink_noise=media-source://..."]
 
   # --- Subjective feedback (morning "how did you sleep?" rating) ---
   # Point this at an input_number helper you created in HA Settings
@@ -210,5 +217,7 @@ schema:
     - "match(^light\\.[a-zA-Z0-9_]+)"
   whitenoise_target: "match(^media_player\\.[a-zA-Z0-9_]+)?"
   whitenoise_volume_scale: "float(0,2)?"
+  whitenoise_track_overrides:
+    - str
   feedback_entity: "match(^input_number\\.[a-zA-Z0-9_]+)?"
   feedback_scale: "int(2,10)?"

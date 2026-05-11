@@ -57,6 +57,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
+from src._time_utils import now_local
 from src.data_structures import SleepStage
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,7 @@ class WakeWindow:
         The window is anchored on the first day from ``ref`` whose
         ``end`` is in the future.  ``ref`` defaults to "now".
         """
-        ref = ref or datetime.utcnow()
+        ref = ref or now_local()
         sh, sm = (int(x) for x in start_hhmm.split(":"))
         eh, em = (int(x) for x in end_hhmm.split(":"))
         s = ref.replace(hour=sh, minute=sm, second=0, microsecond=0)
@@ -195,7 +196,7 @@ class SmartWakePlanner:
 
         # Every inference tick (~30s):
         planner.observe_stage(SleepStage.LIGHT, confidence=0.91)
-        plan = planner.tick(now=datetime.utcnow())
+        plan = planner.tick(now=now_local())
         if plan.decision == WakeDecision.PRE_RAMP:
             await ha.call_service("light", "turn_on", brightness_pct=0)
             ...
@@ -248,9 +249,10 @@ class SmartWakePlanner:
 
         This method is **pure** w.r.t. wall-clock time — pass ``now`` in
         unit tests to test boundary cases.  In production, leave it
-        ``None`` and we'll use ``datetime.utcnow()``.
+        ``None`` and we'll use :func:`src._time_utils.now_local` so that
+        a wake window typed as ``"07:00"`` matches the user's local clock.
         """
-        ref = now or datetime.utcnow()
+        ref = now or now_local()
         if self._woken:
             return WakePlan(
                 decision=WakeDecision.POST_WAKE,

@@ -304,6 +304,37 @@ class SleepStatePublisher:
         truncated = (summary or "—")[:255]
         await self._safe_update(ENTITY_LAST_ACTION, truncated, attrs)
 
+    async def publish_initial_placeholders(self) -> None:
+        """Write a sentinel value for every owned entity at boot time.
+
+        Without this, freshly-installed Lovelace cards show a frustrating
+        "Entity not available" until the first inference tick (potentially
+        ~10 minutes after a cold start).  We seed each entity with an
+        ``"unknown"``-equivalent state on connect so the cards render
+        immediately and update naturally as data arrives.
+        """
+        await self._safe_update(ENTITY_STAGE, "AWAKE", _STATIC_ATTRS_STAGE)
+        await self._safe_update(ENTITY_CONFIDENCE, 0.0, _STATIC_ATTRS_CONF)
+        await self._safe_update(ENTITY_QUALITY, 0.0, _STATIC_ATTRS_QUALITY)
+        await self._safe_update(ENTITY_DURATION, 0, _STATIC_ATTRS_DURATION)
+        await self._safe_update(
+            ENTITY_LAST_ACTION, "—", _STATIC_ATTRS_LAST_ACTION,
+        )
+        # Natural-sleep entities — these are still safe to publish even
+        # if the user didn't enable the corresponding module: the values
+        # are placeholder neutrals.
+        await self._safe_update(ENTITY_DEBT, 0.0, _STATIC_ATTRS_DEBT)
+        await self._safe_update(
+            ENTITY_RECOMMENDED_BEDTIME, "unknown",
+            _STATIC_ATTRS_RECOMMENDED_BEDTIME,
+        )
+        await self._safe_update(
+            ENTITY_WAKE_DECISION, "hold", _STATIC_ATTRS_WAKE_DECISION,
+        )
+        await self._safe_update(
+            ENTITY_SOUNDSCAPE, "off", _STATIC_ATTRS_SOUNDSCAPE,
+        )
+
     async def _safe_update(
         self, entity_id: str, state: Any, attrs: Dict[str, Any],
     ) -> None:

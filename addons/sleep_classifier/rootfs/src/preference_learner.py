@@ -255,6 +255,15 @@ class PreferenceLearner:
     # Recommendation                                                     #
     # ------------------------------------------------------------------ #
 
+    def sessions(self) -> List[SleepSession]:
+        """Return a *defensive copy* of the recorded session history.
+
+        Public alternative to the underscore-prefixed ``_load`` so other
+        modules (sleep-debt accountant, scripts/notebooks) can read the
+        ledger without depending on private internals.
+        """
+        return list(self._load())
+
     def n_sessions(self) -> int:
         return len(self._load())
 

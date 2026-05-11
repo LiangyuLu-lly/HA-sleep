@@ -57,6 +57,8 @@ WAKE_END=$(opt '.wake_window_end // ""')
 WAKE_LIGHTS=$(opt_array_to_csv '.wake_light_targets // []')
 WHITENOISE_TARGET=$(opt '.whitenoise_target // ""')
 WHITENOISE_VOLUME_SCALE=$(opt '.whitenoise_volume_scale // 1.0')
+# `key=value` pairs, joined with `;` so we can survive a shell var.
+WHITENOISE_TRACK_OVERRIDES=$(jq -r '.whitenoise_track_overrides // [] | join(";")' /data/options.json)
 FEEDBACK_ENTITY=$(opt '.feedback_entity // ""')
 FEEDBACK_SCALE=$(opt '.feedback_scale // 5')
 
@@ -134,6 +136,16 @@ learner["history_path"] = "/data/user_preferences.json"
 # and treats each sub-field as independently optional.  We drop empty
 # strings / zero ints so absent fields stay absent (vs. confusing the
 # dataclass with "" defaults).
+# Parse track overrides ``"pink_noise=URL;rain=URL"`` → dict.
+track_overrides_raw = """$WHITENOISE_TRACK_OVERRIDES"""
+track_overrides: dict[str, str] = {}
+for item in track_overrides_raw.split(";"):
+    item = item.strip()
+    if not item or "=" not in item:
+        continue
+    k, _, v = item.partition("=")
+    track_overrides[k.strip()] = v.strip()
+
 natural = {
     "user_id": "default",
     "chronotype": """$CHRONOTYPE""",
@@ -142,6 +154,7 @@ natural = {
     "wake_light_targets": csv_to_list("""$WAKE_LIGHTS"""),
     "whitenoise_target": """$WHITENOISE_TARGET""",
     "whitenoise_volume_scale": float("""$WHITENOISE_VOLUME_SCALE"""),
+    "whitenoise_track_overrides": track_overrides,
     "feedback_entity": """$FEEDBACK_ENTITY""",
     "feedback_scale": int("""$FEEDBACK_SCALE"""),
 }

@@ -132,11 +132,29 @@ def test_low_confidence_attenuates_volume() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Default tracks completeness
+# Default tracks behaviour
 # ---------------------------------------------------------------------------
 
 
-def test_every_audible_soundscape_has_default_track() -> None:
-    audible = [s for s in Soundscape if s != Soundscape.OFF]
-    for s in audible:
-        assert s in DEFAULT_TRACKS, s
+def test_default_tracks_are_empty_until_user_provides() -> None:
+    """Earlier versions hard-coded /share/.../mp3 paths that didn't exist.
+
+    The current contract: ship an empty catalogue and let the user
+    populate it via track_overrides.  The matcher must therefore
+    expose ``media_url() is None`` for every audible stage by default.
+    """
+    assert DEFAULT_TRACKS == {}
+    m = WhiteNoiseMatcher()
+    for s in Soundscape:
+        assert m.media_url(s) is None, s
+
+
+def test_track_override_takes_effect_per_soundscape() -> None:
+    m = WhiteNoiseMatcher(track_overrides={
+        "pink_noise": "media-source://media_source/local/pink.mp3",
+        "rain": "http://example.com/rain.mp3",
+    })
+    assert m.media_url(Soundscape.PINK_NOISE) == "media-source://media_source/local/pink.mp3"
+    assert m.media_url(Soundscape.RAIN) == "http://example.com/rain.mp3"
+    # Anything the user didn't override is still unset.
+    assert m.media_url(Soundscape.BROWN_NOISE) is None
