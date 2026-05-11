@@ -60,6 +60,10 @@ RUN set -eux; \
     find /usr/lib/python3* -name '*.pyc' -delete 2>/dev/null || true; \
     rm -rf /root/.cache /var/cache/apk/* /tmp/*
 
+# Web UI for picking entity_ids out of HA's live state.  Lives inside the
+# container, served via Supervisor Ingress.  See web_ui.py for details.
+COPY web_ui.py /app/web_ui.py
+
 # Add-on entrypoint sits at the image root.
 COPY run.sh /run.sh
 RUN chmod +x /run.sh

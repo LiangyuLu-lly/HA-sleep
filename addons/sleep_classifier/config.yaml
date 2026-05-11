@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.2.0"
+version: "1.2.1"
 slug: sleep_classifier
 description: >-
   Deep-learning sleep stage classifier (CNN-BiLSTM) with closed-loop smart
@@ -42,9 +42,15 @@ host_pid: false
 map:
   - share:rw
 
-# Resource hints for the supervisor scheduler.  TF inference benefits from
-# more memory; the Pi 4B 4 GB SKU is the recommended floor.
-ingress: false
+# Embedded Web UI for picking entity_ids out of a dropdown instead of
+# typing them by hand into the Configuration form.  The aiohttp server
+# inside the add-on listens on :8099; HA Supervisor handles auth +
+# reverse-proxy via the Ingress feature, so the user clicks "Open Web
+# UI" in the add-on detail page and gets in without an extra login.
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:bed-clock
+panel_title: Sleep Classifier
 
 # User-facing configuration form rendered in the add-on UI.
 #

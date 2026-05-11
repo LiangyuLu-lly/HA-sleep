@@ -5,13 +5,18 @@ A deep learning-based sleep stage classification system for smart home environme
 > 📑 **结题报告**: 完整的训练结果、评估指标、混淆矩阵和复现说明见
 > [`docs/PROJECT_COMPLETION_REPORT.md`](docs/PROJECT_COMPLETION_REPORT.md)。
 >
-> � **v1.2.0 拟自然睡眠套件**(2026-05): 6 个新模块
+> 🆕 **v1.2.1 内置 Web UI 实体选择器**(2026-05):add-on 详情页点
+> "OPEN WEB UI" → 下拉选 entity_id,不用再手敲。Supervisor Ingress
+> 免登录,选完写 `/data/web_ui_overrides.json`,优先级高于 Configuration
+> 表单。详见 [`INSTALL.md §5.1`](INSTALL.md#51-推荐用内置-web-ui-选实体v121)。
+>
+> 🌙 **v1.2.0 拟自然睡眠套件**(2026-05): 6 个新模块
 > (用户画像 / 睡眠债务 / 智能唤醒 / SE/WASO/SOL 评分 / 主观反馈 / 白噪音匹配)
 > 全部可选,4 个新 Lovelace 实体,12 篇一级文献支撑。
 > 详见 [`INSTALL.md`](INSTALL.md#拟自然睡眠功能v120-新增) 或
 > [`addons/sleep_classifier/DOCS.md`](addons/sleep_classifier/DOCS.md)。
 >
-> �🏠 **Home Assistant 部署 — 三种方式**:
+> �� **Home Assistant 部署 — 三种方式**:
 >
 > 1. ⭐ **HA OS Add-on**(树莓派 4B + 完整 HA OS,**像 HACS 一样一键安装**)
 >    → [`INSTALL.md`](INSTALL.md) (5 步,3 分钟操作 + 等 build)

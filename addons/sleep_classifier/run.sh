@@ -72,6 +72,20 @@ base = json.loads(Path("/app/config/config.json").read_text(encoding="utf-8"))
 ha = base.setdefault("home_assistant", {})
 api = ha.setdefault("api", {})
 
+# ── Web-UI overrides (entity picker) ─────────────────────────────────
+# If the user used the embedded picker, /data/web_ui_overrides.json
+# carries their selections.  These take precedence over whatever they
+# typed (or didn't type) into the Configuration form, because the picker
+# only writes entity_ids that are guaranteed to exist in HA.
+_overrides_path = Path("/data/web_ui_overrides.json")
+_overrides = {}
+if _overrides_path.is_file():
+    try:
+        _overrides = json.loads(_overrides_path.read_text(encoding="utf-8"))
+        print(f"[run.sh] applied {_overrides_path} (web UI picks)")
+    except Exception as exc:    # noqa: BLE001
+        print(f"[run.sh] WARN: could not parse {_overrides_path}: {exc}")
+
 # Supervisor proxy auth — no user token needed
 api["base_url"] = "http://supervisor/core"
 api["access_token"] = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -113,18 +127,36 @@ if exc: api["explicit_excludes"] = exc
 
 # ----- Slot bindings -----------------------------------------------------
 # Each slot maps to a list of entity_ids; empty list ⇒ keyword scan owns it.
+# ``_with_override(slot, form_value)`` — if the web UI picker wrote an
+# entry for this slot, use that; otherwise fall back to the Configuration
+# form value.  Single-valued slots wrap a non-empty string into a list.
+def _slot_single(override_key, form_value):
+    if override_key in _overrides:
+        v = _norm(_overrides[override_key])
+        return [v] if v else []
+    return one(form_value)
+
+def _slot_multi(override_key, form_value_csv):
+    if override_key in _overrides:
+        raw = _overrides[override_key]
+        if isinstance(raw, list):
+            return [v for v in (_norm(x) for x in raw) if v]
+        v = _norm(raw)
+        return [v] if v else []
+    return csv_to_list(form_value_csv)
+
 slot_bindings = {
-    "heart_rate":     one("""$HR_SOURCE"""),
-    "movement":       one("""$MV_SOURCE"""),
-    "breathing":      one("""$BR_SOURCE"""),
-    "temperature":    one("""$TEMP_SOURCE"""),
-    "humidity":       one("""$HUM_SOURCE"""),
-    "illuminance":    one("""$LUX_SOURCE"""),
-    "lights":         csv_to_list("""$LIGHT_TARGETS"""),
-    "climates":       one("""$CLIMATE_TARGET"""),
-    "humidifiers":    one("""$HUMIDIFIER_TARGET"""),
-    "fans":           one("""$FAN_TARGET"""),
-    "switches":       csv_to_list("""$SWITCH_TARGETS"""),
+    "heart_rate":     _slot_single("heart_rate_source", """$HR_SOURCE"""),
+    "movement":       _slot_single("movement_source", """$MV_SOURCE"""),
+    "breathing":      _slot_single("breathing_source", """$BR_SOURCE"""),
+    "temperature":    _slot_single("temperature_source", """$TEMP_SOURCE"""),
+    "humidity":       _slot_single("humidity_source", """$HUM_SOURCE"""),
+    "illuminance":    _slot_single("illuminance_source", """$LUX_SOURCE"""),
+    "lights":         _slot_multi("light_targets", """$LIGHT_TARGETS"""),
+    "climates":       _slot_single("climate_target", """$CLIMATE_TARGET"""),
+    "humidifiers":    _slot_single("humidifier_target", """$HUMIDIFIER_TARGET"""),
+    "fans":           _slot_single("fan_target", """$FAN_TARGET"""),
+    "switches":       _slot_multi("switch_targets", """$SWITCH_TARGETS"""),
 }
 # Drop empty slots so DiscoveryConfig.from_dict gets a tidy dict.
 api["slot_bindings"] = {k: v for k, v in slot_bindings.items() if v}
@@ -157,16 +189,32 @@ for item in track_overrides_raw.split(";"):
     k, _, v = item.partition("=")
     track_overrides[k.strip()] = v.strip()
 
+def _override_or(key, fallback):
+    """Use the web UI's pick if present (and non-empty after normalisation),
+    otherwise the Configuration form value."""
+    if key in _overrides:
+        v = _norm(_overrides[key])
+        if v != "":
+            return v
+    return fallback
+
+# Wake-light targets accept multi-select.
+_wake_lights_override = _overrides.get("wake_light_targets")
+if isinstance(_wake_lights_override, list):
+    _wake_lights = [v for v in (_norm(x) for x in _wake_lights_override) if v]
+else:
+    _wake_lights = csv_to_list("""$WAKE_LIGHTS""")
+
 natural = {
     "user_id": "default",
-    "chronotype": """$CHRONOTYPE""",
-    "wake_window_start": """$WAKE_START""",
-    "wake_window_end": """$WAKE_END""",
-    "wake_light_targets": csv_to_list("""$WAKE_LIGHTS"""),
-    "whitenoise_target": """$WHITENOISE_TARGET""",
+    "chronotype": _norm("""$CHRONOTYPE""") or "neutral",
+    "wake_window_start": _norm("""$WAKE_START"""),
+    "wake_window_end": _norm("""$WAKE_END"""),
+    "wake_light_targets": _wake_lights,
+    "whitenoise_target": _override_or("whitenoise_target", _norm("""$WHITENOISE_TARGET""")),
     "whitenoise_volume_scale": float("""$WHITENOISE_VOLUME_SCALE"""),
     "whitenoise_track_overrides": track_overrides,
-    "feedback_entity": """$FEEDBACK_ENTITY""",
+    "feedback_entity": _override_or("feedback_entity", _norm("""$FEEDBACK_ENTITY""")),
     "feedback_scale": int("""$FEEDBACK_SCALE"""),
 }
 try:
@@ -201,6 +249,17 @@ esac
 AREA_LABEL="${AREA:-<all rooms>}"
 echo "[run.sh] Starting Sleep Classifier add-on (area=$AREA_LABEL, infer_interval=${INFER_INTERVAL}s, dry_run=$DRY_RUN)"
 echo "[run.sh] Using SUPERVISOR_TOKEN to authenticate against http://supervisor/core"
+
+# ── Web UI (entity picker via Supervisor Ingress) ──────────────────────────
+# Started in the background so the user can open it from the add-on detail
+# page while the inference loop runs in the foreground.  We trap SIGTERM
+# to make sure the helper dies cleanly when the supervisor restarts us
+# (otherwise the port would be held by an orphan).
+export WEB_UI_PORT=8099
+python3 /app/web_ui.py &
+WEB_UI_PID=$!
+echo "[run.sh] Web UI started (PID $WEB_UI_PID) on :$WEB_UI_PORT"
+trap 'kill $WEB_UI_PID 2>/dev/null || true' EXIT INT TERM
 
 # ── Hand off to the Python service ──────────────────────────────────────────
 # We pass --config explicitly so the service reads the merged file we just

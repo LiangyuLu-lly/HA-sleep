@@ -95,6 +95,21 @@ git push -u origin main
 
 ## 5. 配置 add-on
 
+### 5.1 推荐:用内置 Web UI 选实体(v1.2.1+)
+
+**先 Start 一次 add-on**(默认 `dry_run: true`,不会乱动设备),然后:
+
+1. **Sleep Classifier** 详情页 → 顶栏 **"OPEN WEB UI"** 按钮
+2. 表单里每个槽位都是**下拉框**,选项 = 你 HA 里**真实存在**的实体,
+   不用再去 Developer Tools 抄 entity_id
+3. 填完点 **"保存 / Save"**
+4. 回 add-on 详情页点 **RESTART**
+
+Web UI 写到 `/data/web_ui_overrides.json`,**优先级高于** Configuration tab
+的同名字段。要清空某个槽位回到自动发现,选下拉里第一项 `— 留空(自动发现) —`。
+
+### 5.2 备用:直接编辑 Configuration tab
+
 切到 **Configuration** tab。**v1.1.0 默认 `dry_run: true`**,你可以直接
 Save + Start 试跑。最少要改的只有 sensor 槽位:
 
