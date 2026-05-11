@@ -184,7 +184,7 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigurationError("K-fold must be at least 2")
 
 
-def load_config(config_path: str = "config/config.json") -> Dict[str, Any]:
+def load_config(config_path: str = "training_config/config.json") -> Dict[str, Any]:
     """
     Load configuration file with validation
     

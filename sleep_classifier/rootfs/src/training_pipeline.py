@@ -76,7 +76,7 @@ class TrainingPipeline:
         config_path: Path to config.json.
     """
 
-    def __init__(self, config_path: str = "config/config.json") -> None:
+    def __init__(self, config_path: str = "training_config/config.json") -> None:
         self.config_path = config_path
         self._config = self._load_config(config_path)
 

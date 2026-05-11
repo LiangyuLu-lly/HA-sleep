@@ -31,7 +31,7 @@ def _write_config(tmp_path: Path, natural: dict) -> Path:
     We start from the bundled defaults so we don't have to duplicate the
     schema; then we splice in our test-specific natural-sleep config.
     """
-    from config.config_loader import get_default_config
+    from training_config.config_loader import get_default_config
     cfg = get_default_config()
     ha = cfg.setdefault("home_assistant", {})
     ha["api"] = {

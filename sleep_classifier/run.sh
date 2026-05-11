@@ -68,7 +68,7 @@ python3 - <<PY
 import json, os
 from pathlib import Path
 
-base = json.loads(Path("/app/config/config.json").read_text(encoding="utf-8"))
+base = json.loads(Path("/app/training_config/config.json").read_text(encoding="utf-8"))
 ha = base.setdefault("home_assistant", {})
 api = ha.setdefault("api", {})
 

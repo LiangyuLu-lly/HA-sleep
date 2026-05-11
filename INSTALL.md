@@ -25,19 +25,19 @@
 
 HA Supervisor build add-on 时,**只能看到 add-on 目录内的文件**,
 看不到仓库根的 `src/`、`scripts/`、`config/`、`models/`。所以 push 之前要把
-这些目录同步到 `addons/sleep_classifier/rootfs/`:
+这些目录同步到 `sleep_classifier/rootfs/`:
 
 **Windows**:
 
 ```cmd
-addons\sleep_classifier\prepare.bat
+sleep_classifier\prepare.bat
 ```
 
 **Linux/macOS**:
 
 ```bash
-chmod +x addons/sleep_classifier/prepare.sh
-addons/sleep_classifier/prepare.sh
+chmod +x sleep_classifier/prepare.sh
+sleep_classifier/prepare.sh
 ```
 
 预期输出:
@@ -235,7 +235,7 @@ action:
 
 - **自动重启**:Info tab 打开 **Watchdog** 和 **Auto update** 开关。
 - **看实时日志**:浏览器留着 Log tab 即可,自动滚动。
-- **升级 add-on**:push 新版本 + 改 `addons/sleep_classifier/config.yaml`
+- **升级 add-on**:push 新版本 + 改 `sleep_classifier/config.yaml`
   的 `version` 字段,HA 会自动检测并在 Info tab 显示 **UPDATE** 按钮。
 - **WS 自动重连**:网络抖动 add-on 自动指数回退重连(1 → 2 → 4 → … → 5 min),
   不会再因网络问题假死退出。
@@ -391,12 +391,12 @@ HA Supervisor 不允许同一 slug 的 add-on 装两份,所以如果你想在两
 房间同时跑模型,需要在仓库里**复制一份 add-on 目录**:
 
 ```bash
-cp -r addons/sleep_classifier addons/sleep_classifier_guest
-# 编辑 addons/sleep_classifier_guest/config.yaml,只改两处:
+cp -r sleep_classifier sleep_classifier_guest
+# 编辑 sleep_classifier_guest/config.yaml,只改两处:
 #   slug: sleep_classifier_guest
 #   name: Sleep Classifier (Guest)
 # 重跑 prepare:
-addons/sleep_classifier_guest/prepare.sh   # 或 .bat
+sleep_classifier_guest/prepare.sh   # 或 .bat
 git add -A; git commit -m "feat: guest-room instance"; git push
 ```
 
@@ -405,7 +405,7 @@ git add -A; git commit -m "feat: guest-room instance"; git push
 
 > ⚠️ 两个实例发布的 HA 实体 ID 默认相同
 > (`sensor.sleep_classifier_stage`),会互相覆盖。复制后请编辑
-> `addons/sleep_classifier_guest/rootfs/src/sleep_state_publisher.py`
+> `sleep_classifier_guest/rootfs/src/sleep_state_publisher.py`
 > 把 `ENTITY_*` 常量加上 `_guest` 后缀,然后 prepare 一遍。
 
 ## 不想用 Add-on?

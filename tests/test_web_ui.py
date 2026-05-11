@@ -15,7 +15,7 @@ import pytest
 
 # The module lives outside the normal src/ tree (it's bundled into the
 # add-on image), so we add its directory to sys.path for the import.
-_ADDON_ROOT = Path(__file__).resolve().parents[1] / "addons" / "sleep_classifier"
+_ADDON_ROOT = Path(__file__).resolve().parents[1] / "sleep_classifier"
 sys.path.insert(0, str(_ADDON_ROOT))
 
 import web_ui    # noqa: E402  (import-after-sys-path is the point)

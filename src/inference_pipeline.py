@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from config.config_loader import load_config
+from training_config.config_loader import load_config
 from src.anomaly_handler import AnomalyHandler
 from src.bilstm_analyzer import BiLSTMAnalyzer
 from src.cnn_extractor import CNNExtractor
@@ -57,7 +57,7 @@ class InferencePipeline:
 
     def __init__(
         self,
-        config_path: str = "config/config.json",
+        config_path: str = "training_config/config.json",
         *,
         subscriber: Optional[MQTTSubscriber] = None,
         publisher: Optional[MQTTPublisher] = None,

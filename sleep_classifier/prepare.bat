@@ -15,7 +15,10 @@ setlocal
 
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
-pushd "%SCRIPT_DIR%\..\.." >nul
+:: Add-on sits at the repository root now (v1.2.3+) so the project root
+:: is exactly one level up, not two.  HA Supervisor needs this layout to
+:: discover the add-on directly when the user adds the repo URL.
+pushd "%SCRIPT_DIR%\.." >nul
 set "REPO_ROOT=%CD%"
 popd >nul
 set "ROOTFS=%SCRIPT_DIR%\rootfs"
@@ -46,7 +49,7 @@ mkdir "%ROOTFS%"
 :: Critical inputs the Dockerfile relies on -- missing means the add-on
 :: image will be broken at build time, so we want to fail loudly here
 :: rather than 30 minutes later on the Pi.
-for %%D in (src scripts config) do (
+for %%D in (src scripts training_config) do (
     if exist "%REPO_ROOT%\%%D" (
         xcopy /e /i /q /y "%REPO_ROOT%\%%D" "%ROOTFS%\%%D" >nul
         if errorlevel 1 (

@@ -58,7 +58,7 @@ class MovementFilter:
         enabled: bool = True,
         cutoff_freq: float = 10.0,
         sampling_rate: float = 100.0,
-        config_path: str = "config/config.json",
+        config_path: str = "training_config/config.json",
     ) -> None:
         if cutoff_freq <= 0:
             raise MovementFilterError(

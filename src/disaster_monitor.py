@@ -159,7 +159,7 @@ class DisasterMonitor:
         ``disaster_monitoring.gas_threshold`` from the config.
 
         Args:
-            config: Configuration dictionary (e.g. loaded from config.json).
+            config: Configuration dictionary (e.g. loaded from training_config.json).
             mqtt_publisher: Optional MQTTPublisher instance.
 
         Returns:

@@ -3,7 +3,7 @@ import pytest
 import json
 import tempfile
 import os
-from config.config_loader import (
+from training_config.config_loader import (
     load_config, validate_config, get_default_config, ConfigurationError
 )
 

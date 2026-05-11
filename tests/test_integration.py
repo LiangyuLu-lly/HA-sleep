@@ -96,7 +96,7 @@ class TestTrainingFlow:
 
     def test_full_training_flow_produces_valid_history(self):
         """End-to-end training returns a history dict with valid metrics."""
-        pipeline = TrainingPipeline(config_path="config/config.json")
+        pipeline = TrainingPipeline(config_path="training_config/config.json")
         pipeline.max_epochs = 2
         pipeline.patience = 5
         pipeline.batch_size = 16
@@ -117,7 +117,7 @@ class TestTrainingFlow:
 
     def test_training_flow_saves_model_checkpoint(self):
         """Training saves a model checkpoint file."""
-        pipeline = TrainingPipeline(config_path="config/config.json")
+        pipeline = TrainingPipeline(config_path="training_config/config.json")
         pipeline.max_epochs = 2
         pipeline.patience = 5
         pipeline.batch_size = 16
@@ -134,7 +134,7 @@ class TestTrainingFlow:
 
     def test_training_flow_evaluate_after_train(self):
         """evaluate() after training returns valid loss and accuracy."""
-        pipeline = TrainingPipeline(config_path="config/config.json")
+        pipeline = TrainingPipeline(config_path="training_config/config.json")
         pipeline.max_epochs = 2
         pipeline.patience = 5
         pipeline.batch_size = 16
@@ -158,7 +158,7 @@ class TestTrainingFlow:
         dataset = _make_dataset(n_samples=2048)
         training_set, test_set = loader.split_train_test(dataset, test_ratio=0.2)
 
-        pipeline = TrainingPipeline(config_path="config/config.json")
+        pipeline = TrainingPipeline(config_path="training_config/config.json")
         pipeline.max_epochs = 2
         pipeline.patience = 5
         pipeline.batch_size = 16
@@ -176,7 +176,7 @@ class TestTrainingFlow:
         except ImportError:
             pytest.skip("h5py not available")
 
-        pipeline = TrainingPipeline(config_path="config/config.json")
+        pipeline = TrainingPipeline(config_path="training_config/config.json")
         pipeline.max_epochs = 2
         pipeline.patience = 5
         pipeline.batch_size = 16
@@ -191,7 +191,7 @@ class TestTrainingFlow:
             metrics_before = pipeline.evaluate(test_set)
 
             # Fresh pipeline, load saved weights
-            pipeline2 = TrainingPipeline(config_path="config/config.json")
+            pipeline2 = TrainingPipeline(config_path="training_config/config.json")
             pipeline2._normalizer.fit(training_set)
             norm_ds = pipeline2._normalizer.transform(training_set.dataset)
             X, _ = pipeline2._build_feature_matrix(norm_ds)

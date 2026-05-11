@@ -4,7 +4,7 @@ import numpy as np
 from typing import Optional
 
 from src.data_structures import Dataset, TrainingSet
-from config.config_loader import load_config
+from training_config.config_loader import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class DataNormalizer:
     Requirements: 5.1, 5.2, 5.3, 5.4
     """
 
-    def __init__(self, config_path: str = "config/config.json") -> None:
+    def __init__(self, config_path: str = "training_config/config.json") -> None:
         config = load_config(config_path)
         self._method: str = (
             config.get("data_processing", {})

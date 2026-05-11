@@ -52,7 +52,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
-from config.config_loader import load_config
+from training_config.config_loader import load_config
 from src.data_structures import SleepStage
 from src.device_discovery import DeviceDiscovery, DiscoveryConfig, DiscoveryResult
 from src.ha_api_client import (
@@ -1037,7 +1037,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Deep Home Assistant integration for the CNN-BiLSTM sleep model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--config", default="config/config.json")
+    p.add_argument("--config", default="training_config/config.json")
     p.add_argument("--model", default="models/best_model.h5")
     p.add_argument("--base-url", default=None,
                    help="HA base URL (overrides config). e.g. http://homeassistant.local:8123")

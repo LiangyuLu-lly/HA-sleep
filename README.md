@@ -14,7 +14,7 @@ A deep learning-based sleep stage classification system for smart home environme
 > (用户画像 / 睡眠债务 / 智能唤醒 / SE/WASO/SOL 评分 / 主观反馈 / 白噪音匹配)
 > 全部可选,4 个新 Lovelace 实体,12 篇一级文献支撑。
 > 详见 [`INSTALL.md`](INSTALL.md#拟自然睡眠功能v120-新增) 或
-> [`addons/sleep_classifier/DOCS.md`](addons/sleep_classifier/DOCS.md)。
+> [`sleep_classifier/DOCS.md`](sleep_classifier/DOCS.md)。
 >
 > �� **Home Assistant 部署 — 三种方式**:
 >

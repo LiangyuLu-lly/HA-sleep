@@ -53,7 +53,7 @@ class WaveletDenoiser:
         self,
         wavelet: str = "db5",
         level: int = 5,
-        config_path: str = "config/config.json",
+        config_path: str = "training_config/config.json",
     ) -> None:
         # Validate constructor arguments first (before config override)
         if wavelet not in pywt.wavelist():

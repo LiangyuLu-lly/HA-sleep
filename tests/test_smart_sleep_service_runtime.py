@@ -33,7 +33,7 @@ import pytest
 
 
 def _write_config(tmp_path: Path, natural: dict, learner: bool = False) -> Path:
-    from config.config_loader import get_default_config
+    from training_config.config_loader import get_default_config
     cfg = get_default_config()
     ha = cfg.setdefault("home_assistant", {})
     ha["api"] = {

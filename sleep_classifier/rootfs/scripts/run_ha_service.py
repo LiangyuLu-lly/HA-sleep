@@ -57,7 +57,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
-from config.config_loader import load_config
+from training_config.config_loader import load_config
 from src.data_structures import HeartRateData, MovementData, SleepStage
 from src.dataset_loader import DatasetLoader, DatasetLoadError
 from src.ha_integration import HAConfig, HomeAssistantBridge
@@ -349,7 +349,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--config",
-        default="config/config.json",
+        default="training_config/config.json",
         help="Project configuration file.",
     )
     p.add_argument("--broker", default=None,

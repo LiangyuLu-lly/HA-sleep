@@ -62,7 +62,7 @@ def _make_test_set(n_samples: int = 1024, seed: int = 42) -> TestSet:
 
 def _make_pipeline(max_epochs: int = 3, patience: int = 2) -> TrainingPipeline:
     """Create a TrainingPipeline with small epoch/patience for fast tests."""
-    pipeline = TrainingPipeline(config_path="config/config.json")
+    pipeline = TrainingPipeline(config_path="training_config/config.json")
     pipeline.max_epochs = max_epochs
     pipeline.patience = patience
     pipeline.batch_size = 16

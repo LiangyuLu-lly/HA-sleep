@@ -14,7 +14,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Add-on sits at the repository root now (v1.2.3+) so the project root is
+# exactly one level up, not two.  This is the layout HA Supervisor needs
+# to discover the add-on directly when the user adds the repo URL.
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOTFS="$SCRIPT_DIR/rootfs"
 
 echo "[prepare] repo root : $REPO_ROOT"
@@ -65,7 +68,7 @@ copy_dir_optional() {
 # Dockerfile's COPY of rootfs/ produces a stub that crashes at startup.
 copy_dir_required src
 copy_dir_required scripts
-copy_dir_required config
+copy_dir_required training_config
 # models/ is optional: the add-on can boot with bootstrap weights and
 # log a clear warning, but a build with no model is still valid for
 # users who train remotely and copy the .h5 in via /share later.
