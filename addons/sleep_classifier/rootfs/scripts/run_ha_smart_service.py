@@ -62,19 +62,34 @@ from src.ha_api_client import (
     HomeAssistantClient,
     StateChangeEvent,
 )
+from src.feedback_input import SubjectiveFeedbackListener
 from src.preference_learner import (
     EnvironmentParams,
     PreferenceConfig,
     PreferenceLearner,
     SleepSession,
-    compute_quality_score,
+)
+from src.preference_learner import compute_quality_score as _legacy_quality_score
+from src.sleep_debt import NightRecord, SleepDebtTracker
+from src.sleep_quality_score import (
+    blend_subjective,
+    compute_metrics,
+    compute_objective_quality,
 )
 from src.sleep_state_publisher import SleepStatePublisher
 from src.smart_environment_controller import (
     SmartControlConfig,
     SmartEnvironmentController,
 )
+from src.smart_wake import (
+    SmartWakePlanner,
+    WakeDecision,
+    WakeWindow,
+    light_ramp_brightness,
+)
 from src.training_pipeline import TrainingPipeline
+from src.user_profile import UserProfile, UserProfileStore
+from src.whitenoise_matcher import Soundscape, WhiteNoiseMatcher
 
 # Buffer persistence path: ``/data`` is the supervisor-managed volume so the
 # file survives add-on upgrades.  Outside the add-on we fall back to the
@@ -84,6 +99,9 @@ _BUFFER_PATH = _BUFFER_DIR / "inference_buffer.npz"
 # Don't restore a buffer older than this — stale physiology samples from a
 # previous night would mislead the model worse than a fresh cold-start.
 _BUFFER_MAX_AGE_S = 6 * 3600   # 6 hours
+
+# Natural-sleep persistence paths (v1.2.0).
+_PROFILE_PATH = _BUFFER_DIR / "user_profile.json"
 
 logger = logging.getLogger("smart_service")
 
@@ -269,12 +287,69 @@ class SmartSleepService:
         if args.dry_run:
             self.ctrl_cfg.dry_run = True
 
+        # --- Natural-sleep modules (v1.2.0) ----------------------------- #
+        # All of these are *optional*: if the user didn't configure the
+        # relevant fields we leave the attribute as None and the main
+        # loop simply skips the corresponding publish / action.
+        self.profile_store = UserProfileStore(_PROFILE_PATH)
+        natural_cfg = ha_cfg.get("natural_sleep", {})
+        self.profile = self.profile_store.load(
+            user_id=natural_cfg.get("user_id", "default"),
+        )
+        # Keep config-driven overrides that don't belong in the on-disk
+        # profile (user can edit birth_year in Configuration without us
+        # clobbering the learned posterior).
+        if natural_cfg.get("birth_year"):
+            try:
+                self.profile.birth_year = int(natural_cfg["birth_year"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid birth_year %r", natural_cfg["birth_year"],
+                )
+        if natural_cfg.get("chronotype"):
+            self.profile.chronotype = str(natural_cfg["chronotype"])
+
+        # Wake window (two "HH:MM" strings from the add-on Config tab).
+        wake_start = natural_cfg.get("wake_window_start") or ""
+        wake_end = natural_cfg.get("wake_window_end") or ""
+        self._wake_window_strs: Optional[tuple[str, str]] = (
+            (str(wake_start), str(wake_end))
+            if wake_start and wake_end else None
+        )
+        self.wake_planner: Optional[SmartWakePlanner] = None
+        self._wake_light_targets: List[str] = list(
+            natural_cfg.get("wake_light_targets", []) or []
+        )
+
+        # Soundscape matcher.
+        self.sound_matcher: Optional[WhiteNoiseMatcher] = None
+        media_target = natural_cfg.get("whitenoise_target") or ""
+        if media_target:
+            self.sound_matcher = WhiteNoiseMatcher(
+                media_player_entity=str(media_target),
+                user_overrides=natural_cfg.get("whitenoise_overrides") or {},
+                volume_scale=float(natural_cfg.get("whitenoise_volume_scale", 1.0)),
+                is_pre_wake=self._is_pre_wake,
+            )
+        self._last_soundscape: Optional[str] = None
+
+        # Subjective-feedback listener.
+        self.feedback: Optional[SubjectiveFeedbackListener] = None
+        fb_entity = natural_cfg.get("feedback_entity") or ""
+        if fb_entity:
+            self.feedback = SubjectiveFeedbackListener(
+                str(fb_entity),
+                scale=int(natural_cfg.get("feedback_scale", 5)),
+            )
+
         # Runtime state
         self.session_id = uuid.uuid4().hex[:8]
         self.session_started_at = time.time()
         self.stage_counts: Dict[str, int] = {
             "AWAKE": 0, "LIGHT": 0, "DEEP": 0, "REM": 0,
         }
+        # Sequence of (SleepStage) per inference for SE/WASO/SOL scoring.
+        self.stage_sequence: List[SleepStage] = []
         self.last_env = EnvironmentParams()
         self.stop_event = asyncio.Event()
         # The publisher is created once HA is reachable; until then it stays
@@ -295,6 +370,13 @@ class SmartSleepService:
         if event.new_state is None:
             return
         eid = event.entity_id
+
+        # Feedback helper comes first: it wants the raw string state of
+        # ``input_number.sleep_rating``, not a numeric coerced value.
+        if self.feedback is not None and eid == self.feedback.entity_id:
+            self.feedback.on_state_change(event)
+            return
+
         value = event.new_state.numeric_state()
         if value is None:
             return
@@ -403,11 +485,13 @@ class SmartSleepService:
         self,
         engine: _InferenceEngine,
         controller: SmartEnvironmentController,
+        ha: "HomeAssistantClient",
     ) -> None:
         try:
             while not self.stop_event.is_set():
                 stage, conf = engine.infer()
                 self.stage_counts[stage.name] = self.stage_counts.get(stage.name, 0) + 1
+                self.stage_sequence.append(stage)
                 logger.info(
                     "infer stage=%s conf=%.2f  env(T=%s H=%s)",
                     stage.name, conf,
@@ -440,6 +524,12 @@ class SmartSleepService:
                         await self.publisher.publish_last_action(
                             summary, executed=not self.ctrl_cfg.dry_run,
                         )
+
+                # --- Smart-wake tick -------------------------------- #
+                await self._wake_tick(ha, stage, conf)
+
+                # --- Soundscape tick -------------------------------- #
+                await self._soundscape_tick(ha, stage, conf)
 
                 # Periodic buffer dump so a sudden power loss never wipes
                 # more than ``infer_interval`` seconds of warm-up.
@@ -483,7 +573,33 @@ class SmartSleepService:
             return
         if sum(self.stage_counts.values()) == 0:
             return
-        score = compute_quality_score(self.stage_counts)
+
+        # ---- Polysomnography-grade scoring (v1.2.0) ----------------- #
+        # Compute SE / WASO / SOL from the full stage sequence and blend
+        # in the user's subjective rating (if any).  Falls back to the
+        # legacy architecture-only score if we have < 10 epochs of data.
+        subj_snap = self.feedback.consume() if self.feedback is not None else None
+        subj_score = subj_snap.score if subj_snap is not None else None
+        metrics = None
+        if len(self.stage_sequence) >= 10:
+            metrics = compute_metrics(
+                self.stage_sequence,
+                epoch_seconds=float(self.args.infer_interval),
+            )
+            sub_scores = compute_objective_quality(metrics)
+            score = blend_subjective(
+                sub_scores["composite"], subj_score,
+            )
+        else:
+            score = _legacy_quality_score(self.stage_counts)
+            if subj_score is not None:
+                score = blend_subjective(score, subj_score)
+
+        # Record subjective notes on the session for traceability.
+        notes = "auto checkpoint" if partial else "session end"
+        if subj_score is not None:
+            notes += f" (subjective={subj_score:.1f})"
+
         session = SleepSession(
             session_id=self.session_id + ("-partial" if partial else ""),
             started_at=self.session_started_at,
@@ -497,7 +613,7 @@ class SmartSleepService:
             stage_counts=dict(self.stage_counts),
             quality_score=score,
             n_samples=sum(self.stage_counts.values()),
-            notes="auto checkpoint" if partial else "session end",
+            notes=notes,
         )
         try:
             self.learner.record_session(session)
@@ -506,13 +622,31 @@ class SmartSleepService:
                 "Session %s checkpoint — quality=%.1f (history: %s)",
                 session.session_id, score, self.learner.status(),
             )
+            # Feed the same evidence into the user profile so the
+            # recommended-sleep-hours estimate tracks the user's
+            # actual "good night" distribution.
+            try:
+                actual_hours = max(
+                    0.0, (session.ended_at - session.started_at) / 3600.0,
+                )
+                self.profile.record_quality_session(
+                    actual_hours,
+                    objective_score=score,
+                    subjective_score=subj_score,
+                )
+                self.profile_store.save(self.profile)
+            except Exception as exc:    # noqa: BLE001
+                logger.warning("Profile update skipped: %s", exc)
+
             # Reflect the latest score on the Lovelace card.  We're inside a
             # sync method here so schedule the coroutine — best-effort.
             if self.publisher is not None:
                 try:
-                    asyncio.get_event_loop().create_task(
-                        self.publisher.publish_quality(score),
-                    )
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(self.publisher.publish_quality(score))
+                    # Also refresh debt + bedtime entities because the
+                    # new session just became history.
+                    loop.create_task(self._publish_debt_and_bedtime())
                 except RuntimeError:
                     # No running loop (e.g. last call during shutdown). Skip.
                     pass
@@ -579,6 +713,13 @@ class SmartSleepService:
             # Diagnostic state publisher — populates HA Lovelace entities.
             self.publisher = SleepStatePublisher(ha)
 
+            # Publish an initial debt/bedtime snapshot so Lovelace has
+            # something to show before the first session ends.
+            try:
+                await self._publish_debt_and_bedtime()
+            except Exception as exc:    # noqa: BLE001
+                logger.warning("Initial debt/bedtime publish failed: %s", exc)
+
             await ha.connect_websocket()
             await ha.subscribe_state_changes()
 
@@ -588,7 +729,7 @@ class SmartSleepService:
                     name="ws_listener",
                 ),
                 asyncio.create_task(
-                    self._task_inference_loop(engine, controller),
+                    self._task_inference_loop(engine, controller, ha),
                     name="inference_loop",
                 ),
                 asyncio.create_task(
@@ -621,6 +762,185 @@ class SmartSleepService:
                 engine.save_buffers(_BUFFER_PATH)
                 self._persist_session(controller, partial=False)
         return 0
+
+    # ================================================================== #
+    # Natural-sleep helpers (v1.2.0)                                      #
+    # ================================================================== #
+
+    def _is_pre_wake(self, now: Any) -> bool:
+        """True iff the current time is inside the light-ramp window.
+
+        Used by :class:`WhiteNoiseMatcher` to override the stage-based
+        soundscape with the dawn-chorus once we're approaching wake.
+        """
+        if self.wake_planner is None:
+            return False
+        from datetime import datetime, timedelta
+        if not isinstance(now, datetime):
+            return False
+        ramp_start = self.wake_planner.window.end - timedelta(
+            minutes=self.wake_planner.light_ramp_min,
+        )
+        return ramp_start <= now <= self.wake_planner.window.end
+
+    def _ensure_wake_planner(self) -> Optional[SmartWakePlanner]:
+        """Build or refresh ``self.wake_planner`` for tonight's window.
+
+        Called lazily on each tick so the window always refers to the
+        *next* occurrence; once a wake fires we mark the planner as
+        woken and null it out so the next pass builds tomorrow's.
+        """
+        if self._wake_window_strs is None:
+            return None
+        if self.wake_planner is not None and not self.wake_planner._woken:
+            return self.wake_planner
+        try:
+            window = WakeWindow.from_strings(*self._wake_window_strs)
+        except Exception as exc:     # noqa: BLE001
+            logger.warning("Bad wake window %r: %s", self._wake_window_strs, exc)
+            return None
+        self.wake_planner = SmartWakePlanner(window)
+        logger.info(
+            "Smart wake planner armed: window %s .. %s",
+            window.start.isoformat(), window.end.isoformat(),
+        )
+        return self.wake_planner
+
+    async def _wake_tick(
+        self,
+        ha: "HomeAssistantClient",
+        stage: SleepStage,
+        conf: float,
+    ) -> None:
+        """Advance the smart-wake state machine by one inference tick."""
+        planner = self._ensure_wake_planner()
+        if planner is None:
+            return
+        planner.observe_stage(stage, conf)
+        from datetime import datetime
+        plan = planner.tick(now=datetime.utcnow())
+
+        # Publish the decision regardless so the user sees progress.
+        if self.publisher is not None:
+            await self.publisher.publish_wake_decision(
+                plan.decision.value,
+                reason=plan.reason,
+                alarm_time=plan.alarm_time,
+                light_ramp_start=plan.light_ramp_start,
+                matched_stage=plan.matched_stage,
+            )
+
+        # Light ramp: gentle brightness curve over the ramp window.
+        if plan.decision in (WakeDecision.PRE_RAMP, WakeDecision.OPEN_WINDOW):
+            if plan.light_ramp_start and plan.alarm_time and self._wake_light_targets:
+                brightness = light_ramp_brightness(
+                    now=datetime.utcnow(),
+                    ramp_start=plan.light_ramp_start,
+                    ramp_end=plan.alarm_time,
+                )
+                if not self.ctrl_cfg.dry_run:
+                    for eid in self._wake_light_targets:
+                        try:
+                            await ha.call_service(
+                                "light", "turn_on",
+                                entity_id=eid,
+                                brightness_pct=max(1.0, brightness),
+                            )
+                        except Exception as exc:    # noqa: BLE001
+                            logger.warning(
+                                "Light ramp failed for %s: %s", eid, exc,
+                            )
+
+        if plan.decision == WakeDecision.FIRE_NOW:
+            logger.info(
+                "Smart wake: firing alarm (reason=%s stage=%s)",
+                plan.reason, plan.matched_stage,
+            )
+            if not self.ctrl_cfg.dry_run:
+                for eid in self._wake_light_targets:
+                    try:
+                        await ha.call_service(
+                            "light", "turn_on",
+                            entity_id=eid, brightness_pct=100,
+                        )
+                    except Exception as exc:    # noqa: BLE001
+                        logger.warning("Wake light %s failed: %s", eid, exc)
+            planner.mark_woken()
+
+    async def _soundscape_tick(
+        self,
+        ha: "HomeAssistantClient",
+        stage: SleepStage,
+        conf: float,
+    ) -> None:
+        """Push the stage-appropriate soundscape to the user's speaker."""
+        if self.sound_matcher is None:
+            return
+        from datetime import datetime
+        policy = self.sound_matcher.policy_for(
+            stage, conf, now=datetime.utcnow(),
+        )
+        current_id = f"{policy.soundscape.value}@{int(policy.volume_pct)}"
+        # Only act on genuine transitions.
+        if current_id == self._last_soundscape:
+            return
+        self._last_soundscape = current_id
+
+        if self.publisher is not None:
+            await self.publisher.publish_soundscape(
+                policy.soundscape.value,
+                volume_pct=policy.volume_pct,
+                reason=policy.reason,
+            )
+
+        if self.ctrl_cfg.dry_run:
+            return
+        target = self.sound_matcher.media_player_entity
+        if not target:
+            return
+        try:
+            if policy.soundscape == Soundscape.OFF:
+                await ha.call_service(
+                    "media_player", "media_stop", entity_id=target,
+                )
+                return
+            url = self.sound_matcher.media_url(policy.soundscape)
+            if url:
+                await ha.call_service(
+                    "media_player", "play_media",
+                    entity_id=target,
+                    media_content_id=url,
+                    media_content_type="music",
+                )
+            await ha.call_service(
+                "media_player", "volume_set",
+                entity_id=target,
+                volume_level=max(0.0, min(1.0, policy.volume_pct / 100.0)),
+            )
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Soundscape control failed: %s", exc)
+
+    async def _publish_debt_and_bedtime(self) -> None:
+        """Refresh sensor.sleep_classifier_debt_hours + recommended_bedtime."""
+        if self.learner is None or self.publisher is None:
+            return
+        try:
+            sessions = self.learner._load()    # type: ignore[attr-defined]
+            tracker = SleepDebtTracker.from_sessions(self.profile, sessions)
+            plan = tracker.plan_recovery(wake_window=self._wake_window_strs)
+            await self.publisher.publish_debt(
+                plan.current_debt_hours,
+                severity=plan.severity.value,
+                target_hours=self.profile.recommended_total_sleep_hours(),
+                nights_to_full_recovery=plan.nights_to_full_recovery,
+            )
+            await self.publisher.publish_recommended_bedtime(
+                plan.tonight_bedtime,
+                tonight_target_hours=plan.tonight_target_hours,
+                reason=plan.message,
+            )
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Could not publish debt/bedtime: %s", exc)
 
     def _log_binding_help(self, entities: List[HAEntity]) -> None:
         """Print top candidate entity_ids per slot to help the user bind them.

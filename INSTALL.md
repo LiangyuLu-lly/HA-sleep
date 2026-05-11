@@ -258,6 +258,118 @@ action:
 
 ---
 
+## 拟自然睡眠功能(v1.2.0 新增)
+
+v1.2.0 新增 5 个"拟自然睡眠"模块,全部**可选**,在 Configuration tab
+按需开启。
+
+### 1. 睡眠债务(核心专利)
+
+填 `birth_year`(如 `1995`)启用。add-on 从你的历史会话 vs 年龄段推荐时长
+(NSF/AAP 2015/2016)算累积债务,Lovelace 看:
+
+```yaml
+type: entity
+entity: sensor.sleep_classifier_debt_hours
+# attributes 里还有: severity / nightly_target_hours / nights_to_full_recovery
+```
+
+结合 `wake_window_start` / `wake_window_end`,会同步输出今晚推荐就寝:
+
+```text
+sensor.sleep_classifier_recommended_bedtime = "2026-05-12T23:35:00"
+  attr: tonight_target_hours = 10.5
+  attr: reason = "You're 3.2 h in debt — too large for one night..."
+```
+
+恢复策略基于 Van Dongen 2003 + Belenky 2003:小债务(≤ 2h)一晚补足;
+大债务多晚分摊(每晚还 50 %),直到 < 0.5 h 视为归零。
+
+### 2. 智能唤醒
+
+给一个**窗口** 而不是一个点,系统在窗口内自动选最优唤醒时刻:
+
+```yaml
+wake_window_start: "07:00"
+wake_window_end: "07:30"
+wake_light_targets:
+  - light.bedroom_main
+  - light.bedroom_bedside
+```
+
+逻辑:窗口开始前 30 min 开始光线渐进 ramp(Phipps-Nelson 2003);窗口内
+优先在 **LIGHT / post-REM 边界**触发(Hilditch & McHill 2019);若到
+窗口末还在 DEEP,60 秒安全边际强制唤醒(不会迟到)。
+
+实时决策看 `sensor.sleep_classifier_wake_decision`:
+`hold → pre_ramp → open_window → fire_now`。
+
+### 3. 白噪音匹配
+
+把一个 `media_player` 绑到 `whitenoise_target`,系统按阶段自动切音乐:
+
+```text
+AWAKE (入睡前) → 雨声 30 %
+LIGHT          → 粉红噪声 22 %
+DEEP           → 棕色噪声 18 %  (Papalambros 2017)
+REM            → 静音       (Massar 2024: 噪音碎片化梦境)
+PRE-WAKE       → 晨鸟声 35 %   (Geerdink 2016)
+```
+
+Lovelace:`sensor.sleep_classifier_soundscape` enum 实体实时显示当前音轨。
+
+### 4. 主观反馈作权重
+
+在 **Settings → Devices & Services → Helpers** 建一个 `input_number`
+(范围 1-5),填到 `feedback_entity`:
+
+```yaml
+feedback_entity: input_number.sleep_rating
+feedback_scale: 5
+```
+
+起床后给自己打分,下一个会话结算时会把 1-5 映射成 0-100,与客观分
+(架构 + SE + WASO + SOL,AASM + Ohayon 2017)加权 60/40 混合;
+同时喂给偏好学习器 + UserProfile 的贝叶斯后验更新,让系统学到
+"你的好觉"。
+
+### 5. 用户画像
+
+`birth_year` + `chronotype: morning/evening/neutral` 驱动。**9 个年龄
+段**(新生儿/婴儿/幼儿/学龄前/学龄/青少年/青年/成年/老年)按 NSF/AAP
+论文查表得推荐时长,再经 7 晚 pseudo-count 贝叶斯先验 × 你的实际高质量
+夜晚更新个人后验(clamped 在年龄段 low/high 区间)。文件:
+`/data/user_profile.json`。
+
+### 示例 Lovelace 卡片 v2(替换上面 v1.1.0 的)
+
+```yaml
+type: vertical-stack
+cards:
+  - type: glance
+    title: 睡眠监测
+    entities:
+      - entity: sensor.sleep_classifier_stage
+        name: 当前阶段
+      - entity: sensor.sleep_classifier_debt_hours
+        name: 睡眠债
+      - entity: sensor.sleep_classifier_recommended_bedtime
+        name: 今晚就寝
+      - entity: sensor.sleep_classifier_wake_decision
+        name: 闹钟状态
+      - entity: sensor.sleep_classifier_soundscape
+        name: 当前音轨
+      - entity: sensor.sleep_classifier_quality_score
+        name: 上次评分
+  - type: history-graph
+    title: 整夜睡眠分期 + 质量趋势
+    hours_to_show: 24
+    entities:
+      - sensor.sleep_classifier_stage
+      - sensor.sleep_classifier_quality_score
+      - sensor.sleep_classifier_debt_hours
+```
+
 ## 多房间 / 多床位(夫妻房 + 客房)
 
 HA Supervisor 不允许同一 slug 的 add-on 装两份,所以如果你想在两个

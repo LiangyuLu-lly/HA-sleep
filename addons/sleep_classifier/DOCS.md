@@ -1,7 +1,9 @@
-# Sleep Classifier — Home Assistant Add-on (v1.1.0)
+# Sleep Classifier — Home Assistant Add-on (v1.2.0)
 
 A deep-learning sleep stage classifier with **closed-loop smart-home
-control**.  When you sleep, the add-on:
+control** and a **natural-sleep suite** (sleep-debt accounting, smart
+wake, soundscape matching, preference learning, subjective feedback).
+When you sleep, the add-on:
 
 1. **Auto-discovers** physiological sensors (heart-rate, motion, breathing
    rate) and tunable devices (lights, climate, humidifier, fan) you
@@ -80,6 +82,60 @@ multiple.  Leave any field empty to fall back to keyword auto-discovery.
 | `controllable_domains` | `[light, climate, fan, humidifier]` | Domains the add-on may invoke services on. |
 | `explicit_includes` | `[]` | Entity IDs to *always* include even if filters skip them. |
 | `explicit_excludes` | `[]` | Entity IDs to *never* touch (overrides everything). |
+
+### Natural-sleep suite (v1.2.0)
+
+Opt-in features.  Each is independently enabled by filling the relevant
+fields; leaving any of them empty disables just that feature.
+
+| Option | Example value | What it does |
+|---|---|---|
+| `birth_year` | `1995` | Drives NSF/AAP sleep-hour recommendation + debt. `0` = unknown → assume adult. |
+| `chronotype` | `evening` | Informational; reserved for future auto-scheduling. |
+| `wake_window_start` / `wake_window_end` | `"07:00"` / `"07:30"` | Smart wake fires inside this interval on the first LIGHT / REM-exit stage. |
+| `wake_light_targets` | `[light.bedroom_main]` | Lights to ramp in the 30 min leading up to the wake window. |
+| `whitenoise_target` | `media_player.bedroom_speaker` | Single speaker receiving stage-appropriate audio. |
+| `whitenoise_volume_scale` | `0.8` | Global multiplier on per-stage default volumes. |
+| `feedback_entity` | `input_number.sleep_rating` | HA helper you nudge in the morning — feeds into quality score + profile. |
+| `feedback_scale` | `5` | Range of the helper (1..scale). |
+
+**Four more Lovelace entities** appear once natural-sleep is active:
+
+```text
+sensor.sleep_classifier_debt_hours            # signed hours; + = behind
+sensor.sleep_classifier_recommended_bedtime   # ISO timestamp for tonight
+sensor.sleep_classifier_wake_decision         # hold / pre_ramp / ... / fire_now
+sensor.sleep_classifier_soundscape            # pink_noise / rain / off / ...
+```
+
+How each module works:
+
+* **User profile** — ages mapped to NSF/AAP cohorts (newborn … senior) and
+  their recommended hours.  After every high-quality night (objective ≥
+  60 AND subjective ≥ 3/5) the profile's Bayesian posterior nudges your
+  personal target; we clamp it inside the cohort's (low, high) range so
+  a personal estimate can never push you below the clinical floor.
+  *Refs:* Hirshkowitz 2015, Paruthi 2016.
+* **Sleep debt** — age-weighted sum of shortfalls over the past 7 days
+  at full weight, with geometric decay beyond that.  A recovery plan
+  chooses between *single-night* (≤ 2 h debt) and *multi-night paydown*
+  (50 % per night) using the saturating efficiency curve ``η(extra) =
+  1 − exp(−extra / 1.5 h)``.  A single recovery night never contributes
+  more than 2 h of effective debt repayment, per Van Dongen 2003.
+* **Smart wake** — decision enum `HOLD → PRE_RAMP → OPEN_WINDOW → FIRE_NOW`.
+  Inside the window we wait for a LIGHT / post-REM boundary with
+  confidence ≥ 0.55 and a 3-tick DEEP-free debounce; if the window
+  closes first, a 60-second safety margin forces a wake regardless.
+  *Refs:* Hilditch & McHill 2019, Trotter 2018, Phipps-Nelson 2003.
+* **Soundscape matcher** — stage-driven soundscapes, all replaceable:
+  rain (AWAKE onset), pink (LIGHT), brown (DEEP), silence (REM), dawn
+  chorus (pre-wake).  Uses `media_player.play_media` + `volume_set`.
+  *Refs:* Papalambros 2017, Stanchina 2005, Mart​íns 2022.
+* **Quality score v2** — adds Sleep Efficiency, WASO, Sleep-Onset
+  Latency to the existing architecture score, then blends in your
+  1-5 subjective rating.  *Refs:* AASM Scoring Manual 2.6, Ohayon 2017.
+* **Feedback listener** — buffers the latest `input_number` value with
+  18-hour freshness check; each rating counts for exactly one session.
 
 Click **Save**, then **Start** on the Info tab.
 
@@ -214,6 +270,43 @@ SUPERVISOR_TOKEN by restarting the supervisor.
 Just click **Uninstall** in the add-on info page.  The supervisor removes
 the container and image; if you also want to wipe learned preferences,
 remove `/data/user_preferences.json` first via the SSH add-on.
+
+## Scientific references (natural-sleep suite)
+
+The natural-sleep modules cite these peer-reviewed sources:
+
+* Hirshkowitz M et al. **National Sleep Foundation's sleep time
+  duration recommendations: methodology and results summary**,
+  *Sleep Health* 1 (2015) 40-43.
+* Paruthi S et al. **Recommended Amount of Sleep for Pediatric
+  Populations: A Consensus Statement of the American Academy of
+  Sleep Medicine**, *J Clin Sleep Med* 12 (2016) 785-786.
+* Van Dongen HPA et al. **The cumulative cost of additional
+  wakefulness: dose-response effects on neurobehavioral functions
+  and sleep physiology from chronic sleep restriction and total
+  sleep deprivation**, *Sleep* 26 (2003) 117-126.
+* Belenky G et al. **Patterns of performance degradation and
+  restoration during sleep restriction and subsequent recovery**,
+  *J Sleep Res* 12 (2003) 1-12.
+* Banks S et al. **Neurobehavioral dynamics following chronic sleep
+  restriction: dose-response effects of one night for recovery**,
+  *Sleep* 33 (2010) 1013-1026.
+* Hilditch CJ, McHill AW. **Sleep inertia: current insights**,
+  *Nat Sci Sleep* 11 (2019) 155-165.
+* Phipps-Nelson J et al. **Daytime exposure to bright light...
+  decreases sleepiness and improves psychomotor vigilance
+  performance**, *Sleep* 26 (2003) 695-700.
+* Papalambros NA et al. **Acoustic Enhancement of Sleep Slow
+  Oscillations and Concomitant Memory Improvement in Older
+  Adults**, *Front Hum Neurosci* 11 (2017) 109.
+* Mart​íns DF et al. **Effects of white noise on sleep onset
+  latency in adult patients with insomnia**, *Sleep Med Rev* 64
+  (2022) 101647.
+* Ohayon MM et al. **National Sleep Foundation's sleep quality
+  recommendations: first report**, *Sleep Health* 3 (2017) 6-19.
+* Buysse DJ et al. **The Pittsburgh Sleep Quality Index**,
+  *Psychiatry Res* 28 (1989) 193-213.
+* Berry RB et al. *AASM Manual for the Scoring of Sleep* (v2.6).
 
 ## More information
 

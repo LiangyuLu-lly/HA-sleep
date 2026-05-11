@@ -49,6 +49,17 @@ DOMAINS=$(opt_array_to_csv '.controllable_domains // []')
 INCLUDES=$(opt_array_to_csv '.explicit_includes // []')
 EXCLUDES=$(opt_array_to_csv '.explicit_excludes // []')
 
+# Natural-sleep suite (v1.2.0)
+BIRTH_YEAR=$(opt '.birth_year // 0')
+CHRONOTYPE=$(opt '.chronotype // "neutral"')
+WAKE_START=$(opt '.wake_window_start // ""')
+WAKE_END=$(opt '.wake_window_end // ""')
+WAKE_LIGHTS=$(opt_array_to_csv '.wake_light_targets // []')
+WHITENOISE_TARGET=$(opt '.whitenoise_target // ""')
+WHITENOISE_VOLUME_SCALE=$(opt '.whitenoise_volume_scale // 1.0')
+FEEDBACK_ENTITY=$(opt '.feedback_entity // ""')
+FEEDBACK_SCALE=$(opt '.feedback_scale // 5')
+
 # ── Generate an effective config.json that merges user options on top of the
 # ── bundled defaults.  Done in Python because jq + nested merge is awkward.
 python3 - <<PY
@@ -117,6 +128,32 @@ learner["exploration_rate"] = float("""$EXPLORATION_RATE""")
 # Persist preferences on the supervisor's /data volume so they survive
 # add-on reinstalls.
 learner["history_path"] = "/data/user_preferences.json"
+
+# ----- Natural-sleep block (v1.2.0) ------------------------------------
+# ``SmartSleepService`` reads everything under home_assistant.natural_sleep
+# and treats each sub-field as independently optional.  We drop empty
+# strings / zero ints so absent fields stay absent (vs. confusing the
+# dataclass with "" defaults).
+natural = {
+    "user_id": "default",
+    "chronotype": """$CHRONOTYPE""",
+    "wake_window_start": """$WAKE_START""",
+    "wake_window_end": """$WAKE_END""",
+    "wake_light_targets": csv_to_list("""$WAKE_LIGHTS"""),
+    "whitenoise_target": """$WHITENOISE_TARGET""",
+    "whitenoise_volume_scale": float("""$WHITENOISE_VOLUME_SCALE"""),
+    "feedback_entity": """$FEEDBACK_ENTITY""",
+    "feedback_scale": int("""$FEEDBACK_SCALE"""),
+}
+try:
+    by = int("""$BIRTH_YEAR""" or 0)
+except Exception:
+    by = 0
+if by > 0:
+    natural["birth_year"] = by
+# Drop empty strings so Python's ``or`` short-circuits in the service.
+natural = {k: v for k, v in natural.items() if v != ""}
+ha["natural_sleep"] = natural
 
 # Write the effective config inside /data so we don't mutate the read-only
 # image layer.

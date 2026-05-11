@@ -42,6 +42,12 @@ ENTITY_QUALITY = "sensor.sleep_classifier_quality_score"
 ENTITY_DURATION = "sensor.sleep_classifier_session_duration"
 ENTITY_LAST_ACTION = "sensor.sleep_classifier_last_action"
 
+# v1.2.0 — natural-sleep entities
+ENTITY_DEBT = "sensor.sleep_classifier_debt_hours"
+ENTITY_RECOMMENDED_BEDTIME = "sensor.sleep_classifier_recommended_bedtime"
+ENTITY_WAKE_DECISION = "sensor.sleep_classifier_wake_decision"
+ENTITY_SOUNDSCAPE = "sensor.sleep_classifier_soundscape"
+
 # ``icon: mdi:...`` strings render in Lovelace.  ``state_class`` and
 # ``device_class`` enable HA's long-term statistics (so the user gets a
 # free trend graph without writing a SQL query).
@@ -74,6 +80,34 @@ _STATIC_ATTRS_DURATION = {
 _STATIC_ATTRS_LAST_ACTION = {
     "friendly_name": "Last sleep automation action",
     "icon": "mdi:robot",
+}
+_STATIC_ATTRS_DEBT = {
+    "friendly_name": "Sleep debt",
+    "icon": "mdi:bank-minus",
+    "unit_of_measurement": "h",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_RECOMMENDED_BEDTIME = {
+    "friendly_name": "Recommended bedtime tonight",
+    "icon": "mdi:bed-clock",
+    "device_class": "timestamp",
+}
+_STATIC_ATTRS_WAKE_DECISION = {
+    "friendly_name": "Smart wake decision",
+    "icon": "mdi:alarm",
+    "device_class": "enum",
+    "options": ["hold", "pre_ramp", "open_window", "fire_now", "post_wake"],
+}
+_STATIC_ATTRS_SOUNDSCAPE = {
+    "friendly_name": "Current soundscape",
+    "icon": "mdi:weather-rainy",
+    "device_class": "enum",
+    # 7 non-off soundscapes + "off".  Keep list in sync with
+    # :class:`src.whitenoise_matcher.Soundscape`.
+    "options": [
+        "off", "pink_noise", "brown_noise", "white_noise",
+        "rain", "wind", "ocean", "dawn_chorus",
+    ],
 }
 
 
@@ -164,6 +198,97 @@ class SleepStatePublisher:
         await self._safe_update(
             ENTITY_DURATION, int(seconds), _STATIC_ATTRS_DURATION,
         )
+
+    async def publish_debt(
+        self,
+        debt_hours: float,
+        *,
+        severity: str,
+        target_hours: Optional[float] = None,
+        nights_to_full_recovery: Optional[int] = None,
+    ) -> None:
+        """Reflect the sleep-debt accountant's latest read-out.
+
+        Extras (severity / target / recovery nights) are attached as
+        entity attributes so Lovelace can show them on a badge card
+        without a second entity per metric.
+        """
+        attrs = dict(_STATIC_ATTRS_DEBT)
+        attrs["severity"] = severity
+        if target_hours is not None:
+            attrs["nightly_target_hours"] = round(float(target_hours), 2)
+        if nights_to_full_recovery is not None:
+            attrs["nights_to_full_recovery"] = int(nights_to_full_recovery)
+        await self._safe_update(
+            ENTITY_DEBT, round(float(debt_hours), 2), attrs,
+        )
+
+    async def publish_recommended_bedtime(
+        self,
+        bedtime: Optional[Any],
+        *,
+        tonight_target_hours: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Publish the bedtime suggested by :class:`SleepDebtTracker`.
+
+        ``bedtime`` is expected to be a :class:`datetime.datetime`.  If
+        ``None`` (no wake window set yet), we write the ``"unknown"``
+        sentinel so HA keeps the entity in its state machine.
+        """
+        attrs = dict(_STATIC_ATTRS_RECOMMENDED_BEDTIME)
+        if tonight_target_hours is not None:
+            attrs["tonight_target_hours"] = round(float(tonight_target_hours), 2)
+        if reason:
+            attrs["reason"] = reason[:255]
+        if bedtime is None:
+            await self._safe_update(ENTITY_RECOMMENDED_BEDTIME, "unknown", attrs)
+            return
+        # HA's ``timestamp`` device_class requires an ISO 8601 string.
+        iso = bedtime.isoformat() if hasattr(bedtime, "isoformat") else str(bedtime)
+        await self._safe_update(ENTITY_RECOMMENDED_BEDTIME, iso, attrs)
+
+    async def publish_wake_decision(
+        self,
+        decision: str,
+        *,
+        reason: Optional[str] = None,
+        alarm_time: Optional[Any] = None,
+        light_ramp_start: Optional[Any] = None,
+        matched_stage: Optional[str] = None,
+    ) -> None:
+        """Reflect the :class:`SmartWakePlanner` current decision."""
+        attrs = dict(_STATIC_ATTRS_WAKE_DECISION)
+        if reason:
+            attrs["reason"] = reason[:255]
+        if alarm_time is not None:
+            attrs["alarm_time"] = (
+                alarm_time.isoformat()
+                if hasattr(alarm_time, "isoformat") else str(alarm_time)
+            )
+        if light_ramp_start is not None:
+            attrs["light_ramp_start"] = (
+                light_ramp_start.isoformat()
+                if hasattr(light_ramp_start, "isoformat") else str(light_ramp_start)
+            )
+        if matched_stage:
+            attrs["matched_stage"] = matched_stage
+        await self._safe_update(ENTITY_WAKE_DECISION, str(decision), attrs)
+
+    async def publish_soundscape(
+        self,
+        soundscape: str,
+        *,
+        volume_pct: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Reflect the current :class:`WhiteNoiseMatcher` policy."""
+        attrs = dict(_STATIC_ATTRS_SOUNDSCAPE)
+        if volume_pct is not None:
+            attrs["volume_pct"] = round(float(volume_pct), 1)
+        if reason:
+            attrs["reason"] = reason[:255]
+        await self._safe_update(ENTITY_SOUNDSCAPE, str(soundscape), attrs)
 
     async def publish_last_action(
         self, summary: str, *, executed: bool,

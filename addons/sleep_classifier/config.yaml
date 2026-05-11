@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.1.0"
+version: "1.2.0"
 slug: sleep_classifier
 description: >-
   Deep-learning sleep stage classifier (CNN-BiLSTM) with closed-loop smart
@@ -126,6 +126,36 @@ options:
   explicit_includes: []           # entity_ids to force-include in scan
   explicit_excludes: []           # entity_ids to never touch
 
+  # ---- Natural-sleep suite (v1.2.0) -------------------------------------
+  # All fields below are OPTIONAL.  Empty strings / empty lists disable the
+  # matching feature without error, so you can turn on one module at a time.
+
+  # --- User profile (drives NSF/AAP recommended sleep hours + debt) ---
+  birth_year: 0                   # 0 = unknown; otherwise e.g. 1995
+  chronotype: "neutral"           # "morning", "evening", or "neutral"
+
+  # --- Smart wake (selects the best wake moment inside a user window) ---
+  # Leave both strings empty to disable smart-wake.  If set, the add-on
+  # starts a 30-min dawn light ramp before window_start and fires the
+  # "wake" action on the first LIGHT/REM-exit inside the window.
+  wake_window_start: ""           # e.g. "07:00"
+  wake_window_end: ""             # e.g. "07:30"
+  wake_light_targets: []          # lights to ramp; e.g. [light.bedroom_main]
+
+  # --- White-noise / soundscape matcher ---
+  # Pick one media_player entity to receive stage-appropriate audio.
+  # Leave blank to disable.  Advanced users can override per-stage tracks
+  # via whitenoise_overrides (see DOCS.md).
+  whitenoise_target: ""           # e.g. media_player.bedroom_speaker
+  whitenoise_volume_scale: 1.0    # global multiplier on per-stage defaults
+
+  # --- Subjective feedback (morning "how did you sleep?" rating) ---
+  # Point this at an input_number helper you created in HA Settings
+  # → Devices & Services → Helpers.  The add-on picks up state changes
+  # automatically; you nudge it from Lovelace or a voice routine.
+  feedback_entity: ""             # e.g. input_number.sleep_rating
+  feedback_scale: 5               # 1..scale, usually 5 or 10
+
 # Schema validates user input in the UI.
 #
 # The trailing ``?`` in ``match(...)?`` makes a field optional (allows the
@@ -170,3 +200,15 @@ schema:
     - str
   explicit_excludes:
     - str
+
+  # Natural-sleep suite ----------------------------------------------------
+  birth_year: "int(0,2100)?"
+  chronotype: "list(morning|evening|neutral)?"
+  wake_window_start: "match(^([01]?\\d|2[0-3]):[0-5]\\d)?"
+  wake_window_end: "match(^([01]?\\d|2[0-3]):[0-5]\\d)?"
+  wake_light_targets:
+    - "match(^light\\.[a-zA-Z0-9_]+)"
+  whitenoise_target: "match(^media_player\\.[a-zA-Z0-9_]+)?"
+  whitenoise_volume_scale: "float(0,2)?"
+  feedback_entity: "match(^input_number\\.[a-zA-Z0-9_]+)?"
+  feedback_scale: "int(2,10)?"
