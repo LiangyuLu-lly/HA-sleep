@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.6.4"
+version: "1.7.0"
 slug: sleep_classifier
 description: >-
   Closed-loop smart-home sleep automation.  Subscribes to any HA
@@ -164,6 +164,22 @@ options:
   feedback_entity: ""             # e.g. input_number.sleep_rating
   feedback_scale: 5               # 1..scale, usually 5 or 10
 
+  # ---- Apnea / hypopnea trend (v1.7.0) ----------------------------------
+  # ALL fields OPT-IN.  Leave ``apnea_breathing_rate_source`` empty to
+  # disable the feature entirely — the sensor will stay at
+  # ``pending_consent`` and no breathing signal gets processed.
+  #
+  # Even with all three fields filled, the detector will NOT publish
+  # anything beyond ``pending_consent`` until you explicitly toggle on
+  # the input_boolean in ``apnea_consent_entity``.  First 7 nights
+  # after consent = ``calibrating`` (baseline collection); after that
+  # the sensor reports ``green`` / ``amber`` / ``red``.  No numeric
+  # AHI is ever surfaced — see docs/BACKLOG.md for the rationale.
+  apnea_breathing_rate_source: ""      # e.g. sensor.r60abd1_breathing_rate
+  apnea_chest_amplitude_source: ""     # e.g. sensor.r60abd1_chest_amplitude
+  apnea_consent_entity: "input_boolean.sleep_classifier_apnea_consent"
+  apnea_calibration_nights: 7
+
 # Schema validates user input in the UI.
 #
 # The trailing ``?`` in ``match(...)?`` makes a field optional (allows the
@@ -225,3 +241,9 @@ schema:
     - str
   feedback_entity: 'match(^$|^""$|^input_number\.[a-zA-Z0-9_]+$)?'
   feedback_scale: "int(2,10)?"
+
+  # Apnea wiring (v1.7.0) — all optional.
+  apnea_breathing_rate_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
+  apnea_chest_amplitude_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
+  apnea_consent_entity: 'match(^$|^""$|^input_boolean\.[a-zA-Z0-9_]+$)?'
+  apnea_calibration_nights: "int(1,30)?"

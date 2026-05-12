@@ -95,6 +95,7 @@ from src.smart_wake import (
     light_ramp_brightness,
 )
 from src.external_stage_subscriber import ExternalStageSubscriber
+from src.apnea_wiring import ApneaWiring, ApneaWiringConfig
 from src.user_profile import UserProfile, UserProfileStore
 from src.whitenoise_matcher import Soundscape, WhiteNoiseMatcher
 
@@ -193,6 +194,23 @@ class SmartSleepService:
         self._session_wake_dwell_seconds: float = float(
             lifecycle_cfg.get("wake_dwell_seconds", 600.0),
         )
+
+        # v1.7.0 — apnea trend detector.  Disabled by default; when a
+        # breathing-rate source is bound via Configuration the wiring
+        # layer subscribes to it, accumulates samples per session, and
+        # publishes a coarse red/amber/green trend AFTER an explicit
+        # consent toggle.  No numeric AHI is ever surfaced.
+        apnea_cfg = ApneaWiringConfig.from_dict(
+            ha_cfg.get("apnea", {}),
+        )
+        # Make the baseline path relative to PROJECT_ROOT only when
+        # it's a bare filename (tests); leave absolute paths (e.g.
+        # /data/apnea_baseline.json in the Add-on) untouched.
+        if apnea_cfg.baseline_path and not Path(apnea_cfg.baseline_path).is_absolute():
+            apnea_cfg.baseline_path = str(
+                (PROJECT_ROOT / apnea_cfg.baseline_path).resolve(),
+            )
+        self.apnea = ApneaWiring(apnea_cfg)
 
         # --- Natural-sleep modules (v1.2.0) ----------------------------- #
         # All of these are *optional*: if the user didn't configure the
@@ -391,6 +409,17 @@ class SmartSleepService:
             self.feedback.on_state_change(event)
             return
 
+        # ---- 2b. Apnea wiring (v1.7.0) ------------------------------
+        # The consent input_boolean carries a non-numeric state, so
+        # route the raw event.  Breathing-rate / chest-amplitude
+        # entities carry numeric values; we pass both the string state
+        # and the parsed numeric value so the wiring can choose.
+        numeric = event.new_state.numeric_state()
+        if self.apnea.on_state_change(
+            eid, event.new_state.state, numeric_value=numeric,
+        ):
+            return
+
         # ---- 3. Environment sensors ---------------------------------
         value = event.new_state.numeric_state()
         # HA returns ``"unavailable"`` / ``"unknown"`` as the state
@@ -559,6 +588,11 @@ class SmartSleepService:
                     # so the preference learner can later compute
                     # personalised AWAKE/LIGHT/DEEP/REM deltas.
                     self._track_per_stage_env(stage)
+                    # v1.7.0 — append a breathing-signal sample per
+                    # tick so the apnea detector has ~30 s hops to
+                    # look at.  No-op when apnea disabled or the
+                    # relevant rate/amplitude entities aren't bound.
+                    self.apnea.tick()
 
                 logger.info(
                     "infer stage=%s conf=%.2f  env(T=%s H=%s)%s",
@@ -1144,6 +1178,10 @@ class SmartSleepService:
                     "Session %s started (non-AWAKE held for >= %d s).",
                     self.session_id, int(self._session_onset_dwell_seconds),
                 )
+                # v1.7.0 — kick off the apnea sample buffer at the
+                # same boundary so respiratory data gets grouped with
+                # the right session.  No-op when apnea disabled.
+                self.apnea.begin_session()
             return
 
         # Already in a session — check for wake-up.
@@ -1153,7 +1191,37 @@ class SmartSleepService:
                 self.session_id, int(self._session_wake_dwell_seconds),
             )
             self._persist_session(controller, partial=False)
+            # v1.7.0 — finalise the apnea buffer + publish the trend.
+            # Done BEFORE _reset_session_state so the publish task can
+            # still read self.apnea state; the wiring owns its own
+            # session bookkeeping so our reset doesn't touch it.
+            self._finalise_apnea_session_async()
             self._reset_session_state()
+
+    def _finalise_apnea_session_async(self) -> None:
+        """Ask ``self.apnea`` for the final trend and schedule a publish.
+
+        Lives on its own method so tests can stub it.  Failure modes
+        (missing publisher, no baseline yet, apnea disabled) are all
+        swallowed — apnea diagnostics must never block the main
+        session-end flow, which carries the much more critical
+        quality-score + learner persistence.
+        """
+        try:
+            trend = self.apnea.end_session()
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Apnea end_session failed: %s", exc)
+            return
+        if trend is None or self.publisher is None:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.publisher.publish_apnea_index(
+                trend.value, status=self.apnea.status(),
+            ))
+        except RuntimeError:
+            # No running loop (shutdown path) — skip silently.
+            pass
 
     def _track_per_stage_env(self, raw_stage: SleepStage) -> None:
         """Record the current env as the snapshot for ``raw_stage``

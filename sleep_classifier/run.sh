@@ -66,6 +66,12 @@ WHITENOISE_TRACK_OVERRIDES=$(jq -r '.whitenoise_track_overrides // [] | join(";"
 FEEDBACK_ENTITY=$(opt '.feedback_entity // ""')
 FEEDBACK_SCALE=$(opt '.feedback_scale // 5')
 
+# Apnea wiring (v1.7.0)
+APNEA_RATE=$(opt '.apnea_breathing_rate_source // ""')
+APNEA_AMPLITUDE=$(opt '.apnea_chest_amplitude_source // ""')
+APNEA_CONSENT=$(opt '.apnea_consent_entity // ""')
+APNEA_CALIBRATION_NIGHTS=$(opt '.apnea_calibration_nights // 7')
+
 # ── Generate an effective config.json that merges user options on top of the
 # ── bundled defaults.  Done in Python because jq + nested merge is awkward.
 python3 - <<PY
@@ -233,6 +239,26 @@ if by > 0:
 # Drop empty strings so Python's ``or`` short-circuits in the service.
 natural = {k: v for k, v in natural.items() if v != ""}
 ha["natural_sleep"] = natural
+
+# ----- Apnea wiring block (v1.7.0) -------------------------------------
+# Feature is OFF unless the breathing-rate source is bound (the
+# amplitude source is optional — some radars only expose rate).  Even
+# when both are bound the detector still waits for the consent
+# input_boolean before publishing anything beyond pending_consent.
+_apnea_rate = _norm("""$APNEA_RATE""")
+_apnea_amplitude = _norm("""$APNEA_AMPLITUDE""")
+_apnea_consent = _norm("""$APNEA_CONSENT""") or (
+    "input_boolean.sleep_classifier_apnea_consent"
+)
+apnea = {
+    "enabled": bool(_apnea_rate),
+    "breathing_rate_source": _apnea_rate,
+    "chest_amplitude_source": _apnea_amplitude,
+    "consent_entity": _apnea_consent,
+    "baseline_path": "/data/apnea_baseline.json",
+    "calibration_nights": int("""$APNEA_CALIBRATION_NIGHTS"""),
+}
+ha["apnea"] = apnea
 
 # Write the effective config inside /data so we don't mutate the read-only
 # image layer.

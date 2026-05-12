@@ -16,6 +16,7 @@ import pytest
 
 from src.data_structures import SleepStage
 from src.sleep_state_publisher import (
+    ENTITY_APNEA_INDEX,
     ENTITY_CONFIDENCE,
     ENTITY_DEBT,
     ENTITY_DURATION,
@@ -384,20 +385,20 @@ class TestLearningPanelPublishers:
 class TestInitialPlaceholders:
     """Boot-time seeding: every owned entity must get a state immediately."""
 
-    async def test_publishes_all_fourteen_entities(
+    async def test_publishes_all_fifteen_entities(
         self, publisher: SleepStatePublisher, ha_client: AsyncMock,
     ) -> None:
         await publisher.publish_initial_placeholders()
         called = {c.args[0] for c in ha_client.update_state.call_args_list}
-        # v1.5.0: 5 legacy + 4 natural-sleep + 4 learning +
-        # 1 per-stage-deltas = 14 entities.
+        # v1.7.0: 5 legacy + 4 natural-sleep + 4 learning +
+        # 1 per-stage-deltas + 1 apnea-index = 15 entities.
         expected = {
             ENTITY_STAGE, ENTITY_CONFIDENCE, ENTITY_QUALITY, ENTITY_DURATION,
             ENTITY_LAST_ACTION, ENTITY_DEBT, ENTITY_RECOMMENDED_BEDTIME,
             ENTITY_WAKE_DECISION, ENTITY_SOUNDSCAPE,
             ENTITY_LEARNED_BEDTIME_WORKDAY, ENTITY_LEARNED_BEDTIME_WEEKEND,
             ENTITY_LEARNED_ENVIRONMENT, ENTITY_RECOMMENDATION_EXPLAIN,
-            ENTITY_PER_STAGE_DELTAS,
+            ENTITY_PER_STAGE_DELTAS, ENTITY_APNEA_INDEX,
         }
         assert called == expected
 
@@ -408,8 +409,8 @@ class TestInitialPlaceholders:
         publisher = SleepStatePublisher(ha_client)
         # Must not raise, even though every single update fails.
         await publisher.publish_initial_placeholders()
-        # v1.5.0: 14 entities seeded → 14 failures recorded.
-        assert publisher.stats.failures == 14
+        # v1.7.0: 15 entities seeded → 15 failures recorded.
+        assert publisher.stats.failures == 15
 
 
 # ---------------------------------------------------------------------------
@@ -506,3 +507,67 @@ class TestPublishPerStageDeltas:
         # ess_threshold also surfaced so dashboards can render a
         # progress bar without hard-coding 4.
         assert attrs["ess_threshold"] == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------------------
+# v1.7.0 — Apnea index publishing (medical-safety contract)
+# ---------------------------------------------------------------------------
+
+
+class TestPublishApneaIndex:
+    """Locks in the v1.7.0 medical-safety contract:
+
+    * The entity carries a prominent ``disclaimer`` attribute.
+    * Only the enum state (``pending_consent`` / ``calibrating`` /
+      ``green`` / ``amber`` / ``red``) reaches HA — never a numeric
+      events/hour / AHI value, even if the orchestrator mistakenly
+      passes one in.
+    """
+
+    async def test_pending_consent_carries_disclaimer(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_apnea_index("pending_consent")
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[0] == ENTITY_APNEA_INDEX
+        assert c.args[1] == "pending_consent"
+        attrs = c.kwargs["attributes"]
+        assert "disclaimer" in attrs
+        assert "diagnosis" in attrs["disclaimer"].lower()
+
+    async def test_trend_value_passed_through(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_apnea_index("green")
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[1] == "green"
+
+    async def test_status_filters_to_safe_keys_only(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        """Even if the caller passes clinical numbers in ``status``,
+        the publisher must STRIP them — only calibration progress /
+        consent flag / enabled flag are whitelisted.  This guards
+        against an orchestrator bug leaking AHI to the dashboard.
+        """
+        leaky_status = {
+            "enabled": True,
+            "consent": True,
+            "calibration_nights_completed": 5,
+            "calibration_nights_required": 7,
+            # These must be dropped by the publisher.
+            "events_per_hour": 12.0,
+            "ahi": 14.5,
+            "apnea_count": 3,
+        }
+        await publisher.publish_apnea_index("amber", status=leaky_status)
+        c = ha_client.update_state.call_args_list[0]
+        attrs = c.kwargs["attributes"]
+        assert attrs.get("consent") is True
+        assert attrs.get("calibration_nights_completed") == 5
+        # The forbidden keys must NOT be on the entity.
+        for forbidden in ("events_per_hour", "ahi", "apnea_count"):
+            assert forbidden not in attrs, (
+                f"Publisher leaked {forbidden} to HA — this breaks the "
+                f"v1.7.0 medical-safety contract."
+            )

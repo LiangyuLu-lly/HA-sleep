@@ -61,6 +61,20 @@ ENTITY_RECOMMENDATION_EXPLAIN = "sensor.sleep_classifier_recommendation_explain"
 # during their DEEP stage instead of 19.0 °C.
 ENTITY_PER_STAGE_DELTAS = "sensor.sleep_classifier_per_stage_deltas"
 
+# v1.7.0 — apnea/hypopnea trend sensor.
+#
+# IMPORTANT — this sensor INTENTIONALLY does not publish a numeric AHI.
+# AHI is a clinical metric; surfacing "AHI = 12" would be read as a
+# diagnosis.  Instead the state is one of:
+#   pending_consent   - user has not toggled input_boolean consent
+#   calibrating       - still collecting the first 7 nights of baseline
+#   green             - events/hour below AASM mild threshold
+#   amber             - AASM mild-to-moderate OSA bucket
+#   red               - AASM moderate-or-worse bucket
+# See docs/BACKLOG.md "Sleep apnea detector" section for the
+# medical-disclaimer rationale.
+ENTITY_APNEA_INDEX = "sensor.sleep_classifier_apnea_index"
+
 # ``icon: mdi:...`` strings render in Lovelace.  ``state_class`` and
 # ``device_class`` enable HA's long-term statistics (so the user gets a
 # free trend graph without writing a SQL query).
@@ -154,6 +168,22 @@ _STATIC_ATTRS_PER_STAGE_DELTAS = {
     # threshold, ``clinical`` when no learned override is active.
     "device_class": "enum",
     "options": ["clinical", "learning", "personalised"],
+}
+
+_STATIC_ATTRS_APNEA_INDEX = {
+    "friendly_name": "Apnea / hypopnea trend",
+    "icon": "mdi:lungs",
+    "device_class": "enum",
+    "options": [
+        "pending_consent", "calibrating", "green", "amber", "red",
+    ],
+    # Mirrored into the attributes panel so every Lovelace view of
+    # this entity carries the disclaimer.  Deliberately terse so
+    # it fits HA's 255-char attribute-value limit on older builds.
+    "disclaimer": (
+        "This is a TREND indicator, not a medical diagnosis. "
+        "Consult a sleep clinician for a real AHI."
+    ),
 }
 
 
@@ -516,6 +546,41 @@ class SleepStatePublisher:
 
         await self._safe_update(ENTITY_PER_STAGE_DELTAS, state, attrs)
 
+    async def publish_apnea_index(
+        self,
+        trend: str,
+        *,
+        status: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish the v1.7.0 apnea trend sensor.
+
+        ``trend`` is one of the enum option strings declared in
+        :data:`_STATIC_ATTRS_APNEA_INDEX` (``pending_consent`` /
+        ``calibrating`` / ``green`` / ``amber`` / ``red``).
+        ``status`` optionally carries calibration-progress /
+        consent-flag / last-trend diagnostics pulled from
+        :meth:`src.apnea_wiring.ApneaWiring.status`.
+
+        Intentionally never writes a numeric AHI or events/hour value
+        anywhere on this entity — the whole design is to keep clinical
+        numbers off the user-facing dashboard.  If a future release
+        decides to (e.g. under a second opt-in gate) it should use a
+        separate entity with an even more prominent disclaimer.
+        """
+        attrs = dict(_STATIC_ATTRS_APNEA_INDEX)
+        if status:
+            # Only forward diagnostic flags — not events/hour or
+            # baseline values that could be misread as AHI.
+            for key in (
+                "enabled",
+                "consent",
+                "calibration_nights_required",
+                "calibration_nights_completed",
+            ):
+                if key in status:
+                    attrs[key] = status[key]
+        await self._safe_update(ENTITY_APNEA_INDEX, str(trend), attrs)
+
     async def publish_last_action(
         self,
         summary: str,
@@ -607,6 +672,15 @@ class SleepStatePublisher:
         await self._safe_update(
             ENTITY_PER_STAGE_DELTAS, "clinical",
             _STATIC_ATTRS_PER_STAGE_DELTAS,
+        )
+        # v1.7.0 — apnea trend defaults to pending_consent even if the
+        # feature is enabled, because the user must still toggle the
+        # consent input_boolean before anything meaningful is
+        # published.  On add-ons where the feature is not configured
+        # at all, this is also the harmless default shown on Lovelace.
+        await self._safe_update(
+            ENTITY_APNEA_INDEX, "pending_consent",
+            _STATIC_ATTRS_APNEA_INDEX,
         )
 
     async def _safe_update(

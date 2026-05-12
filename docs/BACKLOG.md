@@ -135,49 +135,42 @@ Coverage report kept in CI thinking; not auto-published yet because
 the `pytest-cov` step adds ~0.7 s to the suite.  Add it once the
 suite breaks 1 s budget.
 
-## Sleep apnea detector — algorithm shipped, wiring deferred
+## Sleep apnea detector — algorithm + wiring shipped (v1.7.0) ✅
 
-**Status:** v1.6.0 shipped the **pure algorithm** in
-``src/apnea_detector.py`` with 20 tests + 94 % coverage.  The
-remaining work is the *orchestrator wiring* + consent flow, which
-is gated on an explicit user opt-in for medical-disclaimer reasons.
+**Status:** FULLY SHIPPED as of v1.7.0.
 
-### Why slot it in as a separate module
+v1.6.0 shipped the **pure algorithm** in ``src/apnea_detector.py``
+with dedicated tests.  v1.7.0 added the rest:
 
-The stage subscriber is a discrete-state machine; apnea detection is
-a continuous, sliding-window signal-processing pipeline.  Coupling
-them would force the controller to wait on FFTs every 30 s.  A
-separate module pushes its results into HA on its own cadence and
-the orchestrator only listens.
+* ``src/apnea_wiring.py`` — orchestrator glue (consent state
+  machine, baseline persistence, session bracket, live-sample
+  routing).  17 dedicated tests.
+* ``sensor.sleep_classifier_apnea_index`` (the 15th HA entity)
+  with enum states ``pending_consent`` / ``calibrating`` /
+  ``green`` / ``amber`` / ``red`` and a permanent ``disclaimer``
+  attribute reminding users this is a trend indicator, not a
+  diagnosis.
+* 3 publisher tests lock in the medical-safety contract: clinical
+  numbers in the status dict are filtered out before reaching HA,
+  and the disclaimer attribute is always present.
 
-### Algorithm sketch
+The implementation deliberately deviates from the original
+"report a numeric AHI" sketch: we publish only the coarse
+red/amber/green bucket so users can't misread the sensor as a
+diagnosis.  The whole numeric pipeline exists inside the detector
+but is firewalled behind the publisher.
 
-1. **Subscribe** to a breathing-rate sensor (e.g. R60ABD1's
-   `sensor.r60abd1_breathing_rate`) at 1 Hz and a chest-wall-motion
-   sensor at 10 Hz if available.
-2. **Sliding window** of length 60 s, hop 10 s.  For each window:
-   a. Detect *apneic events* — a contiguous interval of ≥ 10 s
-      where breathing rate < 4 bpm OR chest-wall variance is below
-      the noise floor.
-   b. Detect *hypopneic events* — a ≥ 10 s interval where
-      breathing rate is 50 % below the user's baseline AND
-      chest-wall amplitude is < 70 % of baseline.
-3. **Per-night roll-up** at session checkpoint: count events per
-   hour of recorded sleep, that's the AHI proxy.
-4. **Confidence** comes from how much of the night the radar had
-   signal vs. dropouts (e.g. sleeping on stomach often blocks the
-   chest signal).
+### Future refinements (not blockers)
 
-### Why we have not done it yet
-
-* **Calibration.** The "user's baseline breathing rate" needs ~1
-  week of nightly data to settle.  Until then the hypopnea
-  detector throws false positives.
-* **Medical disclaimer.**  AHI is a clinical metric; surfacing a
-  number > 5 (the medical threshold) without a consent dialog and
-  a "this is not a diagnosis" banner is irresponsible.  We need a
-  one-time onboarding step before this sensor publishes a value.
-* **Validation data.**  Without polysomnography ground truth on
+* **Spousal signal separation** — currently the radar might pick
+  up either sleeper in a shared bed.  Multi-zone radar modes
+  (R60ABD1 supports 4 zones) could route two parallel
+  ``ApneaWiring`` instances.
+* **Validation cohort** — without polysomnography ground truth
+  we can't tune the ``amber`` / ``red`` thresholds.  Partnering
+  with a sleep clinician to compare the add-on output against
+  annotated PSG recordings for a week is the path to tightening
+  the bands.
   real users we can't tune the thresholds.  The right scope is a
   PoC that surfaces a *trend* (red/amber/green) rather than a
   numeric AHI, until we have a study partner.
@@ -194,6 +187,10 @@ the orchestrator only listens.
   `apnea_breathing_source` config slot.
 * Onboarding: first publish only `pending_consent` until the user
   toggles a new HA `input_boolean.sleep_classifier_apnea_consent`.
+
+(The above implementation sketch was realised in v1.7.0 with one
+deliberate deviation: the events-per-hour number is NOT surfaced
+in sensor attributes.  Only the enum bucket reaches HA.)
 
 ## Other ideas worth a fresh session
 

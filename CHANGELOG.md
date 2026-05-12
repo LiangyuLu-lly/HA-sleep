@@ -12,6 +12,69 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.7.0] — 2026-05-13
+
+Apnea / hypopnea trend monitoring lands in the main flow.  The
+detection algorithm itself was shipped as a pure-function PoC in
+v1.6.0 (`src/apnea_detector.py`); v1.7.0 is the **consent + wiring
++ publisher** work that was deliberately held back until it could
+be delivered as one coherent story.
+
+### Added
+
+- **`src/apnea_wiring.py`** — orchestrator-facing glue layer that:
+  * subscribes to a breathing-rate entity (e.g. R60ABD1 radar) and
+    an optional chest-wall-amplitude entity,
+  * tracks consent via an `input_boolean` toggle,
+  * persists a `UserBaseline` across restarts
+    (`/data/apnea_baseline.json`),
+  * brackets sample buffering with `begin_session()` /
+    `end_session()`,
+  * publishes a coarse `ApneaTrend` bucket per completed session.
+- **`sensor.sleep_classifier_apnea_index`** — new 15th HA entity.
+  States: `pending_consent` / `calibrating` / `green` / `amber` /
+  `red`.  Carries a permanent `disclaimer` attribute reminding the
+  user that this is a trend indicator, not a medical diagnosis.
+- **`home_assistant.apnea.*` config block** exposing
+  `breathing_rate_source`, `chest_amplitude_source`, `consent_entity`,
+  `calibration_nights`.  All fields opt-in; leaving
+  `breathing_rate_source` empty disables the feature entirely.
+- **37 new tests**:
+  * `tests/test_apnea_wiring.py` × 17 covering consent gating,
+    baseline persistence, session lifecycle, end-of-session trend
+    projection, status-dict medical-safety invariant.
+  * `tests/test_sleep_state_publisher.py` × 3 locking in the
+    publisher's safety contract (disclaimer always present, clinical
+    numbers in `status=` dropped before reaching HA).
+
+### Changed
+
+- `SleepStatePublisher.publish_initial_placeholders()` now seeds 15
+  entities (was 14); the apnea sensor defaults to `pending_consent`.
+- `_maybe_advance_session_lifecycle` hooks `apnea.begin_session()` on
+  onset and `apnea.end_session()` on wake-up, so breathing samples
+  are grouped with the right sleep session.
+
+### Medical-safety contract
+
+This release explicitly promises that the sensor surface:
+
+1. Never publishes a numeric AHI or events/hour value.
+2. Never leaves `pending_consent` without the user having toggled
+   the consent `input_boolean` on.
+3. Never leaves `calibrating` until at least
+   `apnea_calibration_nights` (default 7) of baseline data has been
+   accumulated.
+4. Wipes persisted baseline from disk on consent revocation.
+5. Carries a `disclaimer` attribute visible on every Lovelace view
+   of the entity.
+
+These are locked in by `tests/test_apnea_wiring.py::TestStatus::
+test_status_never_exposes_events` and
+`tests/test_sleep_state_publisher.py::TestPublishApneaIndex::
+test_status_filters_to_safe_keys_only`.  Changing the contract
+requires breaking a test on purpose.
+
 ## [1.6.4] — 2026-05-13
 
 Continues the "落地" thread from v1.6.3 — two more real-world failure
@@ -317,7 +380,8 @@ misbehave on its first deployed night.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.4...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.4...v1.7.0
 [1.6.4]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.0...v1.6.2
