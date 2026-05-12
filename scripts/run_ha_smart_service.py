@@ -76,6 +76,7 @@ from src.sleep_quality_score import (
     compute_metrics,
     compute_objective_quality,
 )
+from src.learning_panel_publisher import LearningPanelPublisher
 from src.sleep_state_publisher import SleepStatePublisher
 from src.smart_environment_controller import (
     SmartControlConfig,
@@ -267,6 +268,13 @@ class SmartSleepService:
         # Track the last stage we sampled so we don't overwrite the
         # snapshot on every tick — only on genuine stage transitions.
         self._last_sampled_stage: Optional[SleepStage] = None
+        # v1.6.0 — recommend_bedtime() runs a weighted-median over
+        # every session in history.  At the default 30 s inference
+        # cadence with 60 sessions that's ~120 K redundant computes a
+        # night.  Cache for 60 s; the bedtime forecast doesn't change
+        # faster than that anyway.
+        self._bedtime_cache: Optional[Dict[str, Any]] = None
+        self._bedtime_cached_at: float = 0.0
         self.stop_event = asyncio.Event()
         # The publisher is created once HA is reachable; until then it stays
         # ``None`` so dry-run and unit-test paths don't accidentally try to
@@ -945,86 +953,84 @@ class SmartSleepService:
         wind_down_minutes = getattr(self.ctrl_cfg, "wind_down_minutes", 0) or 0
         if wind_down_minutes <= 0:
             return raw_stage
-        try:
-            bedtime = self.learner.recommend_bedtime(now=now_local())
-        except Exception as exc:    # noqa: BLE001
-            # If the learner can't decide a bedtime (e.g. corrupted
-            # history), don't pretend we're winding down.
-            logger.debug("wind-down: recommend_bedtime failed: %s", exc)
+        bedtime = self._bedtime_recommendation_cached()
+        if bedtime is None:
             return raw_stage
         if is_in_wind_down(now_local(), bedtime, wind_down_minutes):
             return SleepStage.LIGHT
         return raw_stage
 
+    # 60 s — same time-scale as user perception of "is it bedtime yet";
+    # any finer is wasted CPU.
+    _BEDTIME_CACHE_TTL_SECONDS: float = 60.0
+
+    def _bedtime_recommendation_cached(self) -> Optional[Dict[str, Any]]:
+        """Return the learner's bedtime recommendation, cached for 60 s.
+
+        ``recommend_bedtime`` walks every session in history doing a
+        weighted-median, so calling it on every 30 s inference tick
+        (and again from the wind-down check) burns CPU for no benefit.
+        Returns ``None`` if the learner is missing or raised — callers
+        treat that as "no wind-down".
+        """
+        if self.learner is None:
+            return None
+        now = time.time()
+        if (
+            self._bedtime_cache is not None
+            and now - self._bedtime_cached_at < self._BEDTIME_CACHE_TTL_SECONDS
+        ):
+            return self._bedtime_cache
+        try:
+            fresh = self.learner.recommend_bedtime(now=now_local())
+        except Exception as exc:    # noqa: BLE001
+            # Corrupted history, IO error, etc.  Don't poison the
+            # control loop; return None so wind-down stays off.
+            logger.debug("wind-down: recommend_bedtime failed: %s", exc)
+            return None
+        self._bedtime_cache = fresh
+        self._bedtime_cached_at = now
+        return fresh
+
+    # ------------------------------------------------------------------ #
+    # Learning panel facade (v1.6.0)                                     #
+    # ------------------------------------------------------------------ #
+    #
+    # The two public methods below are thin shims onto
+    # :class:`LearningPanelPublisher`.  Pre-v1.6 they were ~50-line
+    # methods inline on this class; extracting them dropped this file
+    # off the BACKLOG's biggest-file hotspot and makes the panel
+    # independently unit-testable.
+
+    @property
+    def _panel(self) -> LearningPanelPublisher:
+        """Lazy-initialised because the publisher doesn't exist at __init__.
+
+        Recreated whenever the publisher reference flips (e.g. after a
+        WebSocket reconnect rebuilds the publisher), so the panel never
+        holds a stale reference.
+        """
+        cached = getattr(self, "_panel_cache", None)
+        if cached is not None and cached.publisher is self.publisher:
+            return cached
+        wake_strs = list(self._wake_window_strs or [])
+        new_panel = LearningPanelPublisher(
+            learner=self.learner,
+            publisher=self.publisher,
+            profile=self.profile,
+            wake_window_strs=wake_strs,
+            env_provider=lambda: self.last_env,
+        )
+        self._panel_cache = new_panel
+        return new_panel
+
     async def _publish_debt_and_bedtime(self) -> None:
         """Refresh sensor.sleep_classifier_debt_hours + recommended_bedtime."""
-        if self.learner is None or self.publisher is None:
-            return
-        try:
-            sessions = self.learner.sessions()
-            tracker = SleepDebtTracker.from_sessions(self.profile, sessions)
-            plan = tracker.plan_recovery(wake_window=self._wake_window_strs)
-            await self.publisher.publish_debt(
-                plan.current_debt_hours,
-                severity=plan.severity.value,
-                target_hours=self.profile.recommended_total_sleep_hours(),
-                nights_to_full_recovery=plan.nights_to_full_recovery,
-            )
-            await self.publisher.publish_recommended_bedtime(
-                plan.tonight_bedtime,
-                tonight_target_hours=plan.tonight_target_hours,
-                reason=plan.message,
-            )
-        except Exception as exc:    # noqa: BLE001
-            logger.warning("Could not publish debt/bedtime: %s", exc)
+        await self._panel.publish_debt_and_bedtime()
 
     async def _publish_learning_panel(self) -> None:
-        """Refresh the four v1.3.0 preference-learning sensors.
-
-        Pulls the latest snapshot from :class:`PreferenceLearner` and
-        forwards each piece to the corresponding publisher method.  Any
-        exception is logged but never re-raised so a bad learner state
-        can't interrupt the inference loop.
-        """
-        if self.learner is None or self.publisher is None:
-            return
-        try:
-            defaults = EnvironmentParams(
-                temperature_c=self.last_env.temperature_c,
-                humidity_pct=self.last_env.humidity_pct,
-                brightness_pct=self.last_env.brightness_pct,
-                fan_speed_pct=self.last_env.fan_speed_pct,
-            )
-            bedtime = self.learner.recommend_bedtime()
-            await self.publisher.publish_learned_bedtime(bedtime)
-
-            knn = self.learner.recommend_knn(
-                defaults,
-                current_temp_c=self.last_env.temperature_c,
-            )
-            await self.publisher.publish_learned_environment(
-                knn["env"].to_dict(),
-                confidence=float(knn.get("confidence", 0.0)),
-                n_used=int(knn.get("n_used", 0)),
-            )
-
-            explanation = self.learner.explain(
-                defaults,
-                current_temp_c=self.last_env.temperature_c,
-            )
-            await self.publisher.publish_recommendation_explain(explanation)
-
-            # v1.5.0 — surface the learned per-stage deltas so users
-            # can see the controller "graduating" from clinical to
-            # personalised setpoints as their history accumulates.
-            try:
-                deltas = self.learner.recommend_per_stage_deltas()
-                await self.publisher.publish_per_stage_deltas(deltas)
-            except AttributeError:
-                # Learner predates v1.5.0; nothing to publish.
-                pass
-        except Exception as exc:    # noqa: BLE001
-            logger.warning("Could not publish learning panel: %s", exc)
+        """Refresh the v1.3 + v1.5 preference-learning sensors."""
+        await self._panel.publish_learning_panel()
 
     def _log_binding_help(self, entities: List[HAEntity]) -> None:
         """Print top candidate entity_ids per slot to help the user bind them.
