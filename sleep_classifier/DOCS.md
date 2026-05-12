@@ -1,169 +1,186 @@
-# Sleep Classifier — Home Assistant Add-on (v1.2.0)
+# Sleep Classifier — Home Assistant Add-on (v1.3.0)
 
-A deep-learning sleep stage classifier with **closed-loop smart-home
-control** and a **natural-sleep suite** (sleep-debt accounting, smart
-wake, soundscape matching, preference learning, subjective feedback).
-When you sleep, the add-on:
+Closed-loop smart-home sleep automation: subscribe to an existing HA
+sleep-stage sensor, score each night, learn which environment and
+bedtime correlate with your best sleep, then write those setpoints back
+to your lights / climate / humidifier / fan.
 
-1. **Auto-discovers** physiological sensors (heart-rate, motion, breathing
-   rate) and tunable devices (lights, climate, humidifier, fan) you
-   already exposed in Home Assistant — bilingual matcher works on both
-   English and Chinese / pinyin friendly names.
-2. **Classifies** your sleep stage every 30 s with a CNN-BiLSTM model.
-3. **Publishes** the result back as four HA entities you can drop on a
-   Lovelace dashboard:
+The add-on is built around three pillars:
 
-   ```text
-   sensor.sleep_classifier_stage              # AWAKE / LIGHT / DEEP / REM
-   sensor.sleep_classifier_confidence         # 0..100 %
-   sensor.sleep_classifier_quality_score      # latest sleep-quality grade
-   sensor.sleep_classifier_session_duration   # seconds since session start
-   sensor.sleep_classifier_last_action        # most recent device change
-   ```
-
-4. **Adjusts the bedroom** by calling HA services directly — no automation
-   YAML required.
-5. **Learns** your preferences: after a few nights, the add-on picks the
-   exact temperature / humidity / brightness combo you historically sleep
-   *best* under.
+1. **External stage source** — instead of running its own CNN-BiLSTM
+   model, the add-on follows any HA entity whose state cycles between
+   AWAKE / LIGHT / DEEP / REM.  Most mass-market wearables (Apple
+   Watch, Mi Band, Fitbit, Withings, Garmin, Eight Sleep,
+   sleep_as_android, …) and bedside radars already publish one out
+   of the box; the matcher is case-insensitive and bilingual so
+   "Deep" / "DEEP" / "deep" / "deep_sleep" / "深睡" all normalise to
+   the same internal stage.
+2. **Decay + k-NN preference learner** — every completed session is
+   recorded with the env params and a 0-100 quality score.  Past
+   sessions decay with a 14-day half-life (configurable) and the
+   bedtime recommender splits weekday vs weekend buckets by *wake
+   day*.  The env recommender does a weighted-median k-NN over the
+   top sessions, conditioned on tonight's hour-of-bedtime and ambient
+   temperature.
+3. **Bounded HA controller** — every actuation goes through deadbands
+   (e.g. don't update climate within ±0.5 °C of the current target)
+   and a 120-second inter-action cool-down, so the add-on never
+   flaps your devices.
 
 ## Configuration
 
-Open the **Configuration** tab.  The form is split into three groups:
+Open the **Configuration** tab.  The form is split into four groups.
+The bare-minimum field is `sleep_stage_source`; everything else is
+optional and either auto-discovered or defaults to a safe value.
 
 ### General behaviour
 
 | Option | Default | Description |
 |---|---|---|
 | `area` | (empty) | Discovery filter; leave empty to scan all rooms. |
-| `infer_interval` | `30` | Seconds between inferences + control decisions. |
-| `session_interval` | `1800` | How often to checkpoint the preference learner. |
+| `infer_interval` | `30` | Seconds between control decisions. |
+| `session_interval` | `1800` | How often the preference learner checkpoints to disk. |
 | `dry_run` | `true` | If true, plan actions but never call HA services. **Keep this on for the first night.** |
-| `exploration_rate` | `0.1` | Gaussian noise scale when probing new setpoints. |
+| `exploration_rate` | `0.1` | Gaussian noise scale when probing setpoints around the historical optimum. |
 | `min_seconds_between_actions` | `120` | Cool-down between consecutive service calls (anti-flapping). |
-| `deadband_temperature_c` | `0.5` | Skip climate update when within this. |
-| `deadband_humidity_pct` | `5` | Skip humidifier update when within this. |
-| `deadband_brightness_pct` | `10` | Skip light update when within this. |
+| `deadband_temperature_c` | `0.5` | Skip a climate update if the current target is within this many °C. |
+| `deadband_humidity_pct` | `5` | Skip a humidifier update if within this much %RH. |
+| `deadband_brightness_pct` | `10` | Skip a light update if within this much brightness. |
 | `log_level` | `info` | One of `debug`, `info`, `warning`, `error`. |
 
 ### Slot bindings — pin a specific entity to a role
 
-Auto-discovery is good but not perfect.  If you have multiple HR sources
-(e.g. a Mi Band on your wrist *and* a SleepRadar R60ABD1 next to the bed)
-you'll want to tell the add-on which one to trust.  Each `*_source` /
-`*_target` field below accepts **exactly one** `entity_id`; lists accept
-multiple.  Leave any field empty to fall back to keyword auto-discovery.
+In v1.3.0 the only required slot is `sleep_stage_source`.  Everything
+else can stay empty and fall back to keyword auto-discovery.
 
 | Option | Example value | Notes |
 |---|---|---|
-| `heart_rate_source` | `sensor.xiaomi_smart_band_9_pro_heart_rate` | Single HR sensor. |
-| `movement_source` | `sensor.sleepradar_r60abd1_ts5_yundong_zhuangtai` | Movement / motion / presence. |
-| `breathing_source` | `sensor.sleepradar_r60abd1_ts6_huxi_xinxi` | Used as HR proxy if no HR sensor is bound. |
-| `temperature_source` | `sensor.bedroom_temperature` | Drives "current T" reading. |
-| `humidity_source` | `sensor.bedroom_humidity` | Drives "current RH" reading. |
-| `illuminance_source` | `sensor.bedroom_illuminance` | Optional — only used for brightness deadband. |
+| `sleep_stage_source` | `sensor.mi_band_8_pro_sleep_stage` | **Required.** The HA entity whose state we follow. |
+| `temperature_source` | `sensor.bedroom_temperature` | Drives the "current T" reading + k-NN conditioning. |
+| `humidity_source` | `sensor.bedroom_humidity` | Drives "current RH" + humidity deadband. |
+| `illuminance_source` | `sensor.bedroom_illuminance` | Optional — used for the brightness deadband. |
 | `light_targets` | `[light.bedroom_main, light.bedroom_bedside]` | List — all listed lights are dimmed together. |
 | `climate_target` | `climate.bedroom_ac` | Single AC / heat-pump entity. |
 | `humidifier_target` | `humidifier.bedroom_humidifier` | Optional. |
 | `fan_target` | `fan.bedroom_fan` | Optional. |
 | `switch_targets` | `[switch.bedside_outlet]` | List — generic switches the add-on may toggle. |
 
-> 💡 **Don't know the entity_id?**  Open **Developer Tools → States**
-> in HA, type a fragment of the device name into the *Entity* search,
-> then copy the resulting `entity_id` straight into Configuration.
+> 💡 **Don't know the entity_id?** Open **Developer Tools → States**
+> in HA, type a fragment of the device name in the *Entity* search,
+> and copy the resulting entity ID straight into the Configuration
+> tab — or, easier, click **OPEN WEB UI** on the add-on detail page
+> and pick from a live dropdown.
 
 ### Auto-discovery tunables
 
 | Option | Default | Description |
 |---|---|---|
-| `heart_rate_keywords` | `[heart_rate, hr, pulse, bpm, 心率, 脉搏]` | Substrings used to detect HR sensors. |
-| `movement_keywords` | `[motion, movement, activity, presence, occupancy, 运动, 体动, 人体]` | Movement detector keywords. |
-| `breathing_keywords` | `[breath, breathing, respiration, 呼吸]` | Breathing-rate keywords (used as HR fallback). |
-| `controllable_domains` | `[light, climate, fan, humidifier]` | Domains the add-on may invoke services on. |
-| `explicit_includes` | `[]` | Entity IDs to *always* include even if filters skip them. |
-| `explicit_excludes` | `[]` | Entity IDs to *never* touch (overrides everything). |
+| `sleep_stage_keywords` | `[sleep_stage, sleep, hypnogram, 睡眠, 睡眠阶段]` | Substrings used to find a stage sensor when `sleep_stage_source` is empty. |
+| `controllable_domains` | `[light, climate, fan, humidifier]` | HA domains the add-on is allowed to invoke services on. |
+| `explicit_includes` | `[]` | Entity IDs to *always* include, regardless of filters. |
+| `explicit_excludes` | `[]` | Entity IDs to *never* touch, regardless of filters. |
 
-### Natural-sleep suite (v1.2.0)
+### Natural-sleep suite (v1.2.0, still optional)
 
-Opt-in features.  Each is independently enabled by filling the relevant
-fields; leaving any of them empty disables just that feature.
+Each feature below is enabled by filling the relevant fields; leaving
+any of them empty disables just that feature.
 
 | Option | Example value | What it does |
 |---|---|---|
-| `birth_year` | `1995` | Drives NSF/AAP sleep-hour recommendation + debt. `0` = unknown → assume adult. |
-| `chronotype` | `evening` | Informational; reserved for future auto-scheduling. |
-| `wake_window_start` / `wake_window_end` | `"07:00"` / `"07:30"` | Smart wake fires inside this interval on the first LIGHT / REM-exit stage. |
-| `wake_light_targets` | `[light.bedroom_main]` | Lights to ramp in the 30 min leading up to the wake window. |
-| `whitenoise_target` | `media_player.bedroom_speaker` | Single speaker receiving stage-appropriate audio. |
-| `whitenoise_volume_scale` | `0.8` | Global multiplier on per-stage default volumes. |
-| `feedback_entity` | `input_number.sleep_rating` | HA helper you nudge in the morning — feeds into quality score + profile. |
+| `birth_year` | `1995` | Drives the NSF/AAP sleep-hour recommendation + debt calculation. `0` = unknown → defaults to "adult". |
+| `chronotype` | `evening` | Informational; reserved for a future scheduler. |
+| `wake_window_start` / `wake_window_end` | `"07:00"` / `"07:30"` | Smart-wake fires inside this interval, preferring a LIGHT / post-REM boundary. |
+| `wake_light_targets` | `[light.bedroom_main]` | Lights to ramp up during the 30 min leading up to the wake window. |
+| `whitenoise_target` | `media_player.bedroom_speaker` | Single speaker that receives stage-appropriate audio. |
+| `whitenoise_volume_scale` | `0.8` | Global multiplier on the per-stage default volume. |
+| `feedback_entity` | `input_number.sleep_rating` | A 1-5 helper you nudge after waking; feeds into the quality score. |
 | `feedback_scale` | `5` | Range of the helper (1..scale). |
 
-**Four more Lovelace entities** appear once natural-sleep is active:
+### Preference-learning tunables (v1.3.0)
+
+These four all have sane defaults; leave them alone unless you know
+why you want different values.
+
+| Option | Default | Description |
+|---|---|---|
+| `decay_half_life_days` | `14.0` | How quickly past sessions lose weight in the learner. A 14-day half-life means a session 14 days ago counts half as much as today's. |
+| `knn_k` | `5` | How many neighbour sessions feed the env recommendation. |
+| `knn_hour_sigma` | `1.5` | σ of the Gaussian kernel on bedtime hour (hours). Lower = stricter "same time of night" matching. |
+| `knn_temp_sigma` | `1.5` | σ of the Gaussian kernel on ambient temperature (°C). Lower = stricter "same room condition" matching. |
+
+## Entities published
+
+The add-on owns **13 entities**, all prefixed with
+`sensor.sleep_classifier_*`.  They cluster into three families.
+
+**Stage + session diagnostics**
 
 ```text
-sensor.sleep_classifier_debt_hours            # signed hours; + = behind
-sensor.sleep_classifier_recommended_bedtime   # ISO timestamp for tonight
-sensor.sleep_classifier_wake_decision         # hold / pre_ramp / ... / fire_now
-sensor.sleep_classifier_soundscape            # pink_noise / rain / off / ...
+sensor.sleep_classifier_stage              # AWAKE / LIGHT / DEEP / REM
+sensor.sleep_classifier_confidence         # 0..100 %
+sensor.sleep_classifier_quality_score      # latest session quality (0-100)
+sensor.sleep_classifier_session_duration   # seconds since session start
+sensor.sleep_classifier_last_action        # human-readable last device change
 ```
 
-How each module works:
+**Natural-sleep suite**
 
-* **User profile** — ages mapped to NSF/AAP cohorts (newborn … senior) and
-  their recommended hours.  After every high-quality night (objective ≥
-  60 AND subjective ≥ 3/5) the profile's Bayesian posterior nudges your
-  personal target; we clamp it inside the cohort's (low, high) range so
-  a personal estimate can never push you below the clinical floor.
-  *Refs:* Hirshkowitz 2015, Paruthi 2016.
-* **Sleep debt** — age-weighted sum of shortfalls over the past 7 days
-  at full weight, with geometric decay beyond that.  A recovery plan
-  chooses between *single-night* (≤ 2 h debt) and *multi-night paydown*
-  (50 % per night) using the saturating efficiency curve ``η(extra) =
-  1 − exp(−extra / 1.5 h)``.  A single recovery night never contributes
-  more than 2 h of effective debt repayment, per Van Dongen 2003.
-* **Smart wake** — decision enum `HOLD → PRE_RAMP → OPEN_WINDOW → FIRE_NOW`.
-  Inside the window we wait for a LIGHT / post-REM boundary with
-  confidence ≥ 0.55 and a 3-tick DEEP-free debounce; if the window
-  closes first, a 60-second safety margin forces a wake regardless.
-  *Refs:* Hilditch & McHill 2019, Trotter 2018, Phipps-Nelson 2003.
-* **Soundscape matcher** — stage-driven soundscapes, all replaceable:
-  rain (AWAKE onset), pink (LIGHT), brown (DEEP), silence (REM), dawn
-  chorus (pre-wake).  Uses `media_player.play_media` + `volume_set`.
-  *Refs:* Papalambros 2017, Stanchina 2005, Mart​íns 2022.
-* **Quality score v2** — adds Sleep Efficiency, WASO, Sleep-Onset
-  Latency to the existing architecture score, then blends in your
-  1-5 subjective rating.  *Refs:* AASM Scoring Manual 2.6, Ohayon 2017.
-* **Feedback listener** — buffers the latest `input_number` value with
-  18-hour freshness check; each rating counts for exactly one session.
+```text
+sensor.sleep_classifier_debt_hours         # signed hours; + = behind on sleep
+sensor.sleep_classifier_recommended_bedtime  # ISO timestamp for tonight
+sensor.sleep_classifier_wake_decision      # hold / pre_ramp / open_window / fire_now
+sensor.sleep_classifier_soundscape         # pink_noise / rain / off / dawn_chorus
+```
 
-Click **Save**, then **Start** on the Info tab.
+**Preference-learning panel (v1.3.0)**
+
+```text
+sensor.sleep_classifier_learned_bedtime_workday   # "HH:MM" or "unknown"
+sensor.sleep_classifier_learned_bedtime_weekend   # "HH:MM" or "unknown"
+sensor.sleep_classifier_learned_environment       # "19.5 °C / 50 % / 5 %"
+sensor.sleep_classifier_recommendation_explain    # "ready" / "not_ready"
+```
+
+The four learning entities expose the recommendation reasoning as
+attributes — open the More-Info dialog on
+`sensor.sleep_classifier_recommendation_explain` and Lovelace shows:
+
+- `method`: `"knn+decay"`
+- `n_total`: total sessions in history
+- `avg_age_days`: how stale the history is
+- `decay_half_life_days`: the active decay setting
+- `effective_sample_size`: ≈ Σ weights; tells you how much real
+  signal the recommendation rests on
+- `recommendation`: the env dict picked tonight
+- `neighbors`: top-5 neighbour sessions with their weights, quality,
+  and start time — the actual "why this T / RH / lux?"
 
 ## What happens after Start
 
-* The add-on calls `GET /api/states` through the Supervisor proxy (using
-  the injected `SUPERVISOR_TOKEN`), classifies your entities into sensors
-  and actionables, and prints a summary in the **Log** tab.
-* It restores the inference buffer from `/data/inference_buffer.npz` if
-  one exists and is < 6 h old, so a restart doesn't force a fresh 10-min
-  warm-up.
-* It subscribes to the WebSocket so every `state_changed` event for a
-  matched HR / motion / breathing entity is fed into the inference engine.
-  The WebSocket reconnects automatically with exponential backoff on
-  network blips.
-* Once the rolling window fills (~10 minutes of samples cold-start, or
-  instantly after a restart with the saved buffer) the model starts
-  producing real sleep-stage predictions instead of the bootstrap "LIGHT".
-* When the predicted stage changes, the add-on issues the matching service
-  calls (e.g. `light.turn_off`, `climate.set_temperature`,
-  `humidifier.set_humidity`).
-* Every inference tick also publishes the stage + confidence + session
-  duration to the `sensor.sleep_classifier_*` entities.
+1. The add-on resolves the configured `sleep_stage_source` (or runs
+   keyword auto-discovery against your HA entity list), then
+   subscribes to its `state_changed` events over WebSocket.  Stage
+   strings are normalised through a case-insensitive bilingual matcher.
+2. Every time the stage transitions to a *non-AWAKE* state and stays
+   there for the configured debounce window, a new session is opened
+   and the current environment snapshot is captured.
+3. On the next AWAKE transition (or after a session timeout), the
+   session is closed: stage counts → quality score, the snapshot
+   becomes the env params, and the whole `(env, stages, quality)`
+   triple is appended to `/data/user_preferences.json`.
+4. Once history reaches `min_sessions_for_personalisation` (default
+   `3`), the four v1.3.0 sensors above start publishing real
+   recommendations.  Before that the `_explain` entity sits at
+   `not_ready` with the reason in attributes.
+5. Every `infer_interval` seconds the controller compares the
+   learner's recommendation against the live ambient reading,
+   applies deadbands + cool-downs, and writes back to your targets.
+
+The WebSocket subscriber reconnects with exponential backoff
+(1 s → 2 s → … → 5 min cap) so transient network blips don't take
+the service down.
 
 ## Lovelace dashboard example
-
-Drop this into your dashboard's raw YAML editor for an instant overview
-card.  The entities are populated live by the add-on:
 
 ```yaml
 type: vertical-stack
@@ -174,25 +191,32 @@ cards:
       - entity: sensor.sleep_classifier_stage
         name: Stage
       - entity: sensor.sleep_classifier_confidence
-        name: Confidence
+        name: Conf
       - entity: sensor.sleep_classifier_quality_score
-        name: Last quality
+        name: Last score
       - entity: sensor.sleep_classifier_session_duration
         name: Session
+  - type: glance
+    title: What the learner picked for tonight
+    entities:
+      - entity: sensor.sleep_classifier_learned_bedtime_workday
+        name: Workday bed
+      - entity: sensor.sleep_classifier_learned_bedtime_weekend
+        name: Weekend bed
+      - entity: sensor.sleep_classifier_learned_environment
+        name: Best env
+      - entity: sensor.sleep_classifier_recommendation_explain
+        name: Why?
   - type: history-graph
-    title: Sleep stages over the night
+    title: Sleep stages tonight
     hours_to_show: 12
     entities:
       - sensor.sleep_classifier_stage
-      - sensor.sleep_classifier_confidence
-  - type: entities
-    title: Last automation action
-    entities:
-      - entity: sensor.sleep_classifier_last_action
+      - sensor.sleep_classifier_quality_score
 ```
 
-You can also drive automations off stage transitions, e.g. mute the TV
-the moment the model thinks you're in DEEP sleep:
+You can also drive automations off stage transitions, e.g. mute the
+TV the moment the model thinks you've fallen into deep sleep:
 
 ```yaml
 - alias: "Mute TV during deep sleep"
@@ -210,106 +234,108 @@ the moment the model thinks you're in DEEP sleep:
 
 ## Persistence
 
-* **`/data/user_preferences.json`** — preference history (learner state).
-* **`/data/inference_buffer.npz`** — last seen physiology samples, lets
-  the add-on resume warm.
-* **`/data/effective_config.json`** — merged config that the Python
-  service actually loaded (handy for debugging Configuration UI issues).
+All add-on state lives under `/data`, which is on the supervisor's
+persistent volume.  These survive add-on restarts, upgrades, and a
+full re-install:
 
-All three live on the supervisor's persistent volume, so they survive
-add-on restarts, upgrades, and even a full re-install.
+- **`/data/user_preferences.json`** — session history + learned
+  recommendations.  Don't delete unless you want to start over.
+- **`/data/web_ui_overrides.json`** — slot bindings set via the
+  embedded Web UI; takes priority over the Configuration form.
+- **`/data/effective_config.json`** — the merged config the service
+  actually loaded.  Handy when the Configuration UI seems to say one
+  thing and the log says another.
 
 ## Troubleshooting
 
-### "No heart-rate / movement / breathing sensor found"
+### "No sleep stage source found / Configured stage source not in HA states"
 
-The discovery filter found nothing.  The add-on now logs a list of
-**candidate entity_ids** automatically — copy whichever of those matches
-your hardware into the matching `*_source` field in Configuration, click
-Save, then Restart.
+The `sleep_stage_source` slot is empty *and* auto-discovery didn't
+match anything to the `sleep_stage_keywords`.  Either:
 
-If even the candidate list is empty, your sensors aren't yet integrated
-into HA.  Add them under **Settings → Devices & Services** first.
+- Click **OPEN WEB UI** and pick your stage entity from the dropdown;
+  the dropdown only lists entities whose recent state was one of the
+  recognised stage strings, so finding the right one is fast.
+- Or open **Developer Tools → States**, find your wearable's
+  entity, copy the ID into `sleep_stage_source`, click Save → Restart.
+
+### Log: `external_stage_subscriber: ignoring state '<…>'`
+
+Your sensor uses a stage label we don't recognise (e.g. `"asleep"`
+instead of `"DEEP"`).  Add the literal to `sleep_stage_aliases` in
+the Configuration form, or open an issue with the exact string.
+
+### Recommended bedtime shows "unknown"
+
+The relevant bucket (workday or weekend) doesn't have enough
+sessions yet.  `recommend_bedtime` needs at least 3 sessions in a
+bucket before publishing a value; check the attribute panel on the
+sensor to see `n_workday` / `n_weekend`.
 
 ### Services failing with HTTP 401
 
-The supervisor token is missing or expired.  Restart the add-on; the
-supervisor refreshes the token automatically.
+The supervisor token expired or wasn't injected.  Restart the add-on
+to refresh; the Supervisor re-issues the token on every container
+start.
 
 ### Add-on stuck on "Building"
 
-The first install on a Raspberry Pi 4B downloads ~30 MB of arm64
-piwheels (numpy, scipy, h5py, PyWavelets, aiohttp) and takes **3–5
-minutes**.  Subsequent upgrades reuse the layer cache and are usually
-< 1 minute.
-
-### "TENSORFLOW not available — using numpy-based..." in the log
-
-This is **expected and correct**.  The add-on image deliberately ships
-without TensorFlow to stay small.  Numerical equivalence between the
-Keras path (used at training time) and the numpy fallback (used at
-runtime) is enforced by `tests/test_numpy_keras_equivalence.py` (max
-abs diff < 1e-3).
+First install on a Pi 4B pulls ~10 MB of arm64 wheels (numpy,
+aiohttp) from piwheels — takes **2-3 minutes** on a decent
+connection.  Subsequent rebuilds reuse the layer cache and finish in
+under a minute.
 
 ### Want to test without controlling anything
 
-Set `dry_run: true` in Configuration.  The add-on still reads sensors
-and classifies, and still publishes `sensor.sleep_classifier_*` entities,
-but never issues device service calls — exactly what you want for the
-first night to validate sensor wiring.
+Leave `dry_run: true`.  The add-on still:
 
-### WebSocket / network instability
+- subscribes to the stage entity and creates sessions,
+- publishes every `sensor.sleep_classifier_*` entity, and
+- *plans* device actions and logs them,
 
-Transient errors are logged once at WARNING and the add-on reconnects
-with exponential backoff (1 s → 2 s → 4 s → … → 5 min cap).  Auth
-failures (HTTP 401/403) on the WS still stop the service — re-check your
-SUPERVISOR_TOKEN by restarting the supervisor.
+but never sends a service call.  This is the recommended state for
+the first night so you can verify everything in the Logbook before
+turning it loose.
 
 ## Uninstall
 
-Just click **Uninstall** in the add-on info page.  The supervisor removes
-the container and image; if you also want to wipe learned preferences,
-remove `/data/user_preferences.json` first via the SSH add-on.
+Click **Uninstall** in the add-on info page.  The Supervisor removes
+the container and image.  Learned preferences in `/data/` survive on
+purpose so a reinstall picks up where you left off; to wipe them,
+delete `/data/user_preferences.json` first via the SSH add-on.
 
-## Scientific references (natural-sleep suite)
+## Scientific references
 
-The natural-sleep modules cite these peer-reviewed sources:
+The natural-sleep suite (v1.2.0) and the preference-learner methodology
+(v1.3.0) draw on these peer-reviewed sources:
 
-* Hirshkowitz M et al. **National Sleep Foundation's sleep time
-  duration recommendations: methodology and results summary**,
-  *Sleep Health* 1 (2015) 40-43.
-* Paruthi S et al. **Recommended Amount of Sleep for Pediatric
-  Populations: A Consensus Statement of the American Academy of
-  Sleep Medicine**, *J Clin Sleep Med* 12 (2016) 785-786.
-* Van Dongen HPA et al. **The cumulative cost of additional
-  wakefulness: dose-response effects on neurobehavioral functions
-  and sleep physiology from chronic sleep restriction and total
-  sleep deprivation**, *Sleep* 26 (2003) 117-126.
-* Belenky G et al. **Patterns of performance degradation and
+- Hirshkowitz M et al. **National Sleep Foundation's sleep time
+  duration recommendations**, *Sleep Health* 1 (2015) 40-43.
+- Paruthi S et al. **Recommended Amount of Sleep for Pediatric
+  Populations: A Consensus Statement of the AASM**, *J Clin Sleep
+  Med* 12 (2016) 785-786.
+- Van Dongen HPA et al. **The cumulative cost of additional
+  wakefulness**, *Sleep* 26 (2003) 117-126.
+- Belenky G et al. **Patterns of performance degradation and
   restoration during sleep restriction and subsequent recovery**,
   *J Sleep Res* 12 (2003) 1-12.
-* Banks S et al. **Neurobehavioral dynamics following chronic sleep
-  restriction: dose-response effects of one night for recovery**,
-  *Sleep* 33 (2010) 1013-1026.
-* Hilditch CJ, McHill AW. **Sleep inertia: current insights**,
-  *Nat Sci Sleep* 11 (2019) 155-165.
-* Phipps-Nelson J et al. **Daytime exposure to bright light...
+- Banks S et al. **Neurobehavioral dynamics following chronic sleep
+  restriction**, *Sleep* 33 (2010) 1013-1026.
+- Hilditch CJ, McHill AW. **Sleep inertia: current insights**, *Nat
+  Sci Sleep* 11 (2019) 155-165.
+- Phipps-Nelson J et al. **Daytime exposure to bright light…
   decreases sleepiness and improves psychomotor vigilance
   performance**, *Sleep* 26 (2003) 695-700.
-* Papalambros NA et al. **Acoustic Enhancement of Sleep Slow
-  Oscillations and Concomitant Memory Improvement in Older
-  Adults**, *Front Hum Neurosci* 11 (2017) 109.
-* Mart​íns DF et al. **Effects of white noise on sleep onset
-  latency in adult patients with insomnia**, *Sleep Med Rev* 64
-  (2022) 101647.
-* Ohayon MM et al. **National Sleep Foundation's sleep quality
+- Papalambros NA et al. **Acoustic Enhancement of Sleep Slow
+  Oscillations and Concomitant Memory Improvement in Older Adults**,
+  *Front Hum Neurosci* 11 (2017) 109.
+- Ohayon MM et al. **National Sleep Foundation's sleep quality
   recommendations: first report**, *Sleep Health* 3 (2017) 6-19.
-* Buysse DJ et al. **The Pittsburgh Sleep Quality Index**,
-  *Psychiatry Res* 28 (1989) 193-213.
-* Berry RB et al. *AASM Manual for the Scoring of Sleep* (v2.6).
+- Berry RB et al. *AASM Manual for the Scoring of Sleep* (v2.6).
 
 ## More information
 
-* Project repository: <https://github.com/LiangyuLu-lly/HA-sleep>
-* Manual deployment guide: see `docs/HA_SMART_DEPLOYMENT.md` in the repo.
-* Architecture write-up: see `docs/PROJECT_COMPLETION_REPORT.md`.
+- Project repository: <https://github.com/LiangyuLu-lly/HA-sleep>
+- Installation walk-through: see `INSTALL.md` in the repo.
+- Manual (non-Add-on) deployment: see `docs/MANUAL_DEPLOYMENT.md`.
+- Roadmap: see `docs/BACKLOG.md`.
