@@ -76,12 +76,11 @@ _INPUT_NUMBER_DOMAINS = {"input_number"}
 
 # Order matters — this is the order rendered in the form.
 _SLOTS: List[Dict[str, Any]] = [
-    {"key": "heart_rate_source",   "label": "心率传感器 / Heart-rate sensor",
-     "domains": _SENSOR_DOMAINS,   "multi": False},
-    {"key": "movement_source",     "label": "运动传感器 / Movement sensor",
-     "domains": _SENSOR_DOMAINS,   "multi": False},
-    {"key": "breathing_source",    "label": "呼吸传感器 / Breathing sensor",
-     "domains": _SENSOR_DOMAINS,   "multi": False},
+    # v1.3.0: a single sleep-stage entity replaces the three legacy
+    # physiology slots.  ``input_select`` is allowed because some users
+    # pipe their tracker's output through a helper before exposing it.
+    {"key": "sleep_stage_source",  "label": "睡眠阶段实体 / Sleep-stage entity",
+     "domains": _SENSOR_DOMAINS | {"input_select"}, "multi": False},
     {"key": "temperature_source",  "label": "温度传感器 / Temperature sensor",
      "domains": {"sensor"},         "multi": False},
     {"key": "humidity_source",     "label": "湿度传感器 / Humidity sensor",

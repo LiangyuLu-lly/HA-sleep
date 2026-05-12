@@ -20,7 +20,11 @@ from src.sleep_state_publisher import (
     ENTITY_DEBT,
     ENTITY_DURATION,
     ENTITY_LAST_ACTION,
+    ENTITY_LEARNED_BEDTIME_WEEKEND,
+    ENTITY_LEARNED_BEDTIME_WORKDAY,
+    ENTITY_LEARNED_ENVIRONMENT,
     ENTITY_QUALITY,
+    ENTITY_RECOMMENDATION_EXPLAIN,
     ENTITY_RECOMMENDED_BEDTIME,
     ENTITY_SOUNDSCAPE,
     ENTITY_STAGE,
@@ -279,19 +283,118 @@ class TestNaturalSleepPublishers:
         assert attrs["reason"] == "DEEP / SWA support"
 
 
+class TestLearningPanelPublishers:
+    """v1.3.0 PreferenceLearner-driven entities."""
+
+    async def test_publish_learned_bedtime_writes_both_buckets(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_learned_bedtime({
+            "weekday_bedtime": "23:00",
+            "weekend_bedtime": "00:15",
+            "tonight_bucket": "workday",
+            "n_workday": 12,
+            "n_weekend": 4,
+            "confidence": 0.78,
+        })
+        calls = {c.args[0]: c for c in ha_client.update_state.call_args_list}
+        assert calls[ENTITY_LEARNED_BEDTIME_WORKDAY].args[1] == "23:00"
+        assert calls[ENTITY_LEARNED_BEDTIME_WEEKEND].args[1] == "00:15"
+        wd_attrs = calls[ENTITY_LEARNED_BEDTIME_WORKDAY].kwargs["attributes"]
+        assert wd_attrs["n_samples"] == 12
+        assert wd_attrs["confidence"] == 0.78
+        assert wd_attrs["tonight_bucket"] == "workday"
+
+    async def test_publish_learned_bedtime_unknown_when_none(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_learned_bedtime({
+            "weekday_bedtime": None,
+            "weekend_bedtime": None,
+            "n_workday": 0,
+            "n_weekend": 0,
+            "confidence": 0.0,
+        })
+        calls = {c.args[0]: c for c in ha_client.update_state.call_args_list}
+        assert calls[ENTITY_LEARNED_BEDTIME_WORKDAY].args[1] == "unknown"
+        assert calls[ENTITY_LEARNED_BEDTIME_WEEKEND].args[1] == "unknown"
+
+    async def test_publish_learned_environment_formats_headline(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_learned_environment(
+            {"temperature_c": 19.4, "humidity_pct": 52.0, "brightness_pct": 5.0},
+            confidence=0.91,
+            n_used=4,
+        )
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[0] == ENTITY_LEARNED_ENVIRONMENT
+        # State must be human-readable; per-field values still in attrs.
+        assert "19.4" in c.args[1] and "°C" in c.args[1]
+        attrs = c.kwargs["attributes"]
+        assert attrs["temperature_c"] == 19.4
+        assert attrs["humidity_pct"] == 52.0
+        assert attrs["confidence"] == 0.91
+        assert attrs["n_used"] == 4
+
+    async def test_publish_learned_environment_dash_when_missing(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_learned_environment({})
+        c = ha_client.update_state.call_args_list[0]
+        # All three fields render as "—" → state is "— / — / —".
+        assert c.args[1].count("—") == 3
+
+    async def test_publish_recommendation_explain_ready(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        payload = {
+            "ready": True,
+            "method": "knn+decay",
+            "n_total": 12,
+            "recommendation": {"temperature_c": 19.5},
+            "neighbors": [{"session_id": f"s{i}", "weight": 0.5} for i in range(10)],
+            "confidence": 0.8,
+        }
+        await publisher.publish_recommendation_explain(payload)
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[0] == ENTITY_RECOMMENDATION_EXPLAIN
+        assert c.args[1] == "ready"
+        attrs = c.kwargs["attributes"]
+        assert attrs["method"] == "knn+decay"
+        assert attrs["n_total"] == 12
+        # Neighbor list must be capped at 5 to stay under HA's 16 KB limit.
+        assert len(attrs["neighbors"]) == 5
+
+    async def test_publish_recommendation_explain_not_ready(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        await publisher.publish_recommendation_explain({
+            "ready": False,
+            "reason": "need 3 sessions, have 1",
+            "n_total": 1,
+        })
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[1] == "not_ready"
+        assert c.kwargs["attributes"]["reason"] == "need 3 sessions, have 1"
+        assert c.kwargs["attributes"]["n_total"] == 1
+
+
 class TestInitialPlaceholders:
     """Boot-time seeding: every owned entity must get a state immediately."""
 
-    async def test_publishes_all_nine_entities(
+    async def test_publishes_all_thirteen_entities(
         self, publisher: SleepStatePublisher, ha_client: AsyncMock,
     ) -> None:
         await publisher.publish_initial_placeholders()
         called = {c.args[0] for c in ha_client.update_state.call_args_list}
-        # Five legacy + four natural-sleep = nine entities.
+        # v1.3.0: 5 legacy + 4 natural-sleep + 4 learning = 13 entities.
         expected = {
             ENTITY_STAGE, ENTITY_CONFIDENCE, ENTITY_QUALITY, ENTITY_DURATION,
             ENTITY_LAST_ACTION, ENTITY_DEBT, ENTITY_RECOMMENDED_BEDTIME,
             ENTITY_WAKE_DECISION, ENTITY_SOUNDSCAPE,
+            ENTITY_LEARNED_BEDTIME_WORKDAY, ENTITY_LEARNED_BEDTIME_WEEKEND,
+            ENTITY_LEARNED_ENVIRONMENT, ENTITY_RECOMMENDATION_EXPLAIN,
         }
         assert called == expected
 
@@ -302,4 +405,5 @@ class TestInitialPlaceholders:
         publisher = SleepStatePublisher(ha_client)
         # Must not raise, even though every single update fails.
         await publisher.publish_initial_placeholders()
-        assert publisher.stats.failures == 9
+        # 13 entities seeded → 13 failures recorded.
+        assert publisher.stats.failures == 13

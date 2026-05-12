@@ -1,4 +1,4 @@
-# Home Assistant add-on manifest for the CNN-BiLSTM Sleep Classifier.
+# Home Assistant add-on manifest for the Sleep Classifier.
 #
 # Reference: https://developers.home-assistant.io/docs/add-ons/configuration/
 #
@@ -6,13 +6,14 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.2.3"
+version: "1.3.0"
 slug: sleep_classifier
 description: >-
-  Deep-learning sleep stage classifier (CNN-BiLSTM) with closed-loop smart
-  home control.  Automatically discovers HR / motion sensors and tunable
-  devices (lights, AC, humidifier, fan), then adapts your bedroom to the
-  conditions you historically sleep best in.
+  Closed-loop smart-home sleep automation.  Subscribes to any HA
+  sleep-stage sensor (Apple Watch, Mi Band, Fitbit, sleep_as_android, …),
+  then learns your preferred bedtime and bedroom environment from
+  history and writes back temperature / humidity / lighting / fan
+  setpoints that match the nights you slept best in.
 
 # This add-on is built locally (no pre-built image).  Both Pi 4B (aarch64)
 # and amd64 are supported; the others are excluded to keep the build matrix
@@ -34,7 +35,8 @@ init: false
 homeassistant_api: true
 
 # Persistent storage:
-#   /share        — public to other add-ons (used to drop a model file in)
+#   /share        — public to other add-ons (v1.2 shipped a model file
+#                   drop here; kept mapped for ad-hoc debugging exports)
 #   /data         — private add-on data (preference history JSON lives here)
 map:
   - share:rw
@@ -80,10 +82,17 @@ options:
   log_level: "info"
 
   # ---- Slot bindings: sensors -------------------------------------------
-  # Pin a single entity_id per slot.  Empty string = auto-discover.
-  heart_rate_source: ""          # e.g. sensor.xiaomi_smart_band_9_pro_heart_rate
-  movement_source: ""            # e.g. sensor.sleepradar_r60abd1_ts5_yundong_zhuangtai
-  breathing_source: ""           # e.g. sensor.sleepradar_r60abd1_ts6_huxi_xinxi
+  # Pin a single entity_id per slot.  Empty string = auto-discover (for
+  # environment sensors) or disabled (for sleep_stage_source, which has
+  # no auto-discovery because every device exposes it under a different
+  # name).
+  #
+  # v1.3.0: ``sleep_stage_source`` REPLACES the old heart-rate /
+  # movement / breathing slots.  Mass-market wearables (Mi Band, Apple
+  # Watch, Garmin, Withings) and bedside radars (R60ABD1, Eight Sleep)
+  # already publish a sleep-stage entity into HA — we read that
+  # directly instead of running our own CNN-BiLSTM.
+  sleep_stage_source: ""         # e.g. sensor.mi_band_8_pro_sleep_stage
   temperature_source: ""         # e.g. sensor.bedroom_temperature
   humidity_source: ""            # e.g. sensor.bedroom_humidity
   illuminance_source: ""         # e.g. sensor.bedroom_illuminance
@@ -97,30 +106,10 @@ options:
   switch_targets: []             # general-purpose switches you let us toggle
 
   # ---- Auto-discovery tunables ------------------------------------------
-  # Bilingual defaults (English + Chinese + pinyin) cover Mi Band, Apple
-  # Watch, Garmin, ESPHome mmWave radars (R60ABD1), Aqara FP1/FP2, etc.
-  # Override only if you have a vendor with very unusual naming.
-  heart_rate_keywords:
-    - heart_rate
-    - hr
-    - pulse
-    - bpm
-    - 心率
-    - 脉搏
-  movement_keywords:
-    - motion
-    - movement
-    - activity
-    - presence
-    - occupancy
-    - 运动
-    - 体动
-    - 人体
-  breathing_keywords:
-    - breath
-    - breathing
-    - respiration
-    - 呼吸
+  # Only environment sensors are auto-discovered now (temperature,
+  # humidity, illuminance).  The sleep_stage entity is bound explicitly
+  # via ``sleep_stage_source`` above because every vendor names it
+  # differently and we want zero ambiguity in the data we learn from.
   controllable_domains:
     - light
     - climate
@@ -188,9 +177,10 @@ schema:
   #   2. the literal two-character "" — same as empty (we tolerate this
   #      because users frequently copy the placeholder text verbatim)
   #   3. a real HA entity_id matching the domain regex below
-  heart_rate_source: 'match(^$|^""$|^(sensor|binary_sensor)\.[a-zA-Z0-9_]+$)?'
-  movement_source: 'match(^$|^""$|^(sensor|binary_sensor)\.[a-zA-Z0-9_]+$)?'
-  breathing_source: 'match(^$|^""$|^(sensor|binary_sensor)\.[a-zA-Z0-9_]+$)?'
+  # v1.3.0: a single sleep-stage entity replaces hr/movement/breathing.
+  # We accept sensor.*, binary_sensor.* and input_select.* because some
+  # users wrap a script in a helper before piping it in.
+  sleep_stage_source: 'match(^$|^""$|^(sensor|binary_sensor|input_select)\.[a-zA-Z0-9_]+$)?'
   temperature_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
   humidity_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
   illuminance_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
@@ -203,12 +193,6 @@ schema:
   switch_targets:
     - 'match(^$|^""$|^switch\.[a-zA-Z0-9_]+$)'
 
-  heart_rate_keywords:
-    - str
-  movement_keywords:
-    - str
-  breathing_keywords:
-    - str
   controllable_domains:
     - list(light|climate|fan|humidifier|switch|media_player)
   explicit_includes:

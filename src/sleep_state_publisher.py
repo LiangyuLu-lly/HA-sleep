@@ -48,6 +48,14 @@ ENTITY_RECOMMENDED_BEDTIME = "sensor.sleep_classifier_recommended_bedtime"
 ENTITY_WAKE_DECISION = "sensor.sleep_classifier_wake_decision"
 ENTITY_SOUNDSCAPE = "sensor.sleep_classifier_soundscape"
 
+# v1.3.0 — preference-learning entities.  Four sensors that mirror the
+# PreferenceLearner's public API so Lovelace can render the panel without
+# any template helpers on the user's side.
+ENTITY_LEARNED_BEDTIME_WORKDAY = "sensor.sleep_classifier_learned_bedtime_workday"
+ENTITY_LEARNED_BEDTIME_WEEKEND = "sensor.sleep_classifier_learned_bedtime_weekend"
+ENTITY_LEARNED_ENVIRONMENT = "sensor.sleep_classifier_learned_environment"
+ENTITY_RECOMMENDATION_EXPLAIN = "sensor.sleep_classifier_recommendation_explain"
+
 # ``icon: mdi:...`` strings render in Lovelace.  ``state_class`` and
 # ``device_class`` enable HA's long-term statistics (so the user gets a
 # free trend graph without writing a SQL query).
@@ -108,6 +116,30 @@ _STATIC_ATTRS_SOUNDSCAPE = {
         "off", "pink_noise", "brown_noise", "white_noise",
         "rain", "wind", "ocean", "dawn_chorus",
     ],
+}
+
+# v1.3.0 — learning-related entities.  ``state`` carries the headline
+# value (a "HH:MM" string or "ready" / "not_ready"); the rich data lives
+# in attributes so Lovelace's More-Info dialog can render it.
+_STATIC_ATTRS_LEARNED_BEDTIME_WORKDAY = {
+    "friendly_name": "Learned workday bedtime",
+    "icon": "mdi:briefcase-clock",
+}
+_STATIC_ATTRS_LEARNED_BEDTIME_WEEKEND = {
+    "friendly_name": "Learned weekend bedtime",
+    "icon": "mdi:weekend",
+}
+_STATIC_ATTRS_LEARNED_ENVIRONMENT = {
+    "friendly_name": "Learned best sleep environment",
+    "icon": "mdi:home-thermometer",
+}
+_STATIC_ATTRS_RECOMMENDATION_EXPLAIN = {
+    "friendly_name": "Recommendation explanation",
+    "icon": "mdi:lightbulb-on",
+    # device_class=enum gives Lovelace a chip-style rendering for
+    # ``ready`` / ``not_ready`` without needing a custom card.
+    "device_class": "enum",
+    "options": ["ready", "not_ready"],
 }
 
 
@@ -290,6 +322,108 @@ class SleepStatePublisher:
             attrs["reason"] = reason[:255]
         await self._safe_update(ENTITY_SOUNDSCAPE, str(soundscape), attrs)
 
+    # ------------------------------------------------------------------ #
+    # v1.3.0 — preference-learning entities                                #
+    # ------------------------------------------------------------------ #
+
+    async def publish_learned_bedtime(
+        self,
+        bedtime: Dict[str, Any],
+    ) -> None:
+        """Mirror the ``PreferenceLearner.recommend_bedtime`` payload.
+
+        Two entities are written:
+
+        * ``sensor.sleep_classifier_learned_bedtime_workday``
+        * ``sensor.sleep_classifier_learned_bedtime_weekend``
+
+        Each carries a ``"HH:MM"`` state (or ``"unknown"`` until the
+        bucket has enough samples) and exposes the full bedtime dict
+        as attributes so Lovelace can render confidence + sample count.
+        """
+        workday = bedtime.get("weekday_bedtime") or "unknown"
+        weekend = bedtime.get("weekend_bedtime") or "unknown"
+
+        wd_attrs = dict(_STATIC_ATTRS_LEARNED_BEDTIME_WORKDAY)
+        wd_attrs["n_samples"] = int(bedtime.get("n_workday", 0))
+        wd_attrs["confidence"] = round(float(bedtime.get("confidence", 0.0)), 2)
+        wd_attrs["tonight_bucket"] = bedtime.get("tonight_bucket", "")
+        await self._safe_update(
+            ENTITY_LEARNED_BEDTIME_WORKDAY, str(workday), wd_attrs,
+        )
+
+        we_attrs = dict(_STATIC_ATTRS_LEARNED_BEDTIME_WEEKEND)
+        we_attrs["n_samples"] = int(bedtime.get("n_weekend", 0))
+        we_attrs["confidence"] = round(float(bedtime.get("confidence", 0.0)), 2)
+        we_attrs["tonight_bucket"] = bedtime.get("tonight_bucket", "")
+        await self._safe_update(
+            ENTITY_LEARNED_BEDTIME_WEEKEND, str(weekend), we_attrs,
+        )
+
+    async def publish_learned_environment(
+        self,
+        env: Dict[str, Any],
+        *,
+        confidence: float = 0.0,
+        n_used: int = 0,
+    ) -> None:
+        """Headline string for the recommended bedroom environment.
+
+        State format: ``"19.5 °C / 50 % / 5 %"`` — readable at a glance
+        on a chip-style Lovelace card.  Each numeric value lives in
+        attributes too so users can wire them into custom automations.
+        """
+        def _fmt(v: Optional[float], suffix: str, dp: int = 1) -> str:
+            return f"{round(float(v), dp)} {suffix}" if v is not None else "—"
+
+        temp = env.get("temperature_c")
+        hum = env.get("humidity_pct")
+        bright = env.get("brightness_pct")
+        state = " / ".join([
+            _fmt(temp, "°C", 1),
+            _fmt(hum, "%", 0),
+            _fmt(bright, "%", 0),
+        ])
+        attrs = dict(_STATIC_ATTRS_LEARNED_ENVIRONMENT)
+        if temp is not None:
+            attrs["temperature_c"] = round(float(temp), 2)
+        if hum is not None:
+            attrs["humidity_pct"] = round(float(hum), 1)
+        if bright is not None:
+            attrs["brightness_pct"] = round(float(bright), 1)
+        if env.get("fan_speed_pct") is not None:
+            attrs["fan_speed_pct"] = round(float(env["fan_speed_pct"]), 1)
+        attrs["confidence"] = round(float(confidence), 2)
+        attrs["n_used"] = int(n_used)
+        await self._safe_update(ENTITY_LEARNED_ENVIRONMENT, state, attrs)
+
+    async def publish_recommendation_explain(
+        self,
+        explanation: Dict[str, Any],
+    ) -> None:
+        """Surface the ``PreferenceLearner.explain()`` payload to HA.
+
+        State is the literal string ``"ready"`` or ``"not_ready"`` so
+        Lovelace can colour-code it; the actual reasoning lives in
+        attributes (capped at the 15 KB HA limit by truncating the
+        ``neighbors`` list to the 5 highest-weight rows).
+        """
+        ready = bool(explanation.get("ready"))
+        state = "ready" if ready else "not_ready"
+        attrs = dict(_STATIC_ATTRS_RECOMMENDATION_EXPLAIN)
+        for k in (
+            "method", "n_total", "avg_age_days", "decay_half_life_days",
+            "effective_sample_size", "recommendation", "bedtime",
+            "confidence", "reason",
+        ):
+            if k in explanation:
+                attrs[k] = explanation[k]
+        # Cap neighbour list so attributes never bust HA's 16 KB limit.
+        neighbors = list(explanation.get("neighbors") or [])[:5]
+        if neighbors:
+            attrs["neighbors"] = neighbors
+        await self._safe_update(ENTITY_RECOMMENDATION_EXPLAIN, state, attrs)
+
     async def publish_last_action(
         self, summary: str, *, executed: bool,
     ) -> None:
@@ -333,6 +467,26 @@ class SleepStatePublisher:
         )
         await self._safe_update(
             ENTITY_SOUNDSCAPE, "off", _STATIC_ATTRS_SOUNDSCAPE,
+        )
+        # v1.3.0 learning entities — placeholder until enough sessions
+        # accumulate.  ``unknown`` is HA's standard not-yet-populated
+        # sentinel; the explain entity uses ``not_ready`` to match its
+        # enum options list.
+        await self._safe_update(
+            ENTITY_LEARNED_BEDTIME_WORKDAY, "unknown",
+            _STATIC_ATTRS_LEARNED_BEDTIME_WORKDAY,
+        )
+        await self._safe_update(
+            ENTITY_LEARNED_BEDTIME_WEEKEND, "unknown",
+            _STATIC_ATTRS_LEARNED_BEDTIME_WEEKEND,
+        )
+        await self._safe_update(
+            ENTITY_LEARNED_ENVIRONMENT, "—",
+            _STATIC_ATTRS_LEARNED_ENVIRONMENT,
+        )
+        await self._safe_update(
+            ENTITY_RECOMMENDATION_EXPLAIN, "not_ready",
+            _STATIC_ATTRS_RECOMMENDATION_EXPLAIN,
         )
 
     async def _safe_update(

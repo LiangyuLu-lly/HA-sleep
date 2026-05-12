@@ -42,9 +42,8 @@ import signal
 import sys
 import time
 import uuid
-from collections import deque
 from pathlib import Path
-from typing import Deque, Dict, List, Optional
+from typing import Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -88,145 +87,29 @@ from src.smart_wake import (
     WakeWindow,
     light_ramp_brightness,
 )
-from src.training_pipeline import TrainingPipeline
+from src.external_stage_subscriber import ExternalStageSubscriber
 from src.user_profile import UserProfile, UserProfileStore
 from src.whitenoise_matcher import Soundscape, WhiteNoiseMatcher
 
-# Buffer persistence path: ``/data`` is the supervisor-managed volume so the
-# file survives add-on upgrades.  Outside the add-on we fall back to the
+# Persistence root: ``/data`` is the supervisor-managed volume so files
+# survive add-on upgrades.  Outside the add-on we fall back to the
 # project root so dev runs work too.
+#
+# v1.3.0: the legacy CNN-BiLSTM ``inference_buffer.npz`` is gone — the
+# stage now arrives as a single HA entity update, so there's nothing to
+# warm up across restarts.  We keep ``_BUFFER_DIR`` only as the natural
+# parent for ``user_profile.json`` so the existing on-disk layout stays
+# stable for users upgrading from v1.2.x.
 _BUFFER_DIR = Path("/data") if Path("/data").is_dir() else PROJECT_ROOT
-_BUFFER_PATH = _BUFFER_DIR / "inference_buffer.npz"
-# Don't restore a buffer older than this — stale physiology samples from a
-# previous night would mislead the model worse than a fresh cold-start.
-_BUFFER_MAX_AGE_S = 6 * 3600   # 6 hours
 
 # Natural-sleep persistence paths (v1.2.0).
 _PROFILE_PATH = _BUFFER_DIR / "user_profile.json"
 
+# Type alias kept short so the ``_route_state_change`` /
+# ``_task_inference_loop`` signatures stay scannable.
+_Engine = ExternalStageSubscriber
+
 logger = logging.getLogger("smart_service")
-
-
-# ---------------------------------------------------------------------------
-# Inference engine — rolling buffer + CNN-BiLSTM forward pass
-# ---------------------------------------------------------------------------
-
-
-class _InferenceEngine:
-    """Minimal sliding-window inference engine shared with run_ha_service."""
-
-    _WINDOW = 1024  # samples (must match TrainingPipeline.window_size)
-
-    def __init__(self, model_path: Path, config_path: Path) -> None:
-        self._pipeline = TrainingPipeline(config_path=str(config_path))
-        if model_path.exists():
-            self._pipeline.load_model(str(model_path))
-            self.model_loaded = True
-        else:
-            logger.warning(
-                "Model %s not found — running with random classifier weights",
-                model_path,
-            )
-            self.model_loaded = False
-        self.hr_buf: Deque[float] = deque(maxlen=self._WINDOW)
-        self.mv_buf: Deque[float] = deque(maxlen=self._WINDOW)
-        # Bootstrap normaliser so transform() works without a fit() call.
-        self._pipeline._normalizer._fitted = True
-        self._pipeline._normalizer._hr_mean = 75.0
-        self._pipeline._normalizer._hr_std = 15.0
-        self._pipeline._normalizer._mv_mean = 0.5
-        self._pipeline._normalizer._mv_std = 0.5
-
-    def push_hr(self, value: float) -> None:
-        self.hr_buf.append(float(value))
-
-    def push_movement(self, value: float) -> None:
-        self.mv_buf.append(float(value))
-
-    def buffer_ready(self) -> bool:
-        return len(self.hr_buf) >= self._WINDOW and len(self.mv_buf) >= self._WINDOW
-
-    # ------------------------------------------------------------------ #
-    # Persistence: keep buffers warm across add-on restarts.            #
-    # ------------------------------------------------------------------ #
-
-    def save_buffers(self, path: Path) -> None:
-        """Atomically write the rolling buffers to ``path``.
-
-        Saves to ``<path>.tmp`` first then renames, so a crash during the
-        write never leaves a half-written file (which numpy would refuse
-        to load on the next boot).
-        """
-        if not self.hr_buf and not self.mv_buf:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # ``np.savez_compressed`` silently appends ``.npz`` if the
-            # destination doesn't already end in that suffix.  We therefore
-            # write to an explicit ``<path>.tmp`` *file handle* so the suffix
-            # logic doesn't kick in and our atomic rename stays predictable.
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            with open(tmp, "wb") as fh:
-                np.savez_compressed(
-                    fh,
-                    hr=np.asarray(self.hr_buf, dtype=np.float32),
-                    mv=np.asarray(self.mv_buf, dtype=np.float32),
-                    saved_at=np.float64(time.time()),
-                )
-            tmp.replace(path)
-            logger.info(
-                "inference_buffer saved (hr=%d, mv=%d) → %s",
-                len(self.hr_buf), len(self.mv_buf), path,
-            )
-        except Exception as exc:    # noqa: BLE001
-            logger.warning("Could not persist inference buffer: %s", exc)
-
-    def restore_buffers(self, path: Path, max_age_s: float) -> bool:
-        """Best-effort restore from ``path`` if the file is fresh enough.
-
-        Returns True iff samples were actually loaded (used by the service
-        to bypass the WS warm-up if we were already warm pre-restart).
-        """
-        if not path.exists():
-            return False
-        try:
-            data = np.load(path, allow_pickle=False)
-            saved_at = float(data["saved_at"]) if "saved_at" in data else 0.0
-            age = time.time() - saved_at
-            if age > max_age_s:
-                logger.info(
-                    "inference_buffer at %s is %.0fs old (>%.0fs) — ignoring",
-                    path, age, max_age_s,
-                )
-                return False
-            for v in data["hr"][-self._WINDOW :]:
-                self.hr_buf.append(float(v))
-            for v in data["mv"][-self._WINDOW :]:
-                self.mv_buf.append(float(v))
-            logger.info(
-                "inference_buffer restored (hr=%d, mv=%d, age=%.0fs)",
-                len(self.hr_buf), len(self.mv_buf), age,
-            )
-            return True
-        except Exception as exc:    # noqa: BLE001
-            logger.warning("Could not restore inference buffer: %s", exc)
-            return False
-
-    def infer(self) -> tuple[SleepStage, float]:
-        if not self.buffer_ready():
-            return (SleepStage.LIGHT, 0.25)
-        hr = np.asarray(self.hr_buf, dtype=np.float32)
-        mv = np.asarray(self.mv_buf, dtype=np.float32)
-        hr_n = (hr - self._pipeline._normalizer._hr_mean) / (
-            self._pipeline._normalizer._hr_std + 1e-9
-        )
-        mv_n = (mv - self._pipeline._normalizer._mv_mean) / (
-            self._pipeline._normalizer._mv_std + 1e-9
-        )
-        feats = self._pipeline._extract_features_for_sample(hr_n, mv_n)
-        probs = self._pipeline._classifier_forward(feats.reshape(1, -1))[0]
-        idx = int(np.argmax(probs))
-        return (SleepStage(idx), float(probs[idx]))
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +233,19 @@ class SmartSleepService:
                 scale=int(natural_cfg.get("feedback_scale", 5)),
             )
 
+        # v1.3.0: stage now comes from an external HA entity (Mi Band /
+        # Apple Watch / Withings / etc) instead of a local CNN-BiLSTM
+        # forward pass.  The entity_id is mandatory in live mode but the
+        # constructor must not raise here so dry-run / unit-test paths
+        # can still build the service; we re-check the binding in run().
+        self.sleep_stage_source: str = str(
+            api_cfg.get("sleep_stage_source", "")
+        ).strip()
+        # Allow the user's literal '""' placeholder (the add-on's
+        # Configuration form keeps quotes around the empty default).
+        if self.sleep_stage_source in ('""', "''"):
+            self.sleep_stage_source = ""
+
         # Runtime state
         self.session_id = uuid.uuid4().hex[:8]
         self.session_started_at = time.time()
@@ -373,53 +269,52 @@ class SmartSleepService:
         self,
         event: StateChangeEvent,
         discovery: DiscoveryResult,
-        engine: _InferenceEngine,
+        engine: _Engine,
     ) -> None:
+        """Fan out one HA ``state_changed`` event to the right consumer.
+
+        v1.3.0 fan-out (top priority first):
+
+        1.  The bound *sleep-stage* entity → forward to the subscriber
+            (raw value + attributes; the subscriber owns parsing).
+        2.  The feedback ``input_number`` (if configured) → consume the
+            raw event so we don't try to coerce a string to a number.
+        3.  Environment sensors (temperature / humidity / illuminance)
+            → snapshot into ``self.last_env`` so the controller has a
+            current reading next time the inference loop ticks.
+
+        Heart-rate / movement / breathing sensors are no longer routed
+        anywhere — the external sleep tracker is the authoritative
+        source for stage, and feeding redundant physiology would only
+        add noise to the learner without affecting the decision.
+        """
         if event.new_state is None:
             return
         eid = event.entity_id
 
-        # Feedback helper comes first: it wants the raw string state of
-        # ``input_number.sleep_rating``, not a numeric coerced value.
+        # ---- 1. Sleep-stage forwarding (the new hot path) ------------
+        # Use ``observe`` so the subscriber owns the vocabulary mapping
+        # (numeric / English / Chinese / "unknown" all handled there).
+        if eid == self.sleep_stage_source:
+            engine.observe(
+                eid,
+                event.new_state.state,
+                attributes=event.new_state.attributes,
+            )
+            return
+
+        # ---- 2. Feedback helper (raw string state) -------------------
+        # Must come before the numeric coerce below because feedback
+        # entities sometimes hold non-numeric text (e.g. "skipped").
         if self.feedback is not None and eid == self.feedback.entity_id:
             self.feedback.on_state_change(event)
             return
 
+        # ---- 3. Environment sensors ---------------------------------
         value = event.new_state.numeric_state()
         if value is None:
             return
-
-        if any(e.entity_id == eid for e in discovery.sensors.heart_rate):
-            engine.push_hr(value)
-            # Pair the heart-rate sample with the most recent movement so
-            # both buffers stay aligned.  If movement hasn't been seen yet,
-            # we duplicate the last hr value as a zero-movement placeholder.
-            if engine.mv_buf:
-                engine.mv_buf.append(engine.mv_buf[-1])
-            else:
-                engine.push_movement(0.0)
-        elif any(e.entity_id == eid for e in discovery.sensors.movement):
-            engine.push_movement(value)
-            if engine.hr_buf:
-                engine.hr_buf.append(engine.hr_buf[-1])
-            else:
-                engine.push_hr(75.0)
-        elif (
-            not discovery.sensors.heart_rate
-            and any(e.entity_id == eid for e in discovery.sensors.breathing)
-        ):
-            # mmWave radars expose respiration rate (~12-20 rpm) which is
-            # numerically unlike a heart-rate (~50-90 bpm) but carries the
-            # same physiological-rhythm signal.  Scale to roughly the HR
-            # range so the trained normaliser doesn't clip it before
-            # routing it to the HR buffer.  This branch only fires when
-            # the user has *not* bound a real HR source.
-            engine.push_hr(float(value) * 4.0)
-            if engine.mv_buf:
-                engine.mv_buf.append(engine.mv_buf[-1])
-            else:
-                engine.push_movement(0.0)
-        elif any(e.entity_id == eid for e in discovery.sensors.temperature):
+        if any(e.entity_id == eid for e in discovery.sensors.temperature):
             self.last_env.temperature_c = value
         elif any(e.entity_id == eid for e in discovery.sensors.humidity):
             self.last_env.humidity_pct = value
@@ -434,7 +329,7 @@ class SmartSleepService:
         self,
         ha: HomeAssistantClient,
         discovery: DiscoveryResult,
-        engine: _InferenceEngine,
+        engine: _Engine,
     ) -> None:
         """Stream state-changed events; reconnect with exponential backoff.
 
@@ -491,7 +386,7 @@ class SmartSleepService:
 
     async def _task_inference_loop(
         self,
-        engine: _InferenceEngine,
+        engine: _Engine,
         controller: SmartEnvironmentController,
         ha: "HomeAssistantClient",
     ) -> None:
@@ -539,9 +434,9 @@ class SmartSleepService:
                 # --- Soundscape tick -------------------------------- #
                 await self._soundscape_tick(ha, stage, conf)
 
-                # Periodic buffer dump so a sudden power loss never wipes
-                # more than ``infer_interval`` seconds of warm-up.
-                engine.save_buffers(_BUFFER_PATH)
+                # v1.3.0: no rolling buffer to checkpoint anymore — the
+                # subscriber holds a single most-recent stage so a power
+                # loss costs at most one ``infer_interval`` tick.
 
                 try:
                     await asyncio.wait_for(
@@ -655,6 +550,9 @@ class SmartSleepService:
                     # Also refresh debt + bedtime entities because the
                     # new session just became history.
                     loop.create_task(self._publish_debt_and_bedtime())
+                    # And refresh the v1.3.0 learning panel — the new
+                    # session changes the decay-weighted recommendations.
+                    loop.create_task(self._publish_learning_panel())
                 except RuntimeError:
                     # No running loop (e.g. last call during shutdown). Skip.
                     pass
@@ -666,10 +564,18 @@ class SmartSleepService:
     # ------------------------------------------------------------------ #
 
     async def run(self) -> int:
-        config_path = (PROJECT_ROOT / self.args.config).resolve()
-        engine = _InferenceEngine(
-            model_path=(PROJECT_ROOT / self.args.model).resolve(),
-            config_path=config_path,
+        if not self.sleep_stage_source and not self.args.dry_run:
+            logger.error(
+                "sleep_stage_source is empty.  Open the add-on Configuration "
+                "tab and bind a sleep-stage entity (e.g. "
+                "sensor.mi_band_sleep_stage)."
+            )
+            return 4
+        # The subscriber needs a non-empty entity_id to validate; in the
+        # dry-run-without-binding path we substitute a placeholder so the
+        # synthetic loop can still drive the controller.
+        engine = ExternalStageSubscriber(
+            stage_entity_id=self.sleep_stage_source or "sensor.dry_run_stage",
         )
 
         # ----- Dry-run path: no HA ---------------------------------------
@@ -694,14 +600,21 @@ class SmartSleepService:
             discovery = DeviceDiscovery(self.disc_cfg).discover(entities)
             discovery.log_summary()
 
-            if not discovery.has_minimum_sensors():
-                self._log_binding_help(entities)
-                logger.error(
-                    "No heart-rate / movement / breathing sensor found. "
-                    "Open the add-on Configuration tab and fill the *_source "
-                    "slot fields with one of the candidate entity_ids above.",
+            # v1.3.0: HR / movement / breathing are no longer required.
+            # The only mandatory binding is ``sleep_stage_source`` (checked
+            # at the top of run()).  Environment sensors stay optional but
+            # we surface a one-line summary so the user can spot the gap.
+            if not (
+                discovery.sensors.temperature
+                or discovery.sensors.humidity
+                or discovery.sensors.illuminance
+            ):
+                logger.warning(
+                    "No environment sensors discovered (temperature / humidity "
+                    "/ illuminance).  Learning continues on stage data alone, "
+                    "but the controller can't learn the best (T, RH, lux) "
+                    "combo without them."
                 )
-                return 3
 
             controller = SmartEnvironmentController(
                 config=self.ctrl_cfg,
@@ -713,10 +626,9 @@ class SmartSleepService:
             # Initial environment snapshot
             self._seed_current_env(entities, discovery)
 
-            # Restore any buffer left behind by a previous run.  This
-            # avoids the ~10 minute cold-start window after every add-on
-            # restart — the most common user complaint.
-            engine.restore_buffers(_BUFFER_PATH, max_age_s=_BUFFER_MAX_AGE_S)
+            # v1.3.0: no buffer to restore — the subscriber's first real
+            # state-changed event will populate the cached stage within
+            # one HA WebSocket round-trip (~50 ms typical).
 
             # Diagnostic state publisher — populates HA Lovelace entities.
             self.publisher = SleepStatePublisher(ha)
@@ -734,6 +646,12 @@ class SmartSleepService:
                 await self._publish_debt_and_bedtime()
             except Exception as exc:    # noqa: BLE001
                 logger.warning("Initial debt/bedtime publish failed: %s", exc)
+
+            # Same for the v1.3.0 learning panel.
+            try:
+                await self._publish_learning_panel()
+            except Exception as exc:    # noqa: BLE001
+                logger.warning("Initial learning-panel publish failed: %s", exc)
 
             await ha.connect_websocket()
             await ha.subscribe_state_changes()
@@ -772,9 +690,6 @@ class SmartSleepService:
                         await t
                     except (asyncio.CancelledError, Exception):
                         pass
-                # Save buffer first so even a crash during session persistence
-                # doesn't lose the warm-up samples.
-                engine.save_buffers(_BUFFER_PATH)
                 self._persist_session(controller, partial=False)
         return 0
 
@@ -955,6 +870,44 @@ class SmartSleepService:
         except Exception as exc:    # noqa: BLE001
             logger.warning("Could not publish debt/bedtime: %s", exc)
 
+    async def _publish_learning_panel(self) -> None:
+        """Refresh the four v1.3.0 preference-learning sensors.
+
+        Pulls the latest snapshot from :class:`PreferenceLearner` and
+        forwards each piece to the corresponding publisher method.  Any
+        exception is logged but never re-raised so a bad learner state
+        can't interrupt the inference loop.
+        """
+        if self.learner is None or self.publisher is None:
+            return
+        try:
+            defaults = EnvironmentParams(
+                temperature_c=self.last_env.temperature_c,
+                humidity_pct=self.last_env.humidity_pct,
+                brightness_pct=self.last_env.brightness_pct,
+                fan_speed_pct=self.last_env.fan_speed_pct,
+            )
+            bedtime = self.learner.recommend_bedtime()
+            await self.publisher.publish_learned_bedtime(bedtime)
+
+            knn = self.learner.recommend_knn(
+                defaults,
+                current_temp_c=self.last_env.temperature_c,
+            )
+            await self.publisher.publish_learned_environment(
+                knn["env"].to_dict(),
+                confidence=float(knn.get("confidence", 0.0)),
+                n_used=int(knn.get("n_used", 0)),
+            )
+
+            explanation = self.learner.explain(
+                defaults,
+                current_temp_c=self.last_env.temperature_c,
+            )
+            await self.publisher.publish_recommendation_explain(explanation)
+        except Exception as exc:    # noqa: BLE001
+            logger.warning("Could not publish learning panel: %s", exc)
+
     def _log_binding_help(self, entities: List[HAEntity]) -> None:
         """Print top candidate entity_ids per slot to help the user bind them.
 
@@ -1013,18 +966,28 @@ class SmartSleepService:
             self.last_env.brightness_pct,
         )
 
-    async def _run_dry_with_synthetic_signals(self, engine: _InferenceEngine) -> None:
-        """Tiny offline smoke-test path: pushes random HR/movement and prints actions."""
+    async def _run_dry_with_synthetic_signals(self, engine: _Engine) -> None:
+        """Tiny offline smoke-test path: cycles synthetic stages and prints actions.
+
+        v1.3.0: with the model gone, the dry-run loop just rotates
+        through AWAKE → LIGHT → DEEP → REM at a fixed cadence so an
+        operator can validate routing / publishing without standing up a
+        real HA instance.
+        """
         logger.info("Running offline synthetic loop for %.1fs", self.args.duration or 10)
-        import random as _r
+        cycle = [SleepStage.AWAKE, SleepStage.LIGHT, SleepStage.DEEP, SleepStage.REM]
         deadline = time.time() + (self.args.duration or 10)
+        i = 0
         while time.time() < deadline:
-            engine.push_hr(_r.uniform(55, 80))
-            engine.push_movement(_r.uniform(0, 1))
-            if engine.buffer_ready():
-                stage, conf = engine.infer()
-                logger.info("stage=%s conf=%.2f", stage.name, conf)
-            await asyncio.sleep(0.05)
+            engine.observe(
+                engine.stage_entity_id,
+                cycle[i % len(cycle)].name,
+                attributes={"confidence": 0.9},
+            )
+            stage, conf = engine.current()
+            logger.info("stage=%s conf=%.2f", stage.name, conf)
+            i += 1
+            await asyncio.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,11 +997,14 @@ class SmartSleepService:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Deep Home Assistant integration for the CNN-BiLSTM sleep model.",
+        description=(
+            "Home Assistant integration for the Sleep Classifier add-on "
+            "(v1.3.0+).  Subscribes to an external sleep-stage entity and "
+            "learns the user's optimal sleep environment over time."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--config", default="training_config/config.json")
-    p.add_argument("--model", default="models/best_model.h5")
     p.add_argument("--base-url", default=None,
                    help="HA base URL (overrides config). e.g. http://homeassistant.local:8123")
     p.add_argument("--token", default=None,

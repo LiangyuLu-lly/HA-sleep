@@ -42,6 +42,12 @@ def fake_states() -> List[Dict[str, Any]]:
         return {"entity_id": eid,
                 "attributes": {"friendly_name": friendly or eid}}
     return [
+        # v1.3.0: a single sleep-stage entity replaces the legacy
+        # heart-rate / movement / breathing slots.  We still expose the
+        # old fake entities so existing assertions about domain filtering
+        # keep working.
+        s("sensor.bedroom_sleep_stage",   "Bedroom Sleep Stage"),
+        s("input_select.bedroom_phase",  "Bedroom Phase"),
         s("sensor.bedroom_heart_rate",    "Bedroom Heart Rate"),
         s("sensor.bedroom_movement",      "Bedroom Movement"),
         s("sensor.bedroom_breathing",     "Bedroom Breathing"),
@@ -105,15 +111,16 @@ class TestApiEntities:
         data = await resp.json()
         slots = data["slots"]
 
-        # Heart-rate slot accepts sensor + binary_sensor.  weather + sun
-        # are excluded because they're not in our domain set.
-        hr = slots["heart_rate_source"]
-        eids = {c["entity_id"] for c in hr["candidates"]}
-        assert "sensor.bedroom_heart_rate" in eids
+        # Sleep-stage slot accepts sensor + binary_sensor + input_select.
+        # weather + sun are excluded because they're not in our domain set.
+        stage = slots["sleep_stage_source"]
+        eids = {c["entity_id"] for c in stage["candidates"]}
+        assert "sensor.bedroom_sleep_stage" in eids
+        assert "input_select.bedroom_phase" in eids
         assert "binary_sensor.bedroom_motion" in eids
         assert "weather.home" not in eids
         assert "sun.sun" not in eids
-        assert hr["multi"] is False
+        assert stage["multi"] is False
 
         # Light targets are multi-select and only see light.*
         lt = slots["light_targets"]
@@ -136,12 +143,12 @@ class TestApiEntities:
         self, client, isolate_data_dir,
     ) -> None:
         (isolate_data_dir / "web_ui_overrides.json").write_text(
-            json.dumps({"heart_rate_source": "sensor.bedroom_heart_rate"}),
+            json.dumps({"sleep_stage_source": "sensor.bedroom_sleep_stage"}),
             encoding="utf-8",
         )
         resp = await client.get("/api/entities")
         data = await resp.json()
-        assert data["current"]["heart_rate_source"] == "sensor.bedroom_heart_rate"
+        assert data["current"]["sleep_stage_source"] == "sensor.bedroom_sleep_stage"
 
     async def test_502_when_ha_unreachable(self, monkeypatch) -> None:
         import aiohttp
@@ -167,15 +174,14 @@ class TestApiSave:
         self, client, isolate_data_dir,
     ) -> None:
         body = {
-            "heart_rate_source": "sensor.bedroom_heart_rate",
-            "movement_source":   "sensor.bedroom_movement",
-            "light_targets":     ["light.bedroom_main", "light.bedside_lamp"],
+            "sleep_stage_source": "sensor.bedroom_sleep_stage",
+            "light_targets":      ["light.bedroom_main", "light.bedside_lamp"],
         }
         resp = await client.post("/api/options", json=body)
         assert resp.status == 200
         data = await resp.json()
         assert data["rejected"] == []
-        assert data["saved"]["heart_rate_source"] == "sensor.bedroom_heart_rate"
+        assert data["saved"]["sleep_stage_source"] == "sensor.bedroom_sleep_stage"
         assert data["saved"]["light_targets"] == [
             "light.bedroom_main", "light.bedside_lamp",
         ]
@@ -189,23 +195,23 @@ class TestApiSave:
     async def test_unknown_entity_is_rejected_not_saved(
         self, client, isolate_data_dir,
     ) -> None:
-        body = {"heart_rate_source": "sensor.nonexistent"}
+        body = {"sleep_stage_source": "sensor.nonexistent"}
         resp = await client.post("/api/options", json=body)
         assert resp.status == 200
         data = await resp.json()
         # The bad pick is logged in 'rejected' and NOT written through.
         assert any("nonexistent" in r for r in data["rejected"])
-        assert "heart_rate_source" not in data["saved"]
+        assert "sleep_stage_source" not in data["saved"]
 
     async def test_literal_double_quote_normalised_to_empty(
         self, client, isolate_data_dir,
     ) -> None:
         # User clicks "blank" option whose value renders as ``""``;
         # we should treat this as empty-string, not as an entity_id.
-        body = {"heart_rate_source": '""'}
+        body = {"sleep_stage_source": '""'}
         resp = await client.post("/api/options", json=body)
         data = await resp.json()
-        assert data["saved"]["heart_rate_source"] == ""
+        assert data["saved"]["sleep_stage_source"] == ""
         assert data["rejected"] == []
 
     async def test_multi_select_drops_unknowns_keeps_valid(

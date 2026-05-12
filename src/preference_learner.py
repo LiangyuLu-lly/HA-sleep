@@ -29,10 +29,34 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.data_structures import SleepStage
+from src._time_utils import now_local
+
+# ---------------------------------------------------------------------------
+# Tunables that don't belong in the per-user config (engineering defaults)
+# ---------------------------------------------------------------------------
+#
+# Half-life of the decay window, measured in days.  ``W(d) = 2^(-d/H)``
+# means a session 14 days old still gets 50 % weight — enough that the
+# learner adapts to seasonal changes within ~1 month without
+# overreacting to a single bad night.
+_DEFAULT_HALF_LIFE_DAYS: float = 14.0
+
+# Hours after which an interval is no longer considered "the same
+# bedtime hour" for k-NN matching.  A 1.5 h Gaussian σ gives a soft
+# cut-off: 22:00 has 0.4 weight against 23:30, dropping to 0.05 against
+# 02:00 — close enough that ad-hoc late nights still nudge the
+# recommendation but can't override the user's normal schedule.
+_DEFAULT_HOUR_SIGMA: float = 1.5
+
+# Sigma for the ambient-temperature kernel (°C).  Within ±1 °C of
+# tonight's reading we want past sessions to count fully; >3 °C apart
+# they should barely contribute.
+_DEFAULT_TEMP_SIGMA: float = 1.5
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +139,15 @@ class EnvironmentParams:
 
 @dataclass
 class SleepSession:
-    """One night (or one nap) of accumulated data."""
+    """One night (or one nap) of accumulated data.
+
+    ``recorded_at`` is the wall-clock instant the session was committed
+    to disk — we keep it separate from ``ended_at`` because the latter
+    can be backfilled (e.g. a user importing historical data) and we
+    want the decay weight to reflect "how long ago did we *learn* this?".
+    Default = ``ended_at`` so old session files without the field still
+    decay correctly.
+    """
 
     session_id: str
     started_at: float                  # unix timestamp
@@ -125,6 +157,13 @@ class SleepSession:
     quality_score: float
     n_samples: int = 0
     notes: Optional[str] = None
+    recorded_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        # Backfill ``recorded_at`` for sessions loaded from a pre-v1.3
+        # JSON file (where the field didn't exist).
+        if not self.recorded_at:
+            self.recorded_at = self.ended_at or self.started_at or time.time()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -136,6 +175,7 @@ class SleepSession:
             "quality_score": self.quality_score,
             "n_samples": self.n_samples,
             "notes": self.notes,
+            "recorded_at": self.recorded_at,
         }
 
     @classmethod
@@ -149,6 +189,7 @@ class SleepSession:
             quality_score=float(raw.get("quality_score", 0)),
             n_samples=int(raw.get("n_samples", 0)),
             notes=raw.get("notes"),
+            recorded_at=float(raw.get("recorded_at", 0)),
         )
 
 
@@ -165,6 +206,12 @@ class PreferenceConfig:
     quality_quantile: float = 0.7
     max_sessions_kept: int = 60
     exploration_rate: float = 0.1
+    # v1.3.0 — decay + k-NN tunables.  Defaults match the engineering
+    # constants at module top but stay overridable from add-on options.
+    decay_half_life_days: float = _DEFAULT_HALF_LIFE_DAYS
+    knn_k: int = 5
+    knn_hour_sigma: float = _DEFAULT_HOUR_SIGMA
+    knn_temp_sigma: float = _DEFAULT_TEMP_SIGMA
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "PreferenceConfig":
@@ -277,14 +324,60 @@ class PreferenceLearner:
             f"avg={sum(scores) / n:.1f} max={max(scores):.1f}"
         )
 
-    def _top_sessions(self) -> List[SleepSession]:
+    # ------------------------------------------------------------------ #
+    # Weighting helpers (v1.3.0)                                          #
+    # ------------------------------------------------------------------ #
+
+    def _decay_weight(self, session: SleepSession, now_ts: float) -> float:
+        """Exponential-decay weight for one session.
+
+        ``w(d) = 2 ** (-d / H)`` where ``d`` is age in days and ``H`` is
+        the configured half-life.  We clamp negative ages (a session
+        timestamped in the future after a clock jump) to zero so they
+        still count as "today" instead of getting an unbounded boost.
+        """
+        h = max(self.config.decay_half_life_days, 0.5)
+        age_days = max(0.0, (now_ts - session.recorded_at) / 86400.0)
+        return 2.0 ** (-age_days / h)
+
+    def _session_weights(
+        self,
+        sessions: Sequence[SleepSession],
+        now_ts: Optional[float] = None,
+    ) -> List[float]:
+        """Combine decay × quality into a non-negative weight per session.
+
+        Quality is rescaled from the 0-100 range into 0.1..1.1 so the
+        worst night still contributes a little (otherwise a freak bad
+        score would zero its decay weight and the learner would lose a
+        whole day of data).
+        """
+        if now_ts is None:
+            now_ts = time.time()
+        out: List[float] = []
+        for s in sessions:
+            q = 0.1 + max(0.0, min(100.0, s.quality_score)) / 100.0
+            out.append(self._decay_weight(s, now_ts) * q)
+        return out
+
+    def _top_sessions(
+        self,
+        now_ts: Optional[float] = None,
+    ) -> List[SleepSession]:
+        """Return sessions whose *decayed* quality lands in the top quantile.
+
+        v1.3.0 change: thresholding now uses ``quality × decay`` rather
+        than raw quality, so a great night from 3 months ago no longer
+        outranks a merely-good night from yesterday.
+        """
         sessions = self._load()
         if len(sessions) < self.config.min_sessions_for_personalisation:
             return []
-        scores = sorted(s.quality_score for s in sessions)
-        idx = int(self.config.quality_quantile * (len(scores) - 1))
-        threshold = scores[idx]
-        return [s for s in sessions if s.quality_score >= threshold]
+        weights = self._session_weights(sessions, now_ts)
+        ranked = sorted(zip(sessions, weights), key=lambda p: p[1])
+        idx = int(self.config.quality_quantile * (len(ranked) - 1))
+        threshold = ranked[idx][1]
+        return [s for s, w in zip(sessions, weights) if w >= threshold]
 
     @staticmethod
     def _median(values: List[float]) -> Optional[float]:
@@ -297,11 +390,42 @@ class PreferenceLearner:
             return cleaned[mid]
         return 0.5 * (cleaned[mid - 1] + cleaned[mid])
 
+    @staticmethod
+    def _weighted_median(
+        values: Sequence[Optional[float]],
+        weights: Sequence[float],
+    ) -> Optional[float]:
+        """Return the weighted median of ``values`` (None entries dropped).
+
+        Implementation: sort (value, weight) pairs, walk the cumulative
+        weight until it crosses half of the total.  Falls back to the
+        plain median when all weights collapse to zero.
+        """
+        # Keep every numeric value even if its weight is zero — we still
+        # want to return *something* when all decay weights underflow.
+        pairs = [
+            (float(v), max(0.0, float(w))) for v, w in zip(values, weights)
+            if v is not None and not math.isnan(float(v))
+        ]
+        if not pairs:
+            return None
+        pairs.sort(key=lambda p: p[0])
+        total = sum(w for _, w in pairs)
+        if total <= 0:
+            return PreferenceLearner._median([v for v, _ in pairs])
+        cum = 0.0
+        for v, w in pairs:
+            cum += w
+            if cum >= total / 2.0:
+                return v
+        return pairs[-1][0]
+
     def recommend(
         self,
         defaults: EnvironmentParams,
         *,
         explore: bool = False,
+        now_ts: Optional[float] = None,
     ) -> EnvironmentParams:
         """Return personalised setpoints, falling back to ``defaults``.
 
@@ -311,17 +435,30 @@ class PreferenceLearner:
             explore: if True, add small Gaussian noise (controlled by
                 ``exploration_rate``) so the learner occasionally tries values
                 outside the historical best window.
+            now_ts: override "now" for the decay weight (used by tests).
         """
-        top = self._top_sessions()
+        top = self._top_sessions(now_ts=now_ts)
         if not top:
             logger.debug("PreferenceLearner: not enough history; using defaults")
             return defaults
 
+        # Each surviving top-session still gets a per-field weighted vote
+        # so recent good nights count more than old good nights within
+        # the same top quantile.
+        weights = self._session_weights(top, now_ts)
         rec = EnvironmentParams(
-            temperature_c=self._median([s.env_params.temperature_c for s in top]),
-            humidity_pct=self._median([s.env_params.humidity_pct for s in top]),
-            brightness_pct=self._median([s.env_params.brightness_pct for s in top]),
-            fan_speed_pct=self._median([s.env_params.fan_speed_pct for s in top]),
+            temperature_c=self._weighted_median(
+                [s.env_params.temperature_c for s in top], weights,
+            ),
+            humidity_pct=self._weighted_median(
+                [s.env_params.humidity_pct for s in top], weights,
+            ),
+            brightness_pct=self._weighted_median(
+                [s.env_params.brightness_pct for s in top], weights,
+            ),
+            fan_speed_pct=self._weighted_median(
+                [s.env_params.fan_speed_pct for s in top], weights,
+            ),
         )
         # Replace any unknown field with the caller's default.
         if rec.temperature_c is None:
@@ -360,6 +497,293 @@ class PreferenceLearner:
             f"{rec.fan_speed_pct:.0f}" if rec.fan_speed_pct is not None else "—",
         )
         return rec
+
+    # ------------------------------------------------------------------ #
+    # Bedtime recommendation (v1.3.0)                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _bucket_of(ts: float) -> str:
+        """Return ``"weekend"`` or ``"workday"`` for a bedtime timestamp.
+
+        A bedtime occurring on Friday evening leads into Saturday's
+        sleep, which the user mentally files under "weekend".  We
+        therefore look at the *wake* day, approximated as ``ts + 6h``.
+        """
+        wake = datetime.fromtimestamp(ts + 6 * 3600)
+        return "weekend" if wake.weekday() >= 5 else "workday"
+
+    @staticmethod
+    def _seconds_to_hhmm(seconds: float) -> str:
+        """Format ``seconds since midnight`` as a zero-padded ``HH:MM``."""
+        # Wrap around 24 h so e.g. -30 min → 23:30 (yesterday-late = today-early).
+        s = int(seconds) % 86400
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
+
+    def recommend_bedtime(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        min_per_bucket: int = 3,
+    ) -> Dict[str, Any]:
+        """Suggest tonight's bedtime, separately for workday vs weekend.
+
+        Methodology:
+
+        1. Bucket every session into ``weekend`` or ``workday`` based on
+           the day the user *woke up* (see :meth:`_bucket_of`).
+        2. Within each bucket, compute the decay-weighted median of
+           ``started_at`` translated to seconds-since-midnight.
+        3. Return both buckets plus a ``next_bedtime`` aimed at the
+           bucket *tonight* lands in (i.e. if today is Friday → weekend
+           bedtime).
+
+        Empty buckets return ``None`` rather than guessing — the
+        caller (a Lovelace card) should hide that field instead of
+        showing a misleading "00:00".
+        """
+        if now is None:
+            now = now_local()
+
+        sessions = self._load()
+        now_ts = now.timestamp()
+        per_bucket: Dict[str, List[Tuple[float, float]]] = {
+            "weekend": [], "workday": [],
+        }
+        for s in sessions:
+            if not s.started_at:
+                continue
+            local_started = datetime.fromtimestamp(s.started_at)
+            # Seconds since midnight; if bedtime is past 18:00 we shift by
+            # -86400 so a 23:30 night clusters next to a 00:30 one.
+            sec = (
+                local_started.hour * 3600
+                + local_started.minute * 60
+                + local_started.second
+            )
+            if sec >= 18 * 3600:
+                sec -= 86400
+            bucket = self._bucket_of(s.started_at)
+            w = self._decay_weight(s, now_ts) * (
+                0.1 + max(0.0, min(100.0, s.quality_score)) / 100.0
+            )
+            per_bucket[bucket].append((float(sec), float(w)))
+
+        def _bucket_median(samples: List[Tuple[float, float]]) -> Optional[str]:
+            if len(samples) < min_per_bucket:
+                return None
+            secs = [v for v, _ in samples]
+            wts = [w for _, w in samples]
+            m = self._weighted_median(secs, wts)
+            return None if m is None else self._seconds_to_hhmm(m)
+
+        weekday_bedtime = _bucket_median(per_bucket["workday"])
+        weekend_bedtime = _bucket_median(per_bucket["weekend"])
+        tonight_bucket = self._bucket_of(now_ts)
+        next_bedtime = (
+            weekend_bedtime if tonight_bucket == "weekend" else weekday_bedtime
+        )
+
+        return {
+            "weekday_bedtime": weekday_bedtime,
+            "weekend_bedtime": weekend_bedtime,
+            "next_bedtime": next_bedtime,
+            "tonight_bucket": tonight_bucket,
+            "n_workday": len(per_bucket["workday"]),
+            "n_weekend": len(per_bucket["weekend"]),
+            "confidence": min(
+                1.0, (len(per_bucket["workday"]) + len(per_bucket["weekend"])) / 14.0,
+            ),
+        }
+
+    # ------------------------------------------------------------------ #
+    # k-NN environment recommendation (v1.3.0)                            #
+    # ------------------------------------------------------------------ #
+
+    def _knn_weights(
+        self,
+        sessions: Sequence[SleepSession],
+        *,
+        now_ts: float,
+        target_hour: Optional[float],
+        target_temp_c: Optional[float],
+    ) -> List[float]:
+        """Per-session kernel weight for k-NN.
+
+        Combines the standard decay × quality weight with a Gaussian
+        kernel on bedtime-hour and current ambient temperature.  Any
+        field whose target is ``None`` is silently skipped (so a
+        cold-start with no ambient reading degrades to plain decay).
+        """
+        hour_sigma = max(self.config.knn_hour_sigma, 0.1)
+        temp_sigma = max(self.config.knn_temp_sigma, 0.1)
+        weights: List[float] = []
+        for s in sessions:
+            base = self._decay_weight(s, now_ts) * (
+                0.1 + max(0.0, min(100.0, s.quality_score)) / 100.0
+            )
+            kernel = 1.0
+            if target_hour is not None and s.started_at:
+                d = datetime.fromtimestamp(s.started_at)
+                h = d.hour + d.minute / 60.0
+                # Wrap so 23:30 vs 00:30 = 1 h apart, not 23 h.
+                diff = (h - target_hour) % 24
+                diff = min(diff, 24 - diff)
+                kernel *= math.exp(-(diff * diff) / (2 * hour_sigma * hour_sigma))
+            if target_temp_c is not None and s.env_params.temperature_c is not None:
+                d = s.env_params.temperature_c - target_temp_c
+                kernel *= math.exp(-(d * d) / (2 * temp_sigma * temp_sigma))
+            weights.append(base * kernel)
+        return weights
+
+    def recommend_knn(
+        self,
+        defaults: EnvironmentParams,
+        *,
+        now: Optional[datetime] = None,
+        current_temp_c: Optional[float] = None,
+        k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """k-NN-flavoured recommendation conditioned on tonight's context.
+
+        Picks the ``k`` past sessions most similar to *tonight* — same
+        bedtime hour, same ambient temperature — and returns the
+        weighted-median of their env params.  The neighbour list is
+        echoed back so a Lovelace explainability card can show *which*
+        nights the recommendation is based on.
+
+        Returns a dict so the publisher can write the entire payload
+        verbatim into the attribute panel without a second pass.
+        """
+        if now is None:
+            now = now_local()
+        if k is None:
+            k = self.config.knn_k
+
+        sessions = self._load()
+        if len(sessions) < self.config.min_sessions_for_personalisation:
+            return {
+                "env": defaults,
+                "neighbors": [],
+                "n_used": 0,
+                "confidence": 0.0,
+            }
+
+        target_hour: Optional[float] = now.hour + now.minute / 60.0
+        weights = self._knn_weights(
+            sessions,
+            now_ts=now.timestamp(),
+            target_hour=target_hour,
+            target_temp_c=current_temp_c,
+        )
+        # Pick the top-k by weight.
+        ranked = sorted(
+            zip(sessions, weights), key=lambda p: p[1], reverse=True,
+        )[: max(1, k)]
+        top_sessions = [s for s, _ in ranked]
+        top_weights = [w for _, w in ranked]
+
+        env = EnvironmentParams(
+            temperature_c=self._weighted_median(
+                [s.env_params.temperature_c for s in top_sessions], top_weights,
+            ),
+            humidity_pct=self._weighted_median(
+                [s.env_params.humidity_pct for s in top_sessions], top_weights,
+            ),
+            brightness_pct=self._weighted_median(
+                [s.env_params.brightness_pct for s in top_sessions], top_weights,
+            ),
+            fan_speed_pct=self._weighted_median(
+                [s.env_params.fan_speed_pct for s in top_sessions], top_weights,
+            ),
+        )
+        # Fallback to defaults per field.
+        if env.temperature_c is None:
+            env.temperature_c = defaults.temperature_c
+        if env.humidity_pct is None:
+            env.humidity_pct = defaults.humidity_pct
+        if env.brightness_pct is None:
+            env.brightness_pct = defaults.brightness_pct
+        if env.fan_speed_pct is None:
+            env.fan_speed_pct = defaults.fan_speed_pct
+
+        # Confidence = 0 when no neighbour has any signal, 1 when all
+        # k neighbours contribute close to their full base weight.
+        total_w = sum(top_weights)
+        confidence = min(1.0, total_w / max(1, len(top_sessions)))
+
+        return {
+            "env": env,
+            "neighbors": [
+                {
+                    "session_id": s.session_id,
+                    "weight": round(w, 4),
+                    "quality": round(s.quality_score, 1),
+                    "started_at": s.started_at,
+                }
+                for s, w in zip(top_sessions, top_weights)
+            ],
+            "n_used": len(top_sessions),
+            "confidence": confidence,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Explainability panel (v1.3.0)                                       #
+    # ------------------------------------------------------------------ #
+
+    def explain(
+        self,
+        defaults: EnvironmentParams,
+        *,
+        now: Optional[datetime] = None,
+        current_temp_c: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Return a JSON-serialisable explanation of the current rec.
+
+        Designed to be set as the ``attributes`` of an HA sensor entity
+        (``sensor.sleep_recommendation_explanation``) so the user can
+        open the More-Info card and see exactly why we picked tonight's
+        setpoints.  The payload is intentionally small — Lovelace
+        truncates attribute lists past ~16 KB.
+        """
+        if now is None:
+            now = now_local()
+        now_ts = now.timestamp()
+        sessions = self._load()
+        n_total = len(sessions)
+
+        if n_total < self.config.min_sessions_for_personalisation:
+            return {
+                "ready": False,
+                "reason": (
+                    f"need {self.config.min_sessions_for_personalisation} "
+                    f"sessions, have {n_total}"
+                ),
+                "n_total": n_total,
+                "recommendation": defaults.to_dict(),
+            }
+
+        knn = self.recommend_knn(
+            defaults, now=now, current_temp_c=current_temp_c,
+        )
+        bedtime = self.recommend_bedtime(now=now)
+        weights = self._session_weights(sessions, now_ts)
+        avg_age_d = (
+            sum(now_ts - s.recorded_at for s in sessions) / n_total / 86400.0
+        )
+
+        return {
+            "ready": True,
+            "method": "knn+decay",
+            "n_total": n_total,
+            "avg_age_days": round(avg_age_d, 1),
+            "decay_half_life_days": self.config.decay_half_life_days,
+            "effective_sample_size": round(sum(weights), 2),
+            "recommendation": knn["env"].to_dict(),
+            "neighbors": knn["neighbors"],
+            "bedtime": bedtime,
+            "confidence": knn["confidence"],
+        }
 
 
 __all__ = [

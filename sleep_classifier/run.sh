@@ -26,10 +26,11 @@ DEADBAND_H=$(opt '.deadband_humidity_pct // 5')
 DEADBAND_B=$(opt '.deadband_brightness_pct // 10')
 LOG_LEVEL=$(opt '.log_level // "info"')
 
-# Slot bindings — sensors (single entity_id each, empty means auto-discover)
-HR_SOURCE=$(opt '.heart_rate_source // ""')
-MV_SOURCE=$(opt '.movement_source // ""')
-BR_SOURCE=$(opt '.breathing_source // ""')
+# Slot bindings — sensors
+# v1.3.0: ``sleep_stage_source`` is the single mandatory binding.  The
+# old HR / movement / breathing slots are gone — stage now comes from an
+# external tracker (Mi Band, Apple Watch, R60ABD1, ...) via HA.
+STAGE_SOURCE=$(opt '.sleep_stage_source // ""')
 TEMP_SOURCE=$(opt '.temperature_source // ""')
 HUM_SOURCE=$(opt '.humidity_source // ""')
 LUX_SOURCE=$(opt '.illuminance_source // ""')
@@ -42,9 +43,6 @@ FAN_TARGET=$(opt '.fan_target // ""')
 SWITCH_TARGETS=$(opt_array_to_csv '.switch_targets // []')
 
 # Auto-discovery tunables
-HR_KEYWORDS=$(opt_array_to_csv '.heart_rate_keywords // []')
-MV_KEYWORDS=$(opt_array_to_csv '.movement_keywords // []')
-BR_KEYWORDS=$(opt_array_to_csv '.breathing_keywords // []')
 DOMAINS=$(opt_array_to_csv '.controllable_domains // []')
 INCLUDES=$(opt_array_to_csv '.explicit_includes // []')
 EXCLUDES=$(opt_array_to_csv '.explicit_excludes // []')
@@ -111,19 +109,19 @@ def one(value):
     v = _norm(value)
     return [v] if v else []
 
-hr = csv_to_list("""$HR_KEYWORDS""")
-mv = csv_to_list("""$MV_KEYWORDS""")
-br = csv_to_list("""$BR_KEYWORDS""")
 domains = csv_to_list("""$DOMAINS""")
 inc = csv_to_list("""$INCLUDES""")
 exc = csv_to_list("""$EXCLUDES""")
 
-if hr: api["heart_rate_keywords"] = hr
-if mv: api["movement_keywords"] = mv
-if br: api["breathing_keywords"] = br
 if domains: api["controllable_domains"] = domains
 if inc: api["explicit_includes"] = inc
 if exc: api["explicit_excludes"] = exc
+
+# v1.3.0: stash the sleep-stage entity at the top level of ``api``;
+# SmartSleepService reads it from ``home_assistant.api.sleep_stage_source``.
+_stage = _norm("""$STAGE_SOURCE""")
+if _stage:
+    api["sleep_stage_source"] = _stage
 
 # ----- Slot bindings -----------------------------------------------------
 # Each slot maps to a list of entity_ids; empty list ⇒ keyword scan owns it.
@@ -146,9 +144,6 @@ def _slot_multi(override_key, form_value_csv):
     return csv_to_list(form_value_csv)
 
 slot_bindings = {
-    "heart_rate":     _slot_single("heart_rate_source", """$HR_SOURCE"""),
-    "movement":       _slot_single("movement_source", """$MV_SOURCE"""),
-    "breathing":      _slot_single("breathing_source", """$BR_SOURCE"""),
     "temperature":    _slot_single("temperature_source", """$TEMP_SOURCE"""),
     "humidity":       _slot_single("humidity_source", """$HUM_SOURCE"""),
     "illuminance":    _slot_single("illuminance_source", """$LUX_SOURCE"""),
