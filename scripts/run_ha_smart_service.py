@@ -478,7 +478,12 @@ class SmartSleepService:
                             f"{first.entity_id}"
                         )
                         await self.publisher.publish_last_action(
-                            summary, executed=not self.ctrl_cfg.dry_run,
+                            summary,
+                            executed=not self.ctrl_cfg.dry_run,
+                            # v1.6.2: let the user see *why* some
+                            # devices aren't being controlled even
+                            # though they're bound in Configuration.
+                            skipped_by_capability=controller.capability_stats(),
                         )
 
                 # --- Smart-wake tick -------------------------------- #

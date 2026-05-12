@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.data_structures import SleepStage
+from src.device_capabilities import Capability, capabilities_of, is_available
 from src.device_discovery import ActionableDevices
 from src.ha_api_client import HomeAssistantClient
 from src.preference_learner import (
@@ -190,6 +191,24 @@ def _clamp(value: Optional[float], lo: float, hi: float) -> Optional[float]:
     return max(lo, min(hi, float(value)))
 
 
+def _fan_percent_to_preset(pct: float) -> str:
+    """Quantise a 0-100 % fan target to HA's default preset-mode vocabulary.
+
+    HA fans that expose ``preset_modes`` instead of continuous speed
+    control (common pattern for Sonoff iFan04 / cheap BLE fans) almost
+    always advertise ``low / medium / high`` — that's the tuple the
+    HA fan helper uses as the default.  Cut-offs below are
+    deliberately asymmetric: we prefer ``low`` in the soft middle so
+    an over-cautious learner doesn't blast the user with ``high``.
+    """
+    p = max(0.0, min(100.0, float(pct)))
+    if p < 33.0:
+        return "low"
+    if p < 66.0:
+        return "medium"
+    return "high"
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -325,6 +344,37 @@ class SmartEnvironmentController:
         # plan_actions() calls (every ~30 s in production).
         self._learned_deltas_cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._learned_deltas_cached_at: float = 0.0
+
+        # v1.6.1 — capability gating.  HA happily accepts
+        # ``climate.set_temperature`` against a climate entity whose
+        # ``supported_features`` bitmask does *not* include
+        # ``TARGET_TEMPERATURE``: the service exists on the domain, so
+        # the REST call returns 200, but the device never moves.  Users
+        # then see "Executed climate.set_temperature" in the last_action
+        # sensor and wrongly conclude the loop is working.  To close
+        # this hole we pre-compute each bound entity's capability set
+        # once at construction and gate every action branch on it.  The
+        # inspection is pure / cheap (see :func:`capabilities_of`), so
+        # caching here just makes the ``plan_actions`` path branch-free.
+        self._caps_by_id: Dict[str, set[Capability]] = {}
+        for bucket in (
+            self.devices.lights, self.devices.climates, self.devices.fans,
+            self.devices.humidifiers, self.devices.switches,
+            self.devices.media_players,
+        ):
+            for ent in bucket:
+                self._caps_by_id[ent.entity_id] = capabilities_of(ent)
+        # Remember which (entity_id, capability) pairs we've already
+        # logged a warning for, so a 30 s inference loop doesn't flood
+        # the log with the same "climate.xyz does not support
+        # SET_TEMPERATURE" message every tick.
+        self._missing_cap_warned: set[tuple[str, Capability]] = set()
+        # Counter of actions that were *skipped* because the device
+        # lacked the required capability.  Surfaced in
+        # :meth:`capability_stats` so a diagnostic sensor can show the
+        # user "we wanted to adjust your AC but it doesn't support
+        # temperature control".
+        self._skipped_by_cap: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Target selection                                                   #
@@ -582,6 +632,10 @@ class SmartEnvironmentController:
             )
             if outside_dead and self._allow_action("climate", now):
                 for c in self.devices.climates:
+                    if not self._device_supports(c, Capability.SET_TEMPERATURE):
+                        # This climate entity is on/off-only or preset-only;
+                        # skipping is strictly better than faking success.
+                        continue
                     actions.append(
                         ControlAction(
                             domain="climate",
@@ -604,6 +658,8 @@ class SmartEnvironmentController:
             )
             if outside_dead and self._allow_action("humidifier", now):
                 for h in self.devices.humidifiers:
+                    if not self._device_supports(h, Capability.SET_HUMIDITY):
+                        continue
                     actions.append(
                         ControlAction(
                             domain="humidifier",
@@ -629,6 +685,8 @@ class SmartEnvironmentController:
             if outside_dead and self._allow_action("light", now):
                 for light in self.devices.lights:
                     if light_target.brightness_pct <= 0.5:
+                        # turn_off is universal — every HA light entity
+                        # answers it — so no capability gate needed.
                         actions.append(
                             ControlAction(
                                 domain="light",
@@ -639,12 +697,22 @@ class SmartEnvironmentController:
                             )
                         )
                     else:
-                        # Use warm kelvin for sleep stages so the user isn't
-                        # blasted with daylight white.
-                        data: Dict[str, Any] = {
-                            "brightness_pct": int(round(light_target.brightness_pct)),
-                        }
-                        if stage in {SleepStage.LIGHT, SleepStage.DEEP, SleepStage.REM}:
+                        # brightness_pct needs SET_BRIGHTNESS.  If the
+                        # bulb is on/off-only (Capability.SET_BRIGHTNESS
+                        # absent) we degrade to a plain turn_on so the
+                        # user at least gets light-on/light-off
+                        # behaviour rather than nothing.
+                        data: Dict[str, Any] = {}
+                        if self._device_supports(light, Capability.SET_BRIGHTNESS):
+                            data["brightness_pct"] = int(round(light_target.brightness_pct))
+                        # Warm kelvin is a nice-to-have during sleep
+                        # stages; silently drop if the bulb can't do
+                        # color temp (common for cheap bulbs).
+                        if (
+                            stage in {SleepStage.LIGHT, SleepStage.DEEP, SleepStage.REM}
+                            and light.entity_id in self._caps_by_id
+                            and Capability.SET_COLOR_TEMP in self._caps_by_id[light.entity_id]
+                        ):
                             data["kelvin"] = 2200
                         actions.append(
                             ControlAction(
@@ -661,6 +729,7 @@ class SmartEnvironmentController:
             if self._allow_action("fan", now):
                 for f in self.devices.fans:
                     if fan_target.fan_speed_pct <= 1.0:
+                        # turn_off is universal — skip the capability gate.
                         actions.append(
                             ControlAction(
                                 domain="fan",
@@ -670,7 +739,7 @@ class SmartEnvironmentController:
                                 reason=f"stage={stage.name} → fan off",
                             )
                         )
-                    else:
+                    elif self._device_supports(f, Capability.SET_SPEED_PCT):
                         actions.append(
                             ControlAction(
                                 domain="fan",
@@ -680,6 +749,33 @@ class SmartEnvironmentController:
                                 reason=f"stage={stage.name} target={fan_target.fan_speed_pct}%",
                             )
                         )
+                    elif (
+                        f.entity_id in self._caps_by_id
+                        and Capability.SET_PRESET_MODE
+                        in self._caps_by_id[f.entity_id]
+                    ):
+                        # Preset-mode-only fan (e.g. Sonoff iFan04).
+                        # Quantise the target % into low/medium/high
+                        # buckets — the three values every preset fan
+                        # in the wild supports per HA's defaults.
+                        preset = _fan_percent_to_preset(fan_target.fan_speed_pct)
+                        actions.append(
+                            ControlAction(
+                                domain="fan",
+                                service="set_preset_mode",
+                                entity_id=f.entity_id,
+                                data={"preset_mode": preset},
+                                reason=(
+                                    f"stage={stage.name} "
+                                    f"target={fan_target.fan_speed_pct}% "
+                                    f"preset={preset} (fan is preset-only)"
+                                ),
+                            )
+                        )
+                    # else: fan is turn_on/off only → we already handle
+                    # the 0% branch above; the 1%+ path silently drops
+                    # (and ``_device_supports`` already logged the
+                    # SET_SPEED_PCT miss exactly once).
 
         return actions
 
@@ -687,6 +783,48 @@ class SmartEnvironmentController:
         """Return True if we have waited long enough since the last action."""
         last = self._last_action_ts.get(domain, 0.0)
         return now - last >= self.config.min_seconds_between_actions
+
+    def _device_supports(
+        self, entity: Any, capability: Capability,
+    ) -> bool:
+        """Return ``True`` iff this entity's cached capability set includes it.
+
+        On the first miss for a given ``(entity_id, capability)`` pair
+        we emit a single ``WARNING`` and bump a counter.  Subsequent
+        misses are silent — a 30 s inference loop must not flood the
+        log with the same message every tick.  Counters are available
+        via :meth:`capability_stats` for the diagnostic ``last_action``
+        sensor.
+        """
+        caps = self._caps_by_id.get(entity.entity_id, set())
+        if capability in caps:
+            return True
+        key = (entity.entity_id, capability)
+        if key not in self._missing_cap_warned:
+            self._missing_cap_warned.add(key)
+            logger.warning(
+                "Skipping action: %s does not advertise %s in "
+                "supported_features (HA would accept the call and "
+                "silently no-op). Either bind a capable entity in "
+                "Configuration or remove this one.",
+                entity.entity_id, capability.value,
+            )
+        self._skipped_by_cap[capability.value] = (
+            self._skipped_by_cap.get(capability.value, 0) + 1
+        )
+        return False
+
+    def capability_stats(self) -> Dict[str, int]:
+        """Expose skipped-action counts keyed by capability name.
+
+        Used by the orchestrator to drop a breadcrumb into the
+        ``sensor.sleep_classifier_last_action`` attribute panel so
+        the user can see *why* the loop looks quiet — e.g. their
+        fan is a preset-mode-only Sonoff iFan04 and therefore can't
+        accept ``set_percentage``.  Pure read of internal state;
+        safe to call from any tick.
+        """
+        return dict(self._skipped_by_cap)
 
     # ------------------------------------------------------------------ #
     # Execution                                                          #

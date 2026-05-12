@@ -12,6 +12,68 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.6.2] — 2026-05-12
+
+### Added
+
+- **Capability gating** — `SmartEnvironmentController` now consults
+  `src/device_capabilities.capabilities_of()` for each bound entity at
+  construction, and refuses to plan actions (`climate.set_temperature`,
+  `light.turn_on(brightness_pct=...)`, `fan.set_percentage`,
+  `humidifier.set_humidity`) against entities that don't advertise the
+  matching `supported_features` bit.  Closes the single biggest
+  "looks-correct-but-doesn't-actually-work" hazard where HA would
+  return 200 OK for the service call but the device no-oped because
+  the integration didn't implement the feature.
+- **Preset-fan fallback** — fans that only expose `preset_modes`
+  (Sonoff iFan04 pattern) now receive `fan.set_preset_mode` with a
+  quantised `low/medium/high` value instead of being silently
+  dropped.
+- **On/off-only light degradation** — bulbs without a dimmer no
+  longer have `brightness_pct` sent to them (which HA would accept
+  but silently drop); the controller degrades to a plain
+  `light.turn_on` so the user at least gets on/off behaviour.
+- **`capability_stats()`** on the controller + `skipped_by_capability`
+  attribute on `sensor.sleep_classifier_last_action`, so users can see
+  on their Lovelace dashboard that e.g. their AC was skipped 12 times
+  today for `set_temperature` — a strong hint the bound entity is the
+  wrong one.
+
+### Fixed
+
+- **Orchestrator crash** — `scripts/run_ha_smart_service.py` was
+  calling `.get()` on the `ControlAction` dataclass instances returned
+  by `SmartEnvironmentController.apply()`, which raised
+  `AttributeError` on every real device action.  Replaced with
+  attribute access.  Regression test pins the formatted `last_action`
+  string.
+- **Silently-dropped config** — `sleep_classifier/run.sh` now pipes
+  `wind_down_minutes` and `min_stage_dwell_seconds` from
+  `/data/options.json` into `effective_config.json`.  Pre-fix, user
+  edits to these v1.4 knobs in the Configuration form had no effect.
+- **CI cache key** — `.github/workflows/test.yml` stops referencing
+  the deleted `requirements-train.txt` and the zero-use `hypothesis`
+  dev dependency.
+
+### Changed
+
+- **Runtime image** — `requirements-runtime.txt` drops `numpy`
+  (`grep -R "numpy" src/ scripts/` confirmed zero usages).  Add-on
+  image drops ~5 MB to ~15 MB.
+- **Dead-code removal** — `src/data_structures.py` shrinks from 150
+  to 47 lines, keeping only the `SleepStage` enum.  Eleven unused
+  dataclasses removed (HeartRateData, MovementData, ModelWeights, …).
+  `training_config/config_loader.py` + `config.json` drop the
+  `model` / `mqtt` / `training` / `disaster_monitoring` sections;
+  validation rewritten around the four rules that actually affect
+  startup (deadband bounds, quality_quantile bounds,
+  min_sessions ≥ 1).
+- **Documentation alignment** — README / INSTALL / DOCS stop
+  claiming numpy is a runtime dep; `repository.yaml` renamed from
+  `CNN-BiLSTM Sleep Model Add-ons` to `Sleep Classifier Add-ons`;
+  `setup_env.sh` / `.bat` banners updated; `setup.py` /
+  `pyproject.toml` name → `sleep-classifier`, version → `1.6.2`.
+
 ## [1.6.0] — 2026-05-12
 
 ### Added
@@ -148,7 +210,8 @@ Tracked items live in `docs/BACKLOG.md`.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.2...HEAD
+[1.6.2]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.0...v1.6.2
 [1.6.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.3.1...v1.4.0

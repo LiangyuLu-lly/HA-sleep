@@ -517,16 +517,40 @@ class SleepStatePublisher:
         await self._safe_update(ENTITY_PER_STAGE_DELTAS, state, attrs)
 
     async def publish_last_action(
-        self, summary: str, *, executed: bool,
+        self,
+        summary: str,
+        *,
+        executed: bool,
+        skipped_by_capability: Optional[Dict[str, int]] = None,
     ) -> None:
         """Surface the most recent device action (or 'planned only' in dry-run).
 
         ``summary`` is something short like ``"light.bedroom_main → off"`` so
         Lovelace can show it on a chip.  The full payload is stored as an
         attribute for users who want to dig in.
+
+        ``skipped_by_capability`` (v1.6.2) is a mapping from
+        :class:`src.device_capabilities.Capability` value strings to the
+        count of actions the controller declined to issue because the
+        bound entity didn't advertise that feature.  Exposing it on
+        the diagnostics sensor lets the user see, on their Lovelace
+        dashboard, that e.g. their AC was skipped 12 times today for
+        ``set_temperature`` support — a strong hint that the
+        entity_id in Configuration is pointing at a preset-only
+        device and should be rebound.
         """
         attrs = dict(_STATIC_ATTRS_LAST_ACTION)
         attrs["executed"] = bool(executed)
+        if skipped_by_capability:
+            # Cast to plain dict + sort by count desc so the Lovelace
+            # attributes panel shows the most-skipped capability first.
+            ordered = dict(
+                sorted(
+                    skipped_by_capability.items(),
+                    key=lambda kv: kv[1], reverse=True,
+                )
+            )
+            attrs["skipped_by_capability"] = ordered
         truncated = (summary or "—")[:255]
         await self._safe_update(ENTITY_LAST_ACTION, truncated, attrs)
 

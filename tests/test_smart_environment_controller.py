@@ -29,19 +29,35 @@ from src.smart_environment_controller import (
 
 
 def _light(eid: str) -> HAEntity:
-    return HAEntity(entity_id=eid, state="off", attributes={})
+    # ``supported_color_modes=["brightness"]`` gives the entity the
+    # SET_BRIGHTNESS capability that v1.6.2 gating requires; the
+    # alternative ``["onoff"]`` would simulate a dimmer-less bulb.
+    return HAEntity(
+        entity_id=eid, state="off",
+        attributes={"supported_color_modes": ["brightness"]},
+    )
 
 
 def _climate(eid: str) -> HAEntity:
-    return HAEntity(entity_id=eid, state="cool", attributes={})
+    # SUPPORT_TARGET_TEMPERATURE bit = 1 (ClimateEntityFeature.TARGET_TEMPERATURE).
+    return HAEntity(
+        entity_id=eid, state="cool",
+        attributes={"supported_features": 1},
+    )
 
 
 def _humidifier(eid: str) -> HAEntity:
+    # ``humidifier.*`` unconditionally advertises SET_HUMIDITY in
+    # capabilities_of(), so no supported_features bit needed here.
     return HAEntity(entity_id=eid, state="on", attributes={})
 
 
 def _fan(eid: str) -> HAEntity:
-    return HAEntity(entity_id=eid, state="off", attributes={})
+    # FanEntityFeature.SET_SPEED bit = 1.
+    return HAEntity(
+        entity_id=eid, state="off",
+        attributes={"supported_features": 1},
+    )
 
 
 @pytest.fixture
@@ -604,3 +620,124 @@ class TestPerStageLearnedDeltas:
             ctl.target_for(SleepStage.DEEP)
             ctl.target_for(SleepStage.REM)
         assert _CountingLearner.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Capability gating (v1.6.2)
+# ---------------------------------------------------------------------------
+
+
+class TestCapabilityGating:
+    """v1.6.2 — the controller refuses to plan actions against entities
+    that don't advertise the required capability, instead of firing a
+    service the device will 200-OK but silently no-op on.
+    """
+
+    def test_climate_without_set_temperature_is_skipped(
+        self, ha_client,
+    ) -> None:
+        # Build a "dumb" climate entity — hvac-mode-only, no
+        # TARGET_TEMPERATURE bit (real-world example: many Mihome AC
+        # integrations before their v2 firmware).
+        dumb_ac = HAEntity(
+            entity_id="climate.dumb_ac", state="cool",
+            attributes={"supported_features": 0},
+        )
+        devs = ActionableDevices(climates=[dumb_ac])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.DEEP,
+            EnvironmentParams(temperature_c=25.0, humidity_pct=55.0),
+        )
+        assert [a for a in actions if a.domain == "climate"] == []
+        # Bookkeeping: gate recorded exactly one skip.
+        assert ctl.capability_stats().get("set_temperature") == 1
+
+    def test_onoff_only_light_degrades_to_plain_turn_on(
+        self, ha_client,
+    ) -> None:
+        # Cheap smart plug re-exposed as a light entity — can toggle
+        # but has no dimmer.  The controller should still keep the
+        # user in light (turn_on) at AWAKE, just without brightness.
+        onoff_light = HAEntity(
+            entity_id="light.onoff_bulb", state="off",
+            attributes={"supported_color_modes": ["onoff"]},
+        )
+        devs = ActionableDevices(lights=[onoff_light])
+        cfg = SmartControlConfig(
+            min_seconds_between_actions=0.0,
+            deadband_brightness_pct=0.0,
+        )
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.AWAKE,
+            EnvironmentParams(brightness_pct=0.0),
+        )
+        light_actions = [a for a in actions if a.domain == "light"]
+        assert len(light_actions) == 1
+        # turn_on still fires (the degraded path), but without the
+        # ``brightness_pct`` parameter the bulb can't honour.
+        assert light_actions[0].service == "turn_on"
+        assert "brightness_pct" not in light_actions[0].data
+        # Capability bookkeeping shows the miss.
+        assert ctl.capability_stats().get("set_brightness") == 1
+
+    def test_preset_only_fan_uses_preset_mode(self, ha_client) -> None:
+        # Sonoff iFan04-style preset-only fan: no SET_SPEED (bit 1),
+        # but PRESET_MODE (bit 8).
+        preset_fan = HAEntity(
+            entity_id="fan.ifan04", state="off",
+            attributes={"supported_features": 8},
+        )
+        devs = ActionableDevices(fans=[preset_fan])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        # AWAKE default fan_speed_pct = 20 % -> "low" bucket.
+        actions = ctl.plan_actions(
+            SleepStage.AWAKE, EnvironmentParams(),
+        )
+        fan_actions = [a for a in actions if a.domain == "fan"]
+        assert len(fan_actions) == 1
+        assert fan_actions[0].service == "set_preset_mode"
+        assert fan_actions[0].data["preset_mode"] == "low"
+
+    def test_warning_only_logged_once_per_missing_capability(
+        self, ha_client, caplog,
+    ) -> None:
+        dumb_ac = HAEntity(
+            entity_id="climate.dumb_ac", state="cool",
+            attributes={"supported_features": 0},
+        )
+        devs = ActionableDevices(climates=[dumb_ac])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        with caplog.at_level("WARNING"):
+            ctl.plan_actions(
+                SleepStage.DEEP,
+                EnvironmentParams(temperature_c=25.0),
+            )
+            ctl.plan_actions(
+                SleepStage.DEEP,
+                EnvironmentParams(temperature_c=25.0),
+            )
+            ctl.plan_actions(
+                SleepStage.DEEP,
+                EnvironmentParams(temperature_c=25.0),
+            )
+        warns = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and "set_temperature" in r.message
+        ]
+        assert len(warns) == 1
+        # But the skip counter kept growing, so capability_stats is
+        # still useful for diagnostics.
+        assert ctl.capability_stats().get("set_temperature") == 3
