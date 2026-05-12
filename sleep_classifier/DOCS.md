@@ -1,4 +1,4 @@
-# Sleep Classifier — Home Assistant Add-on (v1.5.0)
+# Sleep Classifier — Home Assistant Add-on (v1.6.0)
 
 **What it actually does**: learn which bedroom environment is most
 restful *for you*, then adapt it continuously across the night, the

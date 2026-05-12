@@ -150,6 +150,7 @@ v1.4.0 addresses all three:
 
 | Version | Headline |
 |---|---|
+| **v1.6.0** | Engineering polish + apnea PoC. `CHANGELOG.md` + `examples/lovelace_dashboard.yaml` for HACS-friendliness; `LearningPanelPublisher` extracted out of the 1215-line orchestrator; HA WebSocket integration tests with an in-process aiohttp fake server (covers reconnect path); 60 s bedtime cache eliminates ~120 K redundant computes/night; pure-functional apnea/hypopnea detector in `src/apnea_detector.py` (algorithm only, consent-gated wiring is v1.7 work); `docs/HACS_MIGRATION.md` for the v2.0 plan. **+45 tests, 419 total, 92 % coverage.** |
 | **v1.5.0** | Per-stage env *deltas* are now learned too — not just the midpoint. New `env_by_stage` field per session, decay-weighted weighted-median delta per field, ESS guard against noisy starts, per-field merge with clinical fallback, new `sensor.sleep_classifier_per_stage_deltas` exposing the controller's `clinical → learning → personalised` graduation. |
 | **v1.4.0** | Real-world robustness pass: per-actuator anticipation lets the AC lead the user by ~15 min; wind-down pre-cool starts dimming + cooling before the learned bedtime; stage debouncing filters 30-second wearable blips. |
 | **v1.3.1** | Per-stage adaptation preserved when learning kicks in: AWAKE / LIGHT / DEEP / REM each apply a clinical delta on top of the learned baseline. Safe-range clamps prevent runaway setpoints. |

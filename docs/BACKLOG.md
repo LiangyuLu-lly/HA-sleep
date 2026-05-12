@@ -135,17 +135,12 @@ Coverage report kept in CI thinking; not auto-published yet because
 the `pytest-cov` step adds ~0.7 s to the suite.  Add it once the
 suite breaks 1 s budget.
 
-## Sleep apnea detector — design sketch
+## Sleep apnea detector — algorithm shipped, wiring deferred
 
-**Goal:** turn the radar's existing breathing-rate + chest-wall-motion
-streams into a per-night apnea-hypopnea index (AHI) proxy, surfaced
-as a new HA sensor `sensor.sleep_classifier_apnea_index`.
-
-**Status:** designed, **not implemented**.  This is the highest-
-medical-value future feature on the roadmap; treating it as a stretch
-goal both for correctness reasons (we don't want to publish a number
-people will mistake for a clinical AHI) and for product reasons (it
-needs a separate consent screen).
+**Status:** v1.6.0 shipped the **pure algorithm** in
+``src/apnea_detector.py`` with 20 tests + 94 % coverage.  The
+remaining work is the *orchestrator wiring* + consent flow, which
+is gated on an explicit user opt-in for medical-disclaimer reasons.
 
 ### Why slot it in as a separate module
 
@@ -209,10 +204,7 @@ the orchestrator only listens.
 * **Open the dataset.**  Release a redacted subset of preference
   histories (with explicit consent) so the community can compare
   recovery-plan algorithms.
-* **HACS distribution.**  Currently the add-on is installed via the
-  HA Add-on Store ("Add Repository" → URL).  HACS would let users
-  install the *integration* (sensor entities + Lovelace card) without
-  the add-on container.  Today the value-add is small because the
-  core logic is in the add-on, but a future refactor that splits
-  out a thin HA custom-component for the sensors only would be a
-  natural HACS package.
+* **HACS distribution.**  Detailed 4-stage migration plan in
+  `docs/HACS_MIGRATION.md` covering the Lovelace plugin extraction,
+  integration scaffold, logic migration, and add-on retirement.
+  Decision criteria for kicking off v2.0 are documented there.
