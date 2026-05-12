@@ -430,3 +430,177 @@ class TestWindDown:
         # Garbage shouldn't crash — fail closed.
         bedtime = {"next_bedtime": "not-a-time"}
         assert is_in_wind_down(self._at(22, 45), bedtime, 30) is False
+
+
+# ---------------------------------------------------------------------------
+# Per-stage learned deltas (v1.5.0)
+# ---------------------------------------------------------------------------
+
+
+class _StubLearner:
+    """Minimal learner double exposing only what the controller calls.
+
+    Real ``PreferenceLearner`` is heavy (file IO, decay maths); we only
+    need to verify the controller's *contract* — that it prefers the
+    learner's per-stage delta when one is supplied and falls back to
+    the clinical default otherwise.
+    """
+
+    def __init__(
+        self,
+        per_stage: dict,
+        baseline_temp: float = 21.0,
+    ) -> None:
+        self._per_stage = per_stage
+        self._baseline_temp = baseline_temp
+
+    def recommend(self, defaults, *, explore=False):
+        return EnvironmentParams(
+            temperature_c=self._baseline_temp,
+            humidity_pct=defaults.humidity_pct,
+            brightness_pct=defaults.brightness_pct,
+            fan_speed_pct=defaults.fan_speed_pct,
+        )
+
+    def recommend_per_stage_deltas(self, now=None):
+        return self._per_stage
+
+
+class TestPerStageLearnedDeltas:
+    def test_no_learner_falls_back_to_clinical(self, devices, ha_client):
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices, learner=None,
+        )
+        # With no learner: DEEP target = LIGHT-default 21 + clinical -2 = 19.
+        assert ctl.target_for(SleepStage.DEEP).temperature_c == pytest.approx(19.0)
+
+    def test_learned_delta_overrides_clinical(self, devices, ha_client):
+        """Heavy-duvet user: learned DEEP delta = 0 °C beats clinical -2."""
+        per_stage = {
+            "AWAKE": {
+                "temperature_c": 2.0, "humidity_pct": None,
+                "brightness_pct": None, "fan_speed_pct": None,
+                "ess": 8.0, "n_sessions": 8,
+            },
+            "LIGHT": {
+                "temperature_c": 0.0, "humidity_pct": 0.0,
+                "brightness_pct": 0.0, "fan_speed_pct": 0.0,
+                "ess": 10.0, "n_sessions": 10,
+            },
+            "DEEP": {
+                "temperature_c": 0.0,  # learned: no delta vs LIGHT
+                "humidity_pct": None,
+                "brightness_pct": None, "fan_speed_pct": None,
+                "ess": 6.0, "n_sessions": 6,
+            },
+            "REM": {
+                "temperature_c": -0.5,
+                "humidity_pct": None,
+                "brightness_pct": None, "fan_speed_pct": None,
+                "ess": 5.0, "n_sessions": 5,
+            },
+        }
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices,
+            learner=_StubLearner(per_stage),
+        )
+        # DEEP target = 21 (learned baseline) + 0 (learned delta) = 21.
+        # If the override hadn't applied, it would be 21 + (-2) = 19.
+        assert ctl.target_for(SleepStage.DEEP).temperature_c == pytest.approx(21.0)
+
+    def test_partial_learned_field_falls_back_per_field(
+        self, devices, ha_client,
+    ):
+        """Temp learned, brightness/humidity unknown → mixed sources OK."""
+        per_stage = {
+            "AWAKE": {
+                "temperature_c": None,  # learned but None → fall back
+                "humidity_pct": None, "brightness_pct": None,
+                "fan_speed_pct": None, "ess": 6.0, "n_sessions": 6,
+            },
+            "LIGHT": {
+                "temperature_c": 0.0, "humidity_pct": 0.0,
+                "brightness_pct": 0.0, "fan_speed_pct": 0.0,
+                "ess": 10.0, "n_sessions": 10,
+            },
+            "DEEP": {
+                "temperature_c": -1.0,    # learned
+                "humidity_pct": None,     # not learned → clinical fallback
+                "brightness_pct": None,
+                "fan_speed_pct": None,
+                "ess": 6.0, "n_sessions": 6,
+            },
+            "REM": {
+                "temperature_c": None, "humidity_pct": None,
+                "brightness_pct": None, "fan_speed_pct": None,
+                "ess": 0.0, "n_sessions": 0,
+            },
+        }
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices,
+            learner=_StubLearner(per_stage),
+        )
+        deep = ctl.target_for(SleepStage.DEEP)
+        # Temp: 21 + (-1) = 20 (learned overrode the -2 clinical).
+        assert deep.temperature_c == pytest.approx(20.0)
+        # Humidity: clinical DEEP-delta is 0 % → baseline humidity (55,
+        # the LIGHT-stage default) flows through unchanged.  This still
+        # validates the per-field merge — the learner returned ``None``
+        # for humidity so we took the ``getattr(clinical, "humidity_pct")``
+        # = 0 branch (rather than letting a None delta poison the math).
+        assert deep.humidity_pct == pytest.approx(55.0)
+
+    def test_learner_crash_does_not_break_planning(
+        self, devices, ha_client,
+    ):
+        """A broken learner must NOT poison the control loop."""
+
+        class _BrokenLearner(_StubLearner):
+            def recommend_per_stage_deltas(self, now=None):
+                raise RuntimeError("disk corruption")
+
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices,
+            learner=_BrokenLearner({}),
+        )
+        # Falls back to clinical: DEEP = 21 + (-2) = 19.
+        assert ctl.target_for(SleepStage.DEEP).temperature_c == pytest.approx(19.0)
+
+    def test_cache_amortises_learner_calls(self, devices, ha_client):
+        """Within the TTL we should only call the learner once."""
+        per_stage = {
+            "AWAKE": {"temperature_c": 1.5, "humidity_pct": None,
+                      "brightness_pct": None, "fan_speed_pct": None,
+                      "ess": 5.0, "n_sessions": 5},
+            "LIGHT": {"temperature_c": 0.0, "humidity_pct": 0.0,
+                      "brightness_pct": 0.0, "fan_speed_pct": 0.0,
+                      "ess": 10.0, "n_sessions": 10},
+            "DEEP": {"temperature_c": -1.0, "humidity_pct": None,
+                     "brightness_pct": None, "fan_speed_pct": None,
+                     "ess": 5.0, "n_sessions": 5},
+            "REM": {"temperature_c": -0.5, "humidity_pct": None,
+                    "brightness_pct": None, "fan_speed_pct": None,
+                    "ess": 5.0, "n_sessions": 5},
+        }
+
+        class _CountingLearner(_StubLearner):
+            calls = 0
+
+            def recommend_per_stage_deltas(self, now=None):
+                _CountingLearner.calls += 1
+                return self._per_stage
+
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices,
+            learner=_CountingLearner(per_stage),
+        )
+        # Many calls in quick succession — should only hit the learner once.
+        for _ in range(10):
+            ctl.target_for(SleepStage.DEEP)
+            ctl.target_for(SleepStage.REM)
+        assert _CountingLearner.calls == 1

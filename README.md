@@ -77,6 +77,42 @@ neighbour list, weights, effective sample size, decay half-life, and
 confidence as attributes that Lovelace renders in the More-Info
 dialog.
 
+## Per-stage learned deltas (v1.5.0)
+
+Until v1.4 the controller applied **clinical** AWAKE/LIGHT/DEEP/REM
+offsets on top of the learner's per-user midpoint:
+*"DEEP must be 2 °C cooler than LIGHT"* etc.  These deltas come from
+the population literature and are right for most people most of the
+time — but **wrong** for the heavy-duvet user who actually sleeps
+best at a flat 19 °C across the whole night, or the silk-sheet user
+whose REM tolerates +0.5 °C.
+
+v1.5.0 makes those offsets *learned* too:
+
+- The orchestrator snapshots the room env at every stage *entry*
+  (e.g. the 19.4 °C reading the moment DEEP started) and saves the
+  trace per session in a new `env_by_stage` field.
+- `PreferenceLearner.recommend_per_stage_deltas()` computes the
+  weighted-median DEEP-minus-LIGHT (and AWAKE/REM) delta across all
+  sessions, with the same exponential decay used by k-NN so old
+  preferences fade.
+- An **effective sample size guard** (Kish's ESS ≥ 4) holds the
+  learned delta back until there's enough evidence — so a noisy
+  first week doesn't push the bedroom into uncomfortable territory.
+- The merge is **per-field**, so a user with 30 nights of
+  temperature data but only 2 nights of brightness data still gets
+  a personalised temperature delta while keeping the safe brightness
+  clinical default.
+- A new sensor `sensor.sleep_classifier_per_stage_deltas` flips
+  through the states `clinical → learning → personalised` so users
+  see the controller "graduate" to a per-user policy as evidence
+  accumulates.
+
+Why this matters for sleep: a setpoint that's 2 °C too cold for *you*
+during DEEP can wake you with shivering or push you out of DEEP into
+LIGHT — undoing all the controller's other work.  Personalised
+deltas close that gap.
+
 ## Real-world robustness (v1.4.0)
 
 Three things in the real world break the textbook
@@ -114,6 +150,7 @@ v1.4.0 addresses all three:
 
 | Version | Headline |
 |---|---|
+| **v1.5.0** | Per-stage env *deltas* are now learned too — not just the midpoint. New `env_by_stage` field per session, decay-weighted weighted-median delta per field, ESS guard against noisy starts, per-field merge with clinical fallback, new `sensor.sleep_classifier_per_stage_deltas` exposing the controller's `clinical → learning → personalised` graduation. |
 | **v1.4.0** | Real-world robustness pass: per-actuator anticipation lets the AC lead the user by ~15 min; wind-down pre-cool starts dimming + cooling before the learned bedtime; stage debouncing filters 30-second wearable blips. |
 | **v1.3.1** | Per-stage adaptation preserved when learning kicks in: AWAKE / LIGHT / DEEP / REM each apply a clinical delta on top of the learned baseline. Safe-range clamps prevent runaway setpoints. |
 | **v1.3.0** | Local CNN-BiLSTM dropped — the add-on now subscribes to any HA sleep-stage sensor.  Image ~20 MB. Preference learner gains recorded_at + exponential decay, weekday/weekend bedtime split, current-context k-NN, and a JSON explainability panel; 4 new HA sensors mirror the reasoning. |

@@ -56,6 +56,11 @@ ENTITY_LEARNED_BEDTIME_WEEKEND = "sensor.sleep_classifier_learned_bedtime_weeken
 ENTITY_LEARNED_ENVIRONMENT = "sensor.sleep_classifier_learned_environment"
 ENTITY_RECOMMENDATION_EXPLAIN = "sensor.sleep_classifier_recommendation_explain"
 
+# v1.5.0 — surfaces the learned vs clinical per-stage deltas so the
+# user can see *why* the controller is now targeting e.g. 19.5 °C
+# during their DEEP stage instead of 19.0 °C.
+ENTITY_PER_STAGE_DELTAS = "sensor.sleep_classifier_per_stage_deltas"
+
 # ``icon: mdi:...`` strings render in Lovelace.  ``state_class`` and
 # ``device_class`` enable HA's long-term statistics (so the user gets a
 # free trend graph without writing a SQL query).
@@ -140,6 +145,15 @@ _STATIC_ATTRS_RECOMMENDATION_EXPLAIN = {
     # ``ready`` / ``not_ready`` without needing a custom card.
     "device_class": "enum",
     "options": ["ready", "not_ready"],
+}
+_STATIC_ATTRS_PER_STAGE_DELTAS = {
+    "friendly_name": "Learned per-stage env deltas",
+    "icon": "mdi:chart-bell-curve",
+    # ``learning`` while the learner is still collecting evidence,
+    # ``personalised`` once at least one stage has crossed the ESS
+    # threshold, ``clinical`` when no learned override is active.
+    "device_class": "enum",
+    "options": ["clinical", "learning", "personalised"],
 }
 
 
@@ -424,6 +438,84 @@ class SleepStatePublisher:
             attrs["neighbors"] = neighbors
         await self._safe_update(ENTITY_RECOMMENDATION_EXPLAIN, state, attrs)
 
+    async def publish_per_stage_deltas(
+        self,
+        deltas: Dict[str, Dict[str, Any]],
+        *,
+        ess_threshold: float = 4.0,
+    ) -> None:
+        """Publish the learner's per-stage env deltas.
+
+        ``deltas`` is the dict returned by
+        :meth:`PreferenceLearner.recommend_per_stage_deltas`.  The
+        state is a coarse-grained enum so HA UIs can colour-code the
+        sensor at a glance:
+
+        * ``clinical`` — no stage has a learned override active.
+        * ``learning`` — at least one stage has *any* samples but none
+          have crossed ``ess_threshold`` yet.
+        * ``personalised`` — at least one non-baseline stage has a
+          learned delta in use.
+
+        Attributes carry the full per-stage breakdown (deltas + ESS +
+        n_sessions per stage) so a Lovelace card can render the table.
+        """
+        if not deltas:
+            await self._safe_update(
+                ENTITY_PER_STAGE_DELTAS, "clinical",
+                _STATIC_ATTRS_PER_STAGE_DELTAS,
+            )
+            return
+
+        # Decide overall state.
+        personalised = False
+        learning = False
+        for stage_name, entry in deltas.items():
+            if stage_name == "LIGHT":
+                continue
+            ess = float(entry.get("ess", 0.0) or 0.0)
+            # Did any field actually get a learned value?
+            any_field_learned = any(
+                entry.get(f) is not None
+                for f in ("temperature_c", "humidity_pct",
+                          "brightness_pct", "fan_speed_pct")
+            )
+            if any_field_learned and ess >= ess_threshold:
+                personalised = True
+            elif ess > 0:
+                learning = True
+
+        if personalised:
+            state = "personalised"
+        elif learning:
+            state = "learning"
+        else:
+            state = "clinical"
+
+        attrs = dict(_STATIC_ATTRS_PER_STAGE_DELTAS)
+        # Flatten into HA-friendly keys: e.g.
+        #   awake_temperature_c_delta = +2.1
+        #   awake_ess = 7.3
+        # This avoids nested objects in the attributes table which
+        # some HA frontends can't render.
+        for stage_name, entry in deltas.items():
+            sn = stage_name.lower()
+            for field in ("temperature_c", "humidity_pct",
+                          "brightness_pct", "fan_speed_pct"):
+                val = entry.get(field)
+                if val is None:
+                    continue
+                attrs[f"{sn}_{field}_delta"] = round(float(val), 2)
+            ess = entry.get("ess")
+            if ess is not None:
+                attrs[f"{sn}_ess"] = round(float(ess), 2)
+            n_sess = entry.get("n_sessions")
+            if n_sess is not None:
+                attrs[f"{sn}_n_sessions"] = int(n_sess)
+        attrs["ess_threshold"] = float(ess_threshold)
+
+        await self._safe_update(ENTITY_PER_STAGE_DELTAS, state, attrs)
+
     async def publish_last_action(
         self, summary: str, *, executed: bool,
     ) -> None:
@@ -487,6 +579,10 @@ class SleepStatePublisher:
         await self._safe_update(
             ENTITY_RECOMMENDATION_EXPLAIN, "not_ready",
             _STATIC_ATTRS_RECOMMENDATION_EXPLAIN,
+        )
+        await self._safe_update(
+            ENTITY_PER_STAGE_DELTAS, "clinical",
+            _STATIC_ATTRS_PER_STAGE_DELTAS,
         )
 
     async def _safe_update(

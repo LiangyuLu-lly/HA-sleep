@@ -96,8 +96,14 @@ _DEFAULT_TARGETS: Dict[SleepStage, EnvironmentParams] = {
 #     the clinical consensus gives us a safe-by-default policy that
 #     still personalises the midpoint.
 #
-# Future work (v1.4): also learn the deltas from per-session
-# stage-segmented env traces.  Tracked in docs/BACKLOG.md.
+# v1.5.0 update: the table below is now a *fallback*.  When the
+# preference learner has accumulated enough per-stage history
+# (effective sample size ≥ 4), each field is overridden by the
+# learned value via :meth:`SmartEnvironmentController._merged_delta`.
+# This lets a heavy-duvet user who reliably sleeps best at a flat
+# 19 °C across all stages replace the population-average -2 °C DEEP
+# delta with their actual ~0 °C delta — without giving up the safe
+# defaults during the first weeks of usage.
 _STAGE_DELTAS: Dict[SleepStage, EnvironmentParams] = {
     SleepStage.AWAKE: EnvironmentParams(
         temperature_c=+2.0, humidity_pct=-5.0,
@@ -313,6 +319,12 @@ class SmartEnvironmentController:
         self._current_targets: Dict[SleepStage, EnvironmentParams] = dict(
             _DEFAULT_TARGETS
         )
+        # v1.5.0 — learned per-stage delta cache.  Re-fetched at most
+        # once every `_LEARNED_DELTA_TTL` seconds to amortise the
+        # weighted-median computation across the high-frequency
+        # plan_actions() calls (every ~30 s in production).
+        self._learned_deltas_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._learned_deltas_cached_at: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Target selection                                                   #
@@ -343,18 +355,93 @@ class SmartEnvironmentController:
             defaults, explore=self._should_explore(),
         )
 
-    @staticmethod
+    # Cache TTL for the learner's per-stage-delta computation.  120 s
+    # is well under our typical 30 s inference cadence × 4 stages, so
+    # the same SleepSession history is queried at most once per ~minute
+    # of wallclock — cheap enough.
+    _LEARNED_DELTA_TTL: float = 120.0
+
+    def _learned_deltas(self) -> Dict[str, Dict[str, Any]]:
+        """Cached view of :meth:`PreferenceLearner.recommend_per_stage_deltas`.
+
+        Returns an empty dict when the learner is absent or hasn't
+        accumulated enough history yet; callers must treat that as
+        "no override, use the clinical default".
+        """
+        if self.learner is None:
+            return {}
+        now = time.time()
+        if (
+            self._learned_deltas_cache is not None
+            and now - self._learned_deltas_cached_at < self._LEARNED_DELTA_TTL
+        ):
+            return self._learned_deltas_cache
+        try:
+            fresh = self.learner.recommend_per_stage_deltas(now=now)
+        except AttributeError:
+            # Older learner without the v1.5.0 method — degrade
+            # gracefully to clinical-only behaviour.
+            fresh = {}
+        except Exception:    # noqa: BLE001
+            # Corrupted history, IO error, whatever: never let a
+            # learner failure break the control loop.
+            fresh = {}
+        self._learned_deltas_cache = fresh
+        self._learned_deltas_cached_at = now
+        return fresh
+
+    def _merged_delta(self, stage: SleepStage) -> EnvironmentParams:
+        """Per-stage delta to apply on top of the LIGHT-stage baseline.
+
+        Each *field* is independently sourced:
+
+        * If the learner has ≥ ``_MIN_ESS_FOR_DELTA`` effective samples
+          for this stage *and* a non-None value for the field, use it.
+        * Otherwise fall back to the clinical default in
+          :data:`_STAGE_DELTAS`.
+
+        This per-field merge (vs. all-or-nothing per stage) means a
+        user who has 30 nights of temperature data but only 2 nights
+        of brightness data still gets a personalised temperature
+        delta while keeping the safe brightness clinical default.
+        """
+        clinical = _STAGE_DELTAS[stage]
+        learned_all = self._learned_deltas()
+        learned = learned_all.get(stage.name) if learned_all else None
+        if not learned:
+            return clinical
+
+        def _pick(field: str) -> Optional[float]:
+            lv = learned.get(field)
+            if lv is None:
+                return getattr(clinical, field)
+            return float(lv)
+
+        return EnvironmentParams(
+            temperature_c=_pick("temperature_c"),
+            humidity_pct=_pick("humidity_pct"),
+            brightness_pct=_pick("brightness_pct"),
+            fan_speed_pct=_pick("fan_speed_pct"),
+        )
+
     def _compose(
+        self,
         baseline: EnvironmentParams,
         stage: SleepStage,
         fallback_stage: SleepStage,
     ) -> EnvironmentParams:
-        """``baseline + _STAGE_DELTAS[stage]`` with safe-range clamps.
+        """``baseline + delta[stage]`` with safe-range clamps.
+
+        v1.5.0: ``delta`` is now the per-stage *learned* delta (where
+        available) merged with the clinical fallback in
+        :data:`_STAGE_DELTAS` on a per-field basis via
+        :meth:`_merged_delta`.  This used to be a ``@staticmethod`` —
+        promoted to an instance method so it can access ``self.learner``.
 
         ``fallback_stage`` is consulted for any baseline field that is
         ``None`` (e.g. learner had no humidity history yet).
         """
-        delta = _STAGE_DELTAS[stage]
+        delta = self._merged_delta(stage)
 
         def _shift(
             base: Optional[float], d: Optional[float], field: str,

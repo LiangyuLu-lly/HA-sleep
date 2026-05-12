@@ -23,6 +23,7 @@ from src.sleep_state_publisher import (
     ENTITY_LEARNED_BEDTIME_WEEKEND,
     ENTITY_LEARNED_BEDTIME_WORKDAY,
     ENTITY_LEARNED_ENVIRONMENT,
+    ENTITY_PER_STAGE_DELTAS,
     ENTITY_QUALITY,
     ENTITY_RECOMMENDATION_EXPLAIN,
     ENTITY_RECOMMENDED_BEDTIME,
@@ -383,18 +384,20 @@ class TestLearningPanelPublishers:
 class TestInitialPlaceholders:
     """Boot-time seeding: every owned entity must get a state immediately."""
 
-    async def test_publishes_all_thirteen_entities(
+    async def test_publishes_all_fourteen_entities(
         self, publisher: SleepStatePublisher, ha_client: AsyncMock,
     ) -> None:
         await publisher.publish_initial_placeholders()
         called = {c.args[0] for c in ha_client.update_state.call_args_list}
-        # v1.3.0: 5 legacy + 4 natural-sleep + 4 learning = 13 entities.
+        # v1.5.0: 5 legacy + 4 natural-sleep + 4 learning +
+        # 1 per-stage-deltas = 14 entities.
         expected = {
             ENTITY_STAGE, ENTITY_CONFIDENCE, ENTITY_QUALITY, ENTITY_DURATION,
             ENTITY_LAST_ACTION, ENTITY_DEBT, ENTITY_RECOMMENDED_BEDTIME,
             ENTITY_WAKE_DECISION, ENTITY_SOUNDSCAPE,
             ENTITY_LEARNED_BEDTIME_WORKDAY, ENTITY_LEARNED_BEDTIME_WEEKEND,
             ENTITY_LEARNED_ENVIRONMENT, ENTITY_RECOMMENDATION_EXPLAIN,
+            ENTITY_PER_STAGE_DELTAS,
         }
         assert called == expected
 
@@ -405,5 +408,101 @@ class TestInitialPlaceholders:
         publisher = SleepStatePublisher(ha_client)
         # Must not raise, even though every single update fails.
         await publisher.publish_initial_placeholders()
-        # 13 entities seeded → 13 failures recorded.
-        assert publisher.stats.failures == 13
+        # v1.5.0: 14 entities seeded → 14 failures recorded.
+        assert publisher.stats.failures == 14
+
+
+# ---------------------------------------------------------------------------
+# v1.5.0 — Per-stage deltas publishing
+# ---------------------------------------------------------------------------
+
+
+class TestPublishPerStageDeltas:
+    """The per-stage-deltas sensor's state must accurately reflect how
+    much of the controller's policy is *learned* vs *clinical default*."""
+
+    async def test_empty_payload_publishes_clinical_state(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        # ``deltas={}`` mimics a learner that hasn't computed anything
+        # yet (or one that pre-dates v1.5.0).  Sensor must default to
+        # ``clinical`` so users see "controller using defaults" at a
+        # glance rather than a stale value or "unknown".
+        await publisher.publish_per_stage_deltas({})
+        assert ha_client.update_state.call_count == 1
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[0] == ENTITY_PER_STAGE_DELTAS
+        assert c.args[1] == "clinical"
+
+    async def test_state_is_learning_when_ess_below_threshold(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        # Some samples accumulated but no stage crossed ESS=4 yet —
+        # users should see "learning" so they know it's progressing.
+        deltas = {
+            "AWAKE": {"temperature_c": None, "humidity_pct": None,
+                      "brightness_pct": None, "fan_speed_pct": None,
+                      "ess": 2.0, "n_sessions": 2},
+            "LIGHT": {"temperature_c": 0.0, "humidity_pct": 0.0,
+                      "brightness_pct": 0.0, "fan_speed_pct": 0.0,
+                      "ess": 2.0, "n_sessions": 2},
+            "DEEP": {"temperature_c": None, "humidity_pct": None,
+                     "brightness_pct": None, "fan_speed_pct": None,
+                     "ess": 2.0, "n_sessions": 2},
+            "REM": {"temperature_c": None, "humidity_pct": None,
+                    "brightness_pct": None, "fan_speed_pct": None,
+                    "ess": 1.0, "n_sessions": 1},
+        }
+        await publisher.publish_per_stage_deltas(deltas)
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[1] == "learning"
+
+    async def test_state_is_personalised_when_any_stage_active(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        # DEEP has a real learned delta + sufficient ESS → the
+        # controller is now using a personalised policy.  Other
+        # stages still being learned shouldn't downgrade the state.
+        deltas = {
+            "AWAKE": {"temperature_c": None, "humidity_pct": None,
+                      "brightness_pct": None, "fan_speed_pct": None,
+                      "ess": 2.0, "n_sessions": 2},
+            "LIGHT": {"temperature_c": 0.0, "humidity_pct": 0.0,
+                      "brightness_pct": 0.0, "fan_speed_pct": 0.0,
+                      "ess": 10.0, "n_sessions": 10},
+            "DEEP": {"temperature_c": -1.7, "humidity_pct": None,
+                     "brightness_pct": None, "fan_speed_pct": None,
+                     "ess": 8.0, "n_sessions": 8},
+            "REM": {"temperature_c": None, "humidity_pct": None,
+                    "brightness_pct": None, "fan_speed_pct": None,
+                    "ess": 0.0, "n_sessions": 0},
+        }
+        await publisher.publish_per_stage_deltas(deltas)
+        c = ha_client.update_state.call_args_list[0]
+        assert c.args[1] == "personalised"
+
+    async def test_attributes_flatten_for_lovelace(
+        self, publisher: SleepStatePublisher, ha_client: AsyncMock,
+    ) -> None:
+        # HA frontends choke on nested dicts in attributes — verify
+        # we surface the per-stage data as flat ``deep_temperature_c_delta``
+        # / ``deep_ess`` keys.
+        deltas = {
+            "DEEP": {"temperature_c": -1.7, "humidity_pct": None,
+                     "brightness_pct": None, "fan_speed_pct": None,
+                     "ess": 8.0, "n_sessions": 8},
+            "LIGHT": {"temperature_c": 0.0, "humidity_pct": 0.0,
+                      "brightness_pct": 0.0, "fan_speed_pct": 0.0,
+                      "ess": 10.0, "n_sessions": 10},
+        }
+        await publisher.publish_per_stage_deltas(deltas)
+        attrs = ha_client.update_state.call_args_list[0].kwargs["attributes"]
+        assert attrs["deep_temperature_c_delta"] == pytest.approx(-1.7)
+        assert attrs["deep_ess"] == pytest.approx(8.0)
+        assert attrs["deep_n_sessions"] == 8
+        # Humidity was None → must not appear in attributes (HA
+        # rendering rules prefer "missing" over "null").
+        assert "deep_humidity_pct_delta" not in attrs
+        # ess_threshold also surfaced so dashboards can render a
+        # progress bar without hard-coding 4.
+        assert attrs["ess_threshold"] == pytest.approx(4.0)

@@ -158,6 +158,14 @@ class SleepSession:
     n_samples: int = 0
     notes: Optional[str] = None
     recorded_at: float = 0.0
+    # v1.5.0 — env snapshot taken when the user *entered* each stage,
+    # used by :meth:`PreferenceLearner.recommend_per_stage_deltas` to
+    # learn each user's idiosyncratic AWAKE/LIGHT/DEEP/REM offsets
+    # instead of using the hard-coded clinical defaults.  Keys are
+    # SleepStage.name strings ("AWAKE", "LIGHT", "DEEP", "REM") to
+    # keep the JSON round-trip cheap; empty dict means the session
+    # was recorded pre-v1.5 and has no per-stage info.
+    env_by_stage: Dict[str, EnvironmentParams] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Backfill ``recorded_at`` for sessions loaded from a pre-v1.3
@@ -176,10 +184,25 @@ class SleepSession:
             "n_samples": self.n_samples,
             "notes": self.notes,
             "recorded_at": self.recorded_at,
+            # v1.5.0 — serialise each per-stage snapshot.  We tolerate
+            # an empty dict so the file shape stays valid for pre-v1.5
+            # sessions reloaded from disk.
+            "env_by_stage": {
+                k: v.to_dict() for k, v in (self.env_by_stage or {}).items()
+            },
         }
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "SleepSession":
+        raw_eb = raw.get("env_by_stage") or {}
+        env_by_stage: Dict[str, EnvironmentParams] = {}
+        # Tolerate older sessions where env_by_stage is missing or
+        # malformed — those sessions just don't contribute to the
+        # per-stage learner.
+        if isinstance(raw_eb, dict):
+            for stage_name, env in raw_eb.items():
+                if isinstance(env, dict):
+                    env_by_stage[str(stage_name)] = EnvironmentParams.from_dict(env)
         return cls(
             session_id=str(raw["session_id"]),
             started_at=float(raw.get("started_at", 0)),
@@ -190,6 +213,7 @@ class SleepSession:
             n_samples=int(raw.get("n_samples", 0)),
             notes=raw.get("notes"),
             recorded_at=float(raw.get("recorded_at", 0)),
+            env_by_stage=env_by_stage,
         )
 
 
@@ -726,6 +750,151 @@ class PreferenceLearner:
             "n_used": len(top_sessions),
             "confidence": confidence,
         }
+
+    # ------------------------------------------------------------------ #
+    # Per-stage deltas (v1.5.0)                                           #
+    # ------------------------------------------------------------------ #
+
+    # Minimum effective sample size before we trust a learned delta.
+    # ESS = (Σw)² / Σ(w²); with all weights = 1 this collapses to n.
+    # Below this we fall back to the clinical default so a noisy
+    # learner doesn't keep the bedroom too dim/cold during DEEP.
+    _MIN_ESS_FOR_DELTA: float = 4.0
+
+    # The reference stage that all deltas are computed *relative to*.
+    # LIGHT is the natural baseline because it's the most populated
+    # stage in any session (most users spend ~50 % of the night there).
+    _DELTA_BASELINE: str = "LIGHT"
+
+    def recommend_per_stage_deltas(
+        self,
+        now: Optional[float] = None,
+    ) -> Dict[str, Dict[str, Optional[float]]]:
+        """Return learned env *deltas* per stage relative to LIGHT.
+
+        Output shape::
+
+            {
+              "AWAKE": {"temperature_c": +2.1, "humidity_pct": None,
+                        "brightness_pct": +18.0, "fan_speed_pct": None,
+                        "ess": 7.3, "n_sessions": 9},
+              "LIGHT": {... all zeros, baseline ...},
+              "DEEP":  {"temperature_c": -1.8, ...},
+              "REM":   {"temperature_c": -1.5, ...},
+            }
+
+        A field is ``None`` when the effective sample size (ESS) is
+        below ``_MIN_ESS_FOR_DELTA`` for that stage — the caller
+        should fall back to the clinical default in
+        :mod:`smart_environment_controller`.
+
+        Algorithm:
+
+        1. Take every session with a non-empty ``env_by_stage``.
+        2. For each session that has both the stage *and* the LIGHT
+           baseline recorded, compute the per-field delta
+           ``env[stage] - env[LIGHT]``.
+        3. Weight each session by the existing exponential time decay
+           (``_session_weights``) so old / stale preferences fade.
+        4. The reported delta is the **weighted median** of those
+           per-session deltas — same robust estimator as
+           ``recommend_knn`` so a single anomalous night can't move
+           the learned delta.
+        5. Report the effective sample size alongside each stage so
+           the controller and the explainability sensor can decide
+           whether to trust it.
+
+        Why deltas rather than absolute targets:
+            Anchoring on LIGHT means the user's *baseline* (a hot
+            sleeper at 24 °C vs a cold one at 18 °C) is captured by
+            the LIGHT k-NN already, and the per-stage method only has
+            to learn the *shape* of the night (how much cooler DEEP
+            wants to be).  This is a much lower-dimensional learning
+            problem that hits ESS ≥ 4 in ~1-2 weeks of nightly use
+            instead of months.
+        """
+        sessions = [
+            s for s in self._load() if s.env_by_stage and self._DELTA_BASELINE in s.env_by_stage
+        ]
+        now_ts = float(now) if now is not None else time.time()
+        weights = self._session_weights(sessions, now_ts)
+
+        result: Dict[str, Dict[str, Optional[float]]] = {}
+        for stage_name in ("AWAKE", "LIGHT", "DEEP", "REM"):
+            # The baseline stage's delta is, by definition, zero.
+            if stage_name == self._DELTA_BASELINE:
+                result[stage_name] = {
+                    "temperature_c": 0.0,
+                    "humidity_pct": 0.0,
+                    "brightness_pct": 0.0,
+                    "fan_speed_pct": 0.0,
+                    "ess": float(len(sessions)),
+                    "n_sessions": len(sessions),
+                }
+                continue
+
+            # Filter to sessions that have BOTH this stage and LIGHT.
+            stage_deltas: Dict[str, List[float]] = {
+                "temperature_c": [],
+                "humidity_pct": [],
+                "brightness_pct": [],
+                "fan_speed_pct": [],
+            }
+            stage_weights: List[float] = []
+            for sess, w in zip(sessions, weights):
+                if stage_name not in sess.env_by_stage:
+                    continue
+                base_env = sess.env_by_stage[self._DELTA_BASELINE]
+                this_env = sess.env_by_stage[stage_name]
+                # Compute delta per field; only contribute fields
+                # where *both* the baseline and this stage have a
+                # numeric reading.
+                appended = False
+                for field_name in stage_deltas:
+                    bv = getattr(base_env, field_name)
+                    tv = getattr(this_env, field_name)
+                    if bv is None or tv is None:
+                        continue
+                    stage_deltas[field_name].append(tv - bv)
+                    appended = True
+                if appended:
+                    stage_weights.append(w)
+
+            ess = self._effective_sample_size(stage_weights)
+            entry: Dict[str, Optional[float]] = {
+                "ess": ess,
+                "n_sessions": len(stage_weights),
+            }
+            for field_name, deltas in stage_deltas.items():
+                if ess < self._MIN_ESS_FOR_DELTA or not deltas:
+                    entry[field_name] = None
+                    continue
+                # Pad weights to match the deltas-per-field cardinality.
+                # In practice every session with both stages snapshotted
+                # contributes to every field with valid bv/tv, so
+                # ``len(deltas) == len(stage_weights)`` holds.  Defensive
+                # truncation if a future schema change breaks the
+                # invariant.
+                wts = stage_weights[: len(deltas)]
+                entry[field_name] = self._weighted_median(deltas, wts)
+            result[stage_name] = entry
+
+        return result
+
+    @staticmethod
+    def _effective_sample_size(weights: Sequence[float]) -> float:
+        """Kish's effective sample size: (Σw)² / Σ(w²).
+
+        ESS = n when all weights are equal; ESS = 1 when a single
+        weight dominates.  We use it as the trust threshold instead of
+        the raw session count so a learner with 30 sessions but
+        crushed by exponential decay still reports a realistic count.
+        """
+        sw = sum(weights)
+        sw2 = sum(w * w for w in weights)
+        if sw2 <= 0.0:
+            return 0.0
+        return (sw * sw) / sw2
 
     # ------------------------------------------------------------------ #
     # Explainability panel (v1.3.0)                                       #

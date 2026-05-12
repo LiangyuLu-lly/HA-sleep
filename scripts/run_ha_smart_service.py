@@ -256,6 +256,17 @@ class SmartSleepService:
         # Sequence of (SleepStage) per inference for SE/WASO/SOL scoring.
         self.stage_sequence: List[SleepStage] = []
         self.last_env = EnvironmentParams()
+        # v1.5.0 — per-stage env snapshots.  Updated by
+        # :meth:`_track_per_stage_env` once per inference tick when the
+        # *raw* (debounced) stage changes.  Empty until the user moves
+        # through more than one stage; populates the matching
+        # SleepSession field at checkpoint time so
+        # :meth:`PreferenceLearner.recommend_per_stage_deltas` can
+        # learn each user's idiosyncratic stage-to-stage offsets.
+        self.env_by_stage: Dict[str, EnvironmentParams] = {}
+        # Track the last stage we sampled so we don't overwrite the
+        # snapshot on every tick — only on genuine stage transitions.
+        self._last_sampled_stage: Optional[SleepStage] = None
         self.stop_event = asyncio.Event()
         # The publisher is created once HA is reachable; until then it stays
         # ``None`` so dry-run and unit-test paths don't accidentally try to
@@ -396,6 +407,13 @@ class SmartSleepService:
                 stage, conf = engine.infer()
                 self.stage_counts[stage.name] = self.stage_counts.get(stage.name, 0) + 1
                 self.stage_sequence.append(stage)
+                # v1.5.0 — snapshot the env at every stage *entry* so
+                # the preference learner can later compute personalised
+                # AWAKE/LIGHT/DEEP/REM deltas.  Guarded by a transition
+                # check so we don't keep overwriting the same stage's
+                # snapshot every tick (we want the env *as the user
+                # entered* the stage, not as they leave it).
+                self._track_per_stage_env(stage)
                 logger.info(
                     "infer stage=%s conf=%.2f  env(T=%s H=%s)",
                     stage.name, conf,
@@ -532,6 +550,12 @@ class SmartSleepService:
             quality_score=score,
             n_samples=sum(self.stage_counts.values()),
             notes=notes,
+            # v1.5.0 — hand off the per-stage env trace collected by
+            # _track_per_stage_env during the night.  Empty dict for a
+            # session that never crossed a stage boundary (e.g. an
+            # extremely short nap); the learner tolerates that and
+            # falls back to clinical deltas.
+            env_by_stage=dict(self.env_by_stage),
         )
         try:
             self.learner.record_session(session)
@@ -871,6 +895,36 @@ class SmartSleepService:
         except Exception as exc:    # noqa: BLE001
             logger.warning("Soundscape control failed: %s", exc)
 
+    def _track_per_stage_env(self, raw_stage: SleepStage) -> None:
+        """Record the current env as the snapshot for ``raw_stage``
+        on the first tick we see this stage in the current session.
+
+        We snapshot **on entry** rather than on exit because:
+
+        * The user's body is reacting to the conditions they entered
+          into; that's the causal signal we want to learn from.
+        * Exit-time conditions are corrupted by the controller's own
+          response — the AC may have already adjusted toward the *next*
+          stage's setpoint thanks to v1.4.0 anticipation.
+
+        Subsequent ticks within the same stage are skipped so we don't
+        overwrite the entry snapshot.  A future occurrence of the same
+        stage (e.g. wake-LIGHT-wake-LIGHT) **does** re-snapshot, since
+        the env may have changed and the new entry is the freshest
+        signal we have.
+        """
+        if self._last_sampled_stage is raw_stage:
+            return
+        # Capture a *copy* of last_env so subsequent env updates don't
+        # mutate this stage's recorded snapshot via shared reference.
+        self.env_by_stage[raw_stage.name] = EnvironmentParams(
+            temperature_c=self.last_env.temperature_c,
+            humidity_pct=self.last_env.humidity_pct,
+            brightness_pct=self.last_env.brightness_pct,
+            fan_speed_pct=self.last_env.fan_speed_pct,
+        )
+        self._last_sampled_stage = raw_stage
+
     def _effective_control_stage(self, raw_stage: SleepStage) -> SleepStage:
         """Map the *observed* stage to the stage the controller should act on.
 
@@ -959,6 +1013,16 @@ class SmartSleepService:
                 current_temp_c=self.last_env.temperature_c,
             )
             await self.publisher.publish_recommendation_explain(explanation)
+
+            # v1.5.0 — surface the learned per-stage deltas so users
+            # can see the controller "graduating" from clinical to
+            # personalised setpoints as their history accumulates.
+            try:
+                deltas = self.learner.recommend_per_stage_deltas()
+                await self.publisher.publish_per_stage_deltas(deltas)
+            except AttributeError:
+                # Learner predates v1.5.0; nothing to publish.
+                pass
         except Exception as exc:    # noqa: BLE001
             logger.warning("Could not publish learning panel: %s", exc)
 

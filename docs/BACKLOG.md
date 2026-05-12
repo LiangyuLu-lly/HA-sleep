@@ -72,59 +72,133 @@ hits every measurable product-quality metric.
 
 ---
 
-## Per-stage env learning (v1.4)
+## Per-stage env learning (shipped in v1.5.0) ✅
 
-**Goal:** replace the hard-coded ``_STAGE_DELTAS`` table in
-``src/smart_environment_controller.py`` with a learned per-stage
-recommendation, so the directional offsets between AWAKE / LIGHT /
-DEEP / REM also become user-specific.
+Originally specified in this backlog as "v1.4" work and shipped in
+v1.5.0 — the controller now prefers learned AWAKE/LIGHT/DEEP/REM
+deltas (computed against the LIGHT-stage baseline) over the clinical
+defaults, with a per-field merge and a Kish-effective-sample-size
+guard.  See README "Per-stage learned deltas (v1.5.0)".
 
-**Status:** specified, not implemented.  Currently the *midpoint* is
-learned (`PreferenceLearner.recommend_knn`) but the deltas are baked
-in from clinical defaults.
+The implementation deviates from the original sketch in two
+deliberate ways:
 
-### Per-stage — why it would help
+* The learner returns *deltas relative to LIGHT*, not absolute env
+  per stage.  This dropped the dimensionality of the learning
+  problem by 4× — a stage now needs ~4 nights of data to cross the
+  ESS threshold instead of ~16, because the per-user midpoint is
+  already nailed down by ``recommend_knn``.
+* The merge with clinical defaults is **per field** rather than
+  per stage.  A user with 30 nights of temperature data but only 2
+  of brightness data therefore gets a personalised temperature
+  delta while keeping the safe brightness clinical default,
+  instead of waiting until the whole stage is learned.
 
-* The clinical deltas are population averages.  A user who reliably
-  sleeps best at a flat 19 °C across all stages (e.g. a heavy duvet
-  user) is mis-served by the current "DEEP must be 2 °C cooler than
-  LIGHT" assumption.
-* Once we collect per-stage telemetry we can also surface a richer
-  Lovelace card: "your AWAKE delta is +1.5 °C — narrower than the
-  +2.0 °C clinical default, suggesting you wind down quickly".
+### Future work atop v1.5.0
 
-### Per-stage — why we have not done it yet
+* **Per-stage exploration.**  Currently exploration noise is added
+  to the absolute setpoint, not the per-stage delta.  A future pass
+  could perturb the *delta* itself, e.g. trial a 0.5 °C narrower
+  DEEP-vs-LIGHT gap, to discover whether a flatter night yields
+  better quality scores than the textbook curve.
+* **Cross-night auto-correlation in the delta.**  If a user's DEEP
+  delta correlates with their AWAKE delta (e.g. both shrink in
+  summer), we could regularise the learner via a small graphical
+  model.  Useful only after we have ~50+ users and can study the
+  empirical correlation matrix.
 
-1. **Storage shape.** Each session today stores one
-   ``EnvironmentParams`` snapshot, not a per-stage trace.  We'd need
-   to either:
-   - bump the JSON schema to ``{stage: env_params}`` per session, or
-   - sample env at every stage transition (and reconcile when stages
-     flap quickly).
-2. **Sparsity.** A normal night has only a few minutes of REM at the
-   end; over 60 sessions that's ~3-4 hours of REM samples.  Decay
-   weighting on top thins it further.  Need to verify the effective
-   sample size is still > 10 before promoting a learned delta.
-3. **Safety.** A noisy learner output for the brightness delta could
-   keep the bedroom lights at 40 % during DEEP for an unfortunate
-   user.  The current safe-range clamp helps but doesn't fully
-   substitute for a sanity check against the clinical envelope.
+## v1.5.0 quality-audit hotspots
 
-### Per-stage — implementation sketch (when we do it)
+Findings from the v1.5.0 release audit (`pytest --cov=src`, 89 % overall):
 
-1. Extend ``SleepSession`` with ``env_by_stage: Dict[str, EnvironmentParams]``,
-   populated by the orchestrator at each stage transition.
-2. Add ``PreferenceLearner.recommend_per_stage()`` returning
-   ``Dict[SleepStage, EnvironmentParams]``; reuse the existing decay
-   + k-NN machinery on a per-stage subset.
-3. Refactor ``SmartEnvironmentController.target_for()`` to prefer the
-   learned per-stage env when ``len(per_stage_history) >= 10`` and
-   fall back to the current baseline + delta otherwise.
-4. Add a 5th HA sensor exposing the *learned* deltas for transparency.
+* **`src/ha_api_client.py` at 57 % coverage.**  The lowest-covered
+  module — but it's mostly the WebSocket reconnect / retry / token
+  refresh loops, none of which can be exercised meaningfully against
+  a unit-test mock.  The fix is **integration tests** with an
+  in-process aiohttp server that speaks just enough of the HA
+  WebSocket protocol to cover the `auth_required → auth_ok →
+  subscribe_events → state_changed` happy path plus a
+  drop-and-reconnect.  Estimated 1 fresh session.
+* **`scripts/run_ha_smart_service.py` at 1065 lines.**  Big but
+  coherent.  The cleanest split is to extract the four
+  `publish_*` / `_publish_*` helpers (debt+bedtime, learning panel,
+  per-stage deltas, soundscape) into a `LearningPanelPublisher`
+  class so the orchestrator drops to ~700 lines and the panel
+  becomes independently testable.  Not blocking; do it the next
+  time a panel feature lands.
+* **`src/_time_utils.py` at 75 %.**  Only 8 statements; the
+  uncovered branches are the `try: ZoneInfo / except` fallback for
+  a missing tzdata package — only triggered on a misconfigured
+  system, so the gap is acceptable.
 
-## R60ABD1 ESPHome native API direct path
+Coverage report kept in CI thinking; not auto-published yet because
+the `pytest-cov` step adds ~0.7 s to the suite.  Add it once the
+suite breaks 1 s budget.
 
-(see top of file)
+## Sleep apnea detector — design sketch
+
+**Goal:** turn the radar's existing breathing-rate + chest-wall-motion
+streams into a per-night apnea-hypopnea index (AHI) proxy, surfaced
+as a new HA sensor `sensor.sleep_classifier_apnea_index`.
+
+**Status:** designed, **not implemented**.  This is the highest-
+medical-value future feature on the roadmap; treating it as a stretch
+goal both for correctness reasons (we don't want to publish a number
+people will mistake for a clinical AHI) and for product reasons (it
+needs a separate consent screen).
+
+### Why slot it in as a separate module
+
+The stage subscriber is a discrete-state machine; apnea detection is
+a continuous, sliding-window signal-processing pipeline.  Coupling
+them would force the controller to wait on FFTs every 30 s.  A
+separate module pushes its results into HA on its own cadence and
+the orchestrator only listens.
+
+### Algorithm sketch
+
+1. **Subscribe** to a breathing-rate sensor (e.g. R60ABD1's
+   `sensor.r60abd1_breathing_rate`) at 1 Hz and a chest-wall-motion
+   sensor at 10 Hz if available.
+2. **Sliding window** of length 60 s, hop 10 s.  For each window:
+   a. Detect *apneic events* — a contiguous interval of ≥ 10 s
+      where breathing rate < 4 bpm OR chest-wall variance is below
+      the noise floor.
+   b. Detect *hypopneic events* — a ≥ 10 s interval where
+      breathing rate is 50 % below the user's baseline AND
+      chest-wall amplitude is < 70 % of baseline.
+3. **Per-night roll-up** at session checkpoint: count events per
+   hour of recorded sleep, that's the AHI proxy.
+4. **Confidence** comes from how much of the night the radar had
+   signal vs. dropouts (e.g. sleeping on stomach often blocks the
+   chest signal).
+
+### Why we have not done it yet
+
+* **Calibration.** The "user's baseline breathing rate" needs ~1
+  week of nightly data to settle.  Until then the hypopnea
+  detector throws false positives.
+* **Medical disclaimer.**  AHI is a clinical metric; surfacing a
+  number > 5 (the medical threshold) without a consent dialog and
+  a "this is not a diagnosis" banner is irresponsible.  We need a
+  one-time onboarding step before this sensor publishes a value.
+* **Validation data.**  Without polysomnography ground truth on
+  real users we can't tune the thresholds.  The right scope is a
+  PoC that surfaces a *trend* (red/amber/green) rather than a
+  numeric AHI, until we have a study partner.
+
+### Implementation sketch (when we do it)
+
+* New `src/apnea_detector.py` with a `BreathingWindow` dataclass and
+  a `compute_ahi_proxy(events, recorded_seconds) -> float`.
+* New HA sensor `sensor.sleep_classifier_apnea_index` (state =
+  red/amber/green, attributes = events_per_hour, calibration_days,
+  confidence).
+* Orchestrator subscribes to the breathing source the same way it
+  subscribes to the stage source, with a similar
+  `apnea_breathing_source` config slot.
+* Onboarding: first publish only `pending_consent` until the user
+  toggles a new HA `input_boolean.sleep_classifier_apnea_consent`.
 
 ## Other ideas worth a fresh session
 
@@ -132,9 +206,13 @@ in from clinical defaults.
   produce mixed signals.  Investigate whether the multi-zone radar
   modes (R60ABD1 supports 4 zones) can be auto-routed to two parallel
   subscriber instances.
-* **Sleep apnea detector.**  Breathing-rate variability + chest-wall
-  motion → apnea-hypopnea index proxy.  Would slot in as a separate
-  module beside the stage subscriber.
 * **Open the dataset.**  Release a redacted subset of preference
   histories (with explicit consent) so the community can compare
   recovery-plan algorithms.
+* **HACS distribution.**  Currently the add-on is installed via the
+  HA Add-on Store ("Add Repository" → URL).  HACS would let users
+  install the *integration* (sensor entities + Lovelace card) without
+  the add-on container.  Today the value-add is small because the
+  core logic is in the add-on, but a future refactor that splits
+  out a thin HA custom-component for the sensors only would be a
+  natural HACS package.

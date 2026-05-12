@@ -1,4 +1,4 @@
-# Sleep Classifier — Home Assistant Add-on (v1.4.0)
+# Sleep Classifier — Home Assistant Add-on (v1.5.0)
 
 **What it actually does**: learn which bedroom environment is most
 restful *for you*, then adapt it continuously across the night, the
@@ -233,6 +233,26 @@ attributes — open the More-Info dialog on
 - `recommendation`: the env dict picked tonight
 - `neighbors`: top-5 neighbour sessions with their weights, quality,
   and start time — the actual "why this T / RH / lux?"
+
+**Per-stage learned deltas (v1.5.0)**
+
+```text
+sensor.sleep_classifier_per_stage_deltas          # "clinical" | "learning" | "personalised"
+```
+
+This sensor shows whether the controller is still using the textbook
+clinical AWAKE/LIGHT/DEEP/REM offsets (`clinical`), accumulating
+evidence (`learning`), or has crossed the effective-sample-size
+threshold and is now using *your* learned offsets (`personalised`).
+The flat attributes (e.g. `deep_temperature_c_delta=-1.7`,
+`deep_ess=8.0`, `deep_n_sessions=8`, `ess_threshold=4.0`) let a
+Lovelace card render the per-stage table without templating.
+
+The point: a heavy-duvet sleeper who actually wants the same 19 °C
+across all stages will see this sensor flip from `clinical` to
+`personalised` within ~1-2 weeks of nightly use, at which moment the
+DEEP setpoint stops being driven by the population-average -2 °C
+delta and starts being driven by their actual -0 °C delta.
 
 ## What happens after Start
 
