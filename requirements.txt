@@ -1,15 +1,14 @@
-# Default dev / CI install — runtime deps plus dev-time test tooling.
+# 开发 / CI 环境：runtime 依赖 + pytest 三件套。
 #
-# Two deployment layers:
-#   * requirements-runtime.txt — minimal aiohttp + numpy; shipped in
-#     the add-on image (~10 MB of wheels).
-#   * requirements.txt (this file) — adds pytest + pytest-asyncio +
-#     pytest-timeout for running the test suite on a workstation.
+# 两层部署：
+#   * requirements-runtime.txt —— Add-on 镜像只装这一份（目前只有
+#     aiohttp；v1.6.0 已移除 numpy）。
+#   * requirements.txt（本文件）—— 工作站跑单测用，在 runtime 基础
+#     上加 pytest、pytest-asyncio、pytest-timeout。
 #
-# v1.3.0 simplification: there is no longer a ``requirements-train.txt``
-# because the local CNN-BiLSTM model + its TensorFlow training pipeline
-# were removed in favour of subscribing to an existing HA sleep-stage
-# entity.  The Pi 4B add-on installs only ``requirements-runtime.txt``.
+# v1.3.0 起已删除本地 CNN-BiLSTM 模型与配套训练流水线，因此没有
+# ``requirements-train.txt``；Alpine Add-on 容器只安装
+# ``requirements-runtime.txt``。
 -r requirements-runtime.txt
 pytest>=7.4.0
 pytest-asyncio>=0.23.0

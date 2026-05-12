@@ -1,20 +1,20 @@
-# Runtime-only dependencies for the v1.3.0 add-on.
+# Add-on 镜像运行时依赖。
 #
-# Design notes
-# ------------
-# Since v1.3.0 the add-on no longer runs a local sleep-stage classifier —
-# it subscribes to a stage entity the user has already built in HA.  The
-# runtime image therefore needs none of the heavy scientific stack:
+# 设计说明
+# ----------
+# v1.3.0 起不再加载本地深度学习模型（CNN-BiLSTM 已废弃），
+# v1.6.1 起 ``src/`` 和 ``scripts/`` 内也没有任何 ``import
+# numpy`` / ``np.`` 的引用（可用 ``grep -R "numpy" src/ scripts/``
+# 自查）——numpy 因此被移出运行时依赖，镜像再瘦约 5 MB。
 #
-#   * no ``scipy`` / ``h5py`` / ``PyWavelets`` — those were only needed by
-#     the deleted CNN/BiLSTM/wavelet pipeline.
-#   * no ``paho-mqtt`` — the MQTT bridge modules were deleted too; we
-#     talk to HA over the REST + WebSocket API exclusively.
-#   * ``numpy`` stays because a handful of utilities (e.g. sleep-debt
-#     computations) still rely on it, and it's ~2 MB so the savings
-#     wouldn't justify a numpy-less refactor.
+# 当前保持最小：aiohttp 用来跑 HA REST + WebSocket 客户端以及
+# 内嵌的 Web UI server。
 #
-# Required invariant: ``import src`` must succeed using only the packages
-# listed below.
+# 如果未来的新模块（比如 apnea_detector 的生产化）确实需要向量
+# 化计算，再把 numpy 加回来；不要为了「以后可能会用」预装，
+# Add-on 体积是用户第一次安装时的一次性摩擦成本。
+#
+# 必需的不变量：在只装下面列出的依赖的前提下，``import src``
+# 必须成功——orchestrator 的冷启动路径不允许触发
+# ``ModuleNotFoundError``。
 aiohttp>=3.9.0
-numpy>=1.24.0

@@ -24,6 +24,12 @@ MIN_SECONDS_BETWEEN_ACTIONS=$(opt '.min_seconds_between_actions // 120')
 DEADBAND_T=$(opt '.deadband_temperature_c // 0.5')
 DEADBAND_H=$(opt '.deadband_humidity_pct // 5')
 DEADBAND_B=$(opt '.deadband_brightness_pct // 10')
+# v1.4.0: wind-down pre-cool + stage debouncing knobs are exposed in
+# config.yaml but used to be silently dropped here, so user edits had
+# no effect.  The defaults mirror SmartControlConfig's dataclass
+# defaults so omitting them in options.json reproduces pre-v1.6 behaviour.
+WIND_DOWN_MINUTES=$(opt '.wind_down_minutes // 30')
+MIN_STAGE_DWELL_SECONDS=$(opt '.min_stage_dwell_seconds // 60')
 LOG_LEVEL=$(opt '.log_level // "info"')
 
 # Slot bindings — sensors
@@ -162,6 +168,12 @@ sc["min_seconds_between_actions"] = int("""$MIN_SECONDS_BETWEEN_ACTIONS""")
 sc["deadband_temperature_c"] = float("""$DEADBAND_T""")
 sc["deadband_humidity_pct"] = float("""$DEADBAND_H""")
 sc["deadband_brightness_pct"] = float("""$DEADBAND_B""")
+# v1.4.0 knobs — used to be silently swallowed so edits in the
+# Configuration form had no effect.  SmartControlConfig.from_dict
+# ignores unknown keys, so writing them unconditionally is safe
+# across downgrade scenarios too.
+sc["wind_down_minutes"] = int("""$WIND_DOWN_MINUTES""")
+sc["min_stage_dwell_seconds"] = float("""$MIN_STAGE_DWELL_SECONDS""")
 
 learner = ha.setdefault("preference_learner", {})
 learner["exploration_rate"] = float("""$EXPLORATION_RATE""")

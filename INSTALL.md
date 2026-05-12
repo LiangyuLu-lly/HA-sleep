@@ -12,9 +12,10 @@ no pip, no Long-Lived Access Token to generate.
 6. Start
 ```
 
-> v1.3.0 lean image: no TensorFlow, no PyWavelets, no h5py — the
-> Pi 4B build pulls ~10 MB of wheels from piwheels and ends up around
-> 20 MB on disk.  The add-on does **not** ship a model file any more;
+> v1.6.0 lean image: no TensorFlow, no PyWavelets, no h5py, no
+> numpy either — the only Python wheel we pull is `aiohttp`, so the
+> Pi 4B build finishes in ~1 min and the image ends up around 15 MB
+> on disk.  The add-on does **not** ship a model file any more;
 > stages come from an HA entity you already own.
 
 ---

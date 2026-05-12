@@ -4,7 +4,9 @@ Every night, the smart service records a *sleep session* — a triple of
 
 * environment parameters that were active during the session
   (temperature, humidity, brightness, fan speed),
-* the sleep-stage time-series produced by the CNN-BiLSTM model,
+* the sleep-stage time-series streamed from the user's HA stage
+  entity (Mi Band / Apple Watch / sleep_as_android / mmWave radar /
+  ...) via :class:`src.external_stage_subscriber.ExternalStageSubscriber`,
 * a derived **sleep quality score**.
 
 From this rolling history we then estimate, for each future stage, the

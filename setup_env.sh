@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "========================================"
-echo "CNN-BiLSTM Sleep Algorithm Setup"
+echo "Sleep Classifier — dev environment setup"
 echo "========================================"
 echo
 

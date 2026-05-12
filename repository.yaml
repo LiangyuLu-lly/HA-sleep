@@ -6,6 +6,6 @@
 # of ./addons/ as an installable add-on.
 #
 # Reference: https://developers.home-assistant.io/docs/add-ons/repository
-name: CNN-BiLSTM Sleep Model Add-ons
+name: Sleep Classifier Add-ons
 url: https://github.com/LiangyuLu-lly/HA-sleep
 maintainer: LiangyuLu-lly <liangyulu781@gmail.com>

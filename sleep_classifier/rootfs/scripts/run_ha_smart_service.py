@@ -2,19 +2,25 @@
 
 Pipeline (single ``asyncio`` loop):
 
-1. **Connect** to HA REST API using a Long-Lived Access Token.
-2. **Discover** entities: physiological sensors (HR, motion), environment
-   sensors (temperature, humidity, illuminance), and actionable devices
-   (lights, climates, fans, humidifiers).
-3. **Subscribe** to ``state_changed`` over the WebSocket.  Whenever a HR or
-   motion sensor publishes a new value, push the sample into the inference
-   engine.
-4. Every ``infer_interval`` seconds, run the CNN-BiLSTM and produce a stage
-   prediction.  The :class:`SmartEnvironmentController` plans + executes the
-   matching HA service calls.
+1. **Connect** to HA REST API (Long-Lived Access Token in dev,
+   Supervisor proxy token in Add-on mode).
+2. **Discover** entities: the bound sleep-stage sensor, environment
+   sensors (temperature, humidity, illuminance), and actionable
+   devices (lights, climates, fans, humidifiers, media_players).
+3. **Subscribe** to ``state_changed`` over the WebSocket.  The
+   configured sleep-stage entity is routed through
+   :class:`ExternalStageSubscriber` (with debounce); environment
+   sensors snapshot into ``self.last_env``; the optional feedback
+   ``input_number`` is forwarded to the
+   :class:`SubjectiveFeedbackListener`.
+4. Every ``infer_interval`` seconds, read the current (debounced)
+   stage from the subscriber.  The
+   :class:`SmartEnvironmentController` plans + executes the matching
+   HA service calls (per-stage deltas + per-actuator anticipation +
+   wind-down pre-cool).
 5. Every ``session_interval`` (default 30 min), persist a partial
-   :class:`SleepSession` so the learner gets ongoing reward signals; record
-   the final session on graceful shutdown.
+   :class:`SleepSession` so the learner gets ongoing reward signals;
+   record the final session on graceful shutdown.
 
 Run examples
 ------------
@@ -38,6 +44,7 @@ import argparse
 import asyncio
 import logging
 import os
+import random
 import signal
 import sys
 import time
@@ -48,8 +55,6 @@ from typing import Dict, List, Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-import numpy as np
 
 from training_config.config_loader import load_config
 from src.data_structures import SleepStage
@@ -388,11 +393,14 @@ class SmartSleepService:
                     exc, backoff,
                 )
             # Sleep with jitter, but bail out fast if a shutdown signal lands.
+            # ``random.uniform(-j, +j)`` is the textbook 1-line way to
+            # spread reconnects across the cluster; dropping numpy from
+            # this module means one less heavyweight import at startup.
             jitter = backoff * 0.2
             try:
                 await asyncio.wait_for(
                     self.stop_event.wait(),
-                    timeout=backoff + (jitter * (np.random.random() - 0.5) * 2.0),
+                    timeout=backoff + random.uniform(-jitter, jitter),
                 )
                 return
             except asyncio.TimeoutError:
@@ -459,11 +467,15 @@ class SmartSleepService:
                         time.time() - self.session_started_at,
                     )
                     if actions:
+                        # ``actions`` is a list of ControlAction dataclasses
+                        # (see src/smart_environment_controller.py), not a
+                        # list of dicts — calling .get() on a dataclass
+                        # raises AttributeError.  A dataclass fallback is
+                        # robust against any future field renames.
                         first = actions[0]
                         summary = (
-                            f"{first.get('domain', '?')}."
-                            f"{first.get('service', '?')} → "
-                            f"{first.get('entity_id', '?')}"
+                            f"{first.domain}.{first.service} → "
+                            f"{first.entity_id}"
                         )
                         await self.publisher.publish_last_action(
                             summary, executed=not self.ctrl_cfg.dry_run,

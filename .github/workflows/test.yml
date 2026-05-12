@@ -46,19 +46,19 @@ jobs:
           cache: "pip"
           cache-dependency-path: |
             requirements-runtime.txt
-            requirements-train.txt
+            requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install runtime deps (numpy/scipy/h5py/PyWavelets/aiohttp) —
-          # these are what production actually uses.
-          pip install -r requirements-runtime.txt
-          # Install dev/test extras separately so we never accidentally
-          # ship TensorFlow into the add-on image.
-          pip install pytest pytest-asyncio pytest-timeout hypothesis
+          # requirements.txt already brings in pytest + pytest-asyncio +
+          # pytest-timeout on top of runtime deps (aiohttp + numpy), so
+          # installing it covers both test and runtime layers.  No
+          # TensorFlow / scipy / h5py / hypothesis here: v1.3.0 removed
+          # them and the grep for @given / strategies is empty.
+          pip install -r requirements.txt
 
-      - name: Run pytest (no TF — numpy fallback path)
+      - name: Run pytest
         run: pytest tests/ --timeout=60 -q
 
   # -------------------------------------------------------------------- #

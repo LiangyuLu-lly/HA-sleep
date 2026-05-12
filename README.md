@@ -154,7 +154,7 @@ v1.4.0 addresses all three:
 | **v1.5.0** | Per-stage env *deltas* are now learned too — not just the midpoint. New `env_by_stage` field per session, decay-weighted weighted-median delta per field, ESS guard against noisy starts, per-field merge with clinical fallback, new `sensor.sleep_classifier_per_stage_deltas` exposing the controller's `clinical → learning → personalised` graduation. |
 | **v1.4.0** | Real-world robustness pass: per-actuator anticipation lets the AC lead the user by ~15 min; wind-down pre-cool starts dimming + cooling before the learned bedtime; stage debouncing filters 30-second wearable blips. |
 | **v1.3.1** | Per-stage adaptation preserved when learning kicks in: AWAKE / LIGHT / DEEP / REM each apply a clinical delta on top of the learned baseline. Safe-range clamps prevent runaway setpoints. |
-| **v1.3.0** | Local CNN-BiLSTM dropped — the add-on now subscribes to any HA sleep-stage sensor.  Image ~20 MB. Preference learner gains recorded_at + exponential decay, weekday/weekend bedtime split, current-context k-NN, and a JSON explainability panel; 4 new HA sensors mirror the reasoning. |
+| **v1.3.0** | Local CNN-BiLSTM dropped — the add-on now subscribes to any HA sleep-stage sensor.  Image ~20 MB (trimmed further to ~15 MB in v1.6.0 after numpy was dropped). Preference learner gains recorded_at + exponential decay, weekday/weekend bedtime split, current-context k-NN, and a JSON explainability panel; 4 new HA sensors mirror the reasoning. |
 
 Older release notes live in the git tag history (e.g. `git show v1.2.3`
 for the last release that bundled the local CNN-BiLSTM model).

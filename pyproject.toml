@@ -17,8 +17,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sleep-classifier"
-version = "1.1.0"
-description = "CNN-BiLSTM sleep stage classifier with closed-loop HA integration"
+version = "1.6.0"
+description = "Home Assistant Add-on: learns your ideal sleep environment from HA sleep-stage history and adapts the bedroom across the night"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -34,9 +34,11 @@ testpaths = ["tests"]
 # decorator that was easy to forget.
 asyncio_mode = "auto"
 # Surface unhandled coroutines and resource warnings during local dev.
+# v1.3.0 后不再依赖 tensorflow / keras，原先用来屏蔽它们
+# DeprecationWarning 的过滤规则已失效——只保留仍会出现的
+# ``PytestUnraisableExceptionWarning``（aiohttp 在事件循环
+# 关闭时偶发会触发）。
 filterwarnings = [
-    "ignore::DeprecationWarning:tensorflow.*",
-    "ignore::DeprecationWarning:keras.*",
     "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 # Sane defaults so a bare ``pytest`` doesn't hang on a stuck async test.

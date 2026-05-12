@@ -305,3 +305,72 @@ class TestPersistSession:
         assert len(sessions) == 1
         # Subjective '5/5' should pull score up; check note records it.
         assert "subjective=5.0" in (sessions[0].notes or "")
+
+
+# ---------------------------------------------------------------------------
+# _task_inference_loop — last_action formatting regression
+# ---------------------------------------------------------------------------
+
+
+class TestLastActionFormatting:
+    """``actions`` is a list of :class:`ControlAction` dataclasses.
+
+    Pre-fix the orchestrator called ``first.get('domain', '?')`` on it,
+    which raises ``AttributeError`` on every non-empty plan.  A test
+    that asserts ``publish_last_action`` is awaited with the expected
+    string both locks in the fix and guards against future refactors
+    that might switch the dataclass to a dict (or vice versa) without
+    updating the formatter.
+    """
+
+    async def test_control_action_is_formatted_by_attribute_access(
+        self, service_cls, tmp_path, ha_client, stage_enum,
+    ) -> None:
+        from src.smart_environment_controller import ControlAction
+        import asyncio
+
+        cfg = _write_config(tmp_path, natural={})
+        svc = service_cls(_args(cfg))
+
+        # Wire in a publisher that records what we'd have pushed to HA.
+        svc.publisher = MagicMock()
+        svc.publisher.publish_stage = AsyncMock()
+        svc.publisher.publish_duration = AsyncMock()
+        svc.publisher.publish_last_action = AsyncMock()
+
+        # Stub engine + controller so the loop runs exactly one tick
+        # before stop_event fires.  Controller returns a real
+        # ControlAction so we exercise the dataclass formatting path.
+        engine = MagicMock()
+        engine.infer = MagicMock(
+            return_value=(stage_enum.LIGHT, 0.9),
+        )
+        action = ControlAction(
+            domain="climate",
+            service="set_temperature",
+            entity_id="climate.bedroom_ac",
+            data={"temperature": 20.0},
+            reason="test",
+        )
+        controller = MagicMock()
+        controller.apply = AsyncMock(return_value=[action])
+
+        # Short infer_interval so the wait_for returns quickly via
+        # stop_event rather than sleeping the whole 30 s default.
+        svc.args.infer_interval = 0.05
+
+        async def _stop_soon():
+            # Give the loop one tick, then release it.
+            await asyncio.sleep(0.01)
+            svc.stop_event.set()
+
+        await asyncio.gather(
+            svc._task_inference_loop(engine, controller, ha_client),
+            _stop_soon(),
+        )
+
+        svc.publisher.publish_last_action.assert_awaited()
+        call = svc.publisher.publish_last_action.await_args
+        # Positional arg is the formatted summary string.
+        assert call.args[0] == "climate.set_temperature → climate.bedroom_ac"
+        assert call.kwargs["executed"] is True

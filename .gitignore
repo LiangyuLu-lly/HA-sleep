@@ -41,11 +41,13 @@ htmlcov/
 .tox/
 .hypothesis/
 
-# Data and Models
+# Local dev data the training-era modules used to generate.  v1.3.0
+# stopped shipping / training any local model, so these patterns are
+# kept only as a safety net in case an old workflow drops a binary
+# into the repo; the canonical contents of models/ is a single
+# .gitkeep and data/ is now just a dev cache.
 data/*.edf
 data/*.csv
-models/*.h5
-models/*.hdf5
 
 # Logs
 *.log
