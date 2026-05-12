@@ -12,6 +12,57 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.6.3] — 2026-05-13
+
+The "落地" pass — three real-world failure modes the v1.6.2 feature
+list glossed over, each of which would silently make the add-on
+misbehave on its first deployed night.
+
+### Fixed
+
+- **Session never reset.** `session_id`, `session_started_at`,
+  `stage_counts`, `stage_sequence`, and `env_by_stage` were initialised
+  once in `__init__` and never cleared, so an add-on running for a
+  month produced one 30-day-long "session".  Every night's quality
+  score was the cumulative average since boot, SE/WASO/SOL were
+  meaningless, and the learner got the same mishmash of evidence
+  every time.  Replaced with a proper onset/wake state machine:
+  sessions start after `session_onset_dwell_seconds` of continuous
+  non-AWAKE (default 300 s = 5 min, the AASM PSG criterion) and end
+  after `session_wake_dwell_seconds` of continuous AWAKE (default
+  600 s = 10 min, long enough that a brief stir doesn't close it).
+  On session end `_persist_session(partial=False)` runs followed by
+  `_reset_session_state()`, rotating to a fresh session id + zeroing
+  all per-session accumulators.
+- **Dead stage source locked the bedroom.** If the bound wearable /
+  radar stopped reporting (dead battery, user took the watch off),
+  `ExternalStageSubscriber.current()` kept returning the last stage
+  forever.  The controller would then hold whatever setpoint was
+  last inferred — e.g. lock the AC at DEEP's 18 °C for the whole
+  day.  The inference loop now checks `engine.is_stale()` each
+  tick: while stale it publishes the diagnostic stage sensor (so
+  Lovelace shows "not reporting") but skips stage counting, skips
+  wind-down substitution, and skips `controller.apply()` entirely.
+  Recovery transitions are logged once per edge (one WARN on going
+  stale, one INFO on coming back live).
+
+### Added
+
+- `home_assistant.session_lifecycle` config block with
+  `onset_dwell_seconds` and `wake_dwell_seconds` so power users can
+  tighten or loosen the thresholds without editing code.
+- 6 new runtime tests in `tests/test_smart_sleep_service_runtime.py`:
+  `TestSessionLifecycle` (4 cases covering reset, onset threshold,
+  brief-stir tolerance, sustained-AWAKE wake-up) and
+  `TestStaleStageSourceGuard` (2 cases covering `apply()` skip and
+  log deduplication on recovery).
+
+### Changed
+
+- Inference log line now appends `[pre-onset]` while outside a
+  session, so users can see in the log why their first minutes of
+  being in bed aren't being recorded.
+
 ## [1.6.2] — 2026-05-12
 
 ### Added
@@ -210,7 +261,8 @@ Tracked items live in `docs/BACKLOG.md`.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.2...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.3...HEAD
+[1.6.3]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.0...v1.6.2
 [1.6.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.4.0...v1.5.0

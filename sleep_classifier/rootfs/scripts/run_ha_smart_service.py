@@ -178,6 +178,22 @@ class SmartSleepService:
         if args.dry_run:
             self.ctrl_cfg.dry_run = True
 
+        # v1.6.3 — session-lifecycle knobs.  Read from
+        # ``home_assistant.session_lifecycle`` so they can be surfaced
+        # in the add-on Configuration UI later without changing the
+        # dataclass shape.  Defaults derive from the literature:
+        # 5 min of non-AWAKE persistence is a standard sleep-onset
+        # criterion in PSG scoring (AASM §2); 10 min of continuous
+        # AWAKE is long enough that a stir-then-back-to-sleep doesn't
+        # close the session prematurely.
+        lifecycle_cfg = ha_cfg.get("session_lifecycle", {})
+        self._session_onset_dwell_seconds: float = float(
+            lifecycle_cfg.get("onset_dwell_seconds", 300.0),
+        )
+        self._session_wake_dwell_seconds: float = float(
+            lifecycle_cfg.get("wake_dwell_seconds", 600.0),
+        )
+
         # --- Natural-sleep modules (v1.2.0) ----------------------------- #
         # All of these are *optional*: if the user didn't configure the
         # relevant fields we leave the attribute as None and the main
@@ -273,6 +289,25 @@ class SmartSleepService:
         # Track the last stage we sampled so we don't overwrite the
         # snapshot on every tick — only on genuine stage transitions.
         self._last_sampled_stage: Optional[SleepStage] = None
+
+        # v1.6.3 — proper session-lifecycle bookkeeping.  Previously the
+        # five fields above were initialised *once* in __init__ and never
+        # reset, so an add-on running for a month produced one
+        # 30-day-long "session" with a meaningless quality score.  The
+        # real semantics are:
+        #   * A session STARTS the first time we observe a non-AWAKE
+        #     stage that holds for >= ``session_onset_dwell_seconds``.
+        #   * A session ENDS after ``session_wake_dwell_seconds`` of
+        #     continuous AWAKE.
+        # While ``_in_session`` is False we still tick the controller
+        # (so setpoints track daytime comfort too) but we don't append
+        # to stage_sequence or stage_counts and don't persist anything.
+        self._in_session: bool = False
+        self._consecutive_awake_ticks: int = 0
+        self._consecutive_non_awake_ticks: int = 0
+        # Published once per staleness-state change so the log doesn't
+        # flood when a wearable is off for 8 hours.
+        self._stage_source_was_stale: bool = False
         # v1.6.0 — recommend_bedtime() runs a weighted-median over
         # every session in history.  At the default 30 s inference
         # cadence with 60 sessions that's ~120 K redundant computes a
@@ -421,19 +456,82 @@ class SmartSleepService:
         try:
             while not self.stop_event.is_set():
                 stage, conf = engine.infer()
-                self.stage_counts[stage.name] = self.stage_counts.get(stage.name, 0) + 1
-                self.stage_sequence.append(stage)
-                # v1.5.0 — snapshot the env at every stage *entry* so
-                # the preference learner can later compute personalised
-                # AWAKE/LIGHT/DEEP/REM deltas.  Guarded by a transition
-                # check so we don't keep overwriting the same stage's
-                # snapshot every tick (we want the env *as the user
-                # entered* the stage, not as they leave it).
-                self._track_per_stage_env(stage)
+
+                # v1.6.3 — stale stage-source guard.  If the bound HA
+                # entity hasn't reported a new state in a long time
+                # (wearable dead, integration broken, user took the
+                # watch off), the subscriber keeps returning the last
+                # known stage forever.  Without this guard the
+                # controller would lock the bedroom into e.g. DEEP
+                # setpoints for a whole day; the session-lifecycle
+                # state machine would miss the wake transition and
+                # never close the session.  When stale we:
+                #   1) skip updating stage_counts / stage_sequence —
+                #      we don't know what's really happening;
+                #   2) skip the effective-stage substitution + apply()
+                #      — don't push new setpoints based on stale data;
+                #   3) still publish to HA (with is_stale=true) so the
+                #      user sees "tracker not reporting" on the chip;
+                #   4) log once per edge transition, not every tick.
+                is_stale = engine.is_stale()
+                if is_stale and not self._stage_source_was_stale:
+                    logger.warning(
+                        "Stage source %s has not updated for > %d s; "
+                        "pausing control loop until the tracker comes "
+                        "back online.",
+                        engine.stage_entity_id,
+                        int(engine._stale_after),
+                    )
+                    self._stage_source_was_stale = True
+                elif not is_stale and self._stage_source_was_stale:
+                    logger.info(
+                        "Stage source %s is live again — resuming control.",
+                        engine.stage_entity_id,
+                    )
+                    self._stage_source_was_stale = False
+
+                if is_stale:
+                    # Still publish the diagnostic sensor so HA shows
+                    # the staleness, but skip every mutation.
+                    if self.publisher is not None:
+                        await self.publisher.publish_stage(
+                            stage, conf,
+                            env_temperature_c=self.last_env.temperature_c,
+                            env_humidity_pct=self.last_env.humidity_pct,
+                            env_brightness_pct=self.last_env.brightness_pct,
+                        )
+                    try:
+                        await asyncio.wait_for(
+                            self.stop_event.wait(),
+                            timeout=self.args.infer_interval,
+                        )
+                        return     # stop_event fired — exit the task
+                    except asyncio.TimeoutError:
+                        continue   # next tick — re-check is_stale
+
+                # v1.6.3 — session lifecycle state machine.  Runs BEFORE
+                # counts are updated so the first tick past onset/wake
+                # doesn't bleed into the next session.  Note that
+                # _maybe_advance_session_lifecycle may call
+                # _persist_session + _reset_session_state mid-tick
+                # when it detects a wake.
+                self._maybe_advance_session_lifecycle(stage, controller)
+
+                if self._in_session:
+                    self.stage_counts[stage.name] = (
+                        self.stage_counts.get(stage.name, 0) + 1
+                    )
+                    self.stage_sequence.append(stage)
+                    # v1.5.0 — snapshot the env at every stage *entry*
+                    # so the preference learner can later compute
+                    # personalised AWAKE/LIGHT/DEEP/REM deltas.
+                    self._track_per_stage_env(stage)
+
                 logger.info(
-                    "infer stage=%s conf=%.2f  env(T=%s H=%s)",
+                    "infer stage=%s conf=%.2f  env(T=%s H=%s)%s",
                     stage.name, conf,
                     self.last_env.temperature_c, self.last_env.humidity_pct,
+                    "" if self._in_session else "  [pre-onset]",
                 )
                 # v1.4.0 — wind-down substitution.  When the user is
                 # still AWAKE but we are within `wind_down_minutes` of
@@ -919,6 +1017,103 @@ class SmartSleepService:
             )
         except Exception as exc:    # noqa: BLE001
             logger.warning("Soundscape control failed: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Session lifecycle (v1.6.3)                                         #
+    # ------------------------------------------------------------------ #
+    #
+    # Previously everything in ``__init__`` under "Runtime state" was
+    # a one-shot assignment — the orchestrator would start a "session"
+    # on boot and keep adding to its stage_counts until process exit,
+    # producing one 30-day-long session per month of uptime.  The real
+    # semantics of a "session" are:
+    #
+    #   * STARTS: the first time the debounced stage stays non-AWAKE
+    #     for >= ``onset_dwell_seconds`` (default 5 min).  That's the
+    #     standard PSG sleep-onset criterion.
+    #   * ENDS:   after ``wake_dwell_seconds`` of continuous AWAKE
+    #     (default 10 min) — long enough that a brief nighttime stir
+    #     followed by falling back asleep doesn't close the session.
+    #
+    # Outside a session the controller still runs (so daytime comfort
+    # is still adjusted by deadband + learned baseline), but:
+    #
+    #   - stage_counts / stage_sequence / env_by_stage are NOT updated
+    #   - _persist_session does nothing
+    #   - the quality score for a session is therefore bounded by what
+    #     actually happened during that session, not all of last month
+
+    def _reset_session_state(self) -> None:
+        """Wipe per-session accumulators back to a fresh-session baseline.
+
+        Called after ``_persist_session(partial=False)`` finalises a
+        session, so the next sleep starts with zero'd counts + a new
+        session id.  ``last_env`` is intentionally preserved because
+        environment sensors live on a different timescale than
+        sessions — the latest T/RH/lux reading is still valid for
+        tomorrow night.
+        """
+        self.session_id = uuid.uuid4().hex[:8]
+        self.session_started_at = time.time()
+        self.stage_counts = {
+            "AWAKE": 0, "LIGHT": 0, "DEEP": 0, "REM": 0,
+        }
+        self.stage_sequence = []
+        self.env_by_stage = {}
+        self._last_sampled_stage = None
+        self._in_session = False
+        self._consecutive_awake_ticks = 0
+        self._consecutive_non_awake_ticks = 0
+
+    def _maybe_advance_session_lifecycle(
+        self,
+        stage: SleepStage,
+        controller: "SmartEnvironmentController",
+    ) -> None:
+        """Run the onset / wake-up state machine one tick.
+
+        Must be called *every* inference tick (not only when the user
+        is inside a session) so dwell counters track correctly across
+        AWAKE ↔ non-AWAKE transitions.  Returns nothing; mutates
+        ``_in_session`` and — on session end — calls
+        :meth:`_persist_session` + :meth:`_reset_session_state`.
+        """
+        interval = max(1.0, float(self.args.infer_interval))
+        # Convert dwell thresholds from seconds to tick counts so
+        # integer-comparisons are cheap.
+        onset_ticks = max(1, int(self._session_onset_dwell_seconds / interval))
+        wake_ticks = max(1, int(self._session_wake_dwell_seconds / interval))
+
+        if stage is SleepStage.AWAKE:
+            self._consecutive_awake_ticks += 1
+            self._consecutive_non_awake_ticks = 0
+        else:
+            self._consecutive_non_awake_ticks += 1
+            self._consecutive_awake_ticks = 0
+
+        if not self._in_session:
+            # Onset detection — enough non-AWAKE dwell = session began.
+            if self._consecutive_non_awake_ticks >= onset_ticks:
+                self._in_session = True
+                # Back-date the session start so we don't lose the
+                # onset dwell window's worth of data from the record.
+                self.session_started_at = time.time() - (
+                    self._consecutive_non_awake_ticks * interval
+                )
+                logger.info(
+                    "Session %s started (non-AWAKE held for >= %d s).",
+                    self.session_id, int(self._session_onset_dwell_seconds),
+                )
+            return
+
+        # Already in a session — check for wake-up.
+        if self._consecutive_awake_ticks >= wake_ticks:
+            logger.info(
+                "Session %s ending (AWAKE held for >= %d s).",
+                self.session_id, int(self._session_wake_dwell_seconds),
+            )
+            self._persist_session(controller, partial=False)
+            self._reset_session_state()
 
     def _track_per_stage_env(self, raw_stage: SleepStage) -> None:
         """Record the current env as the snapshot for ``raw_stage``

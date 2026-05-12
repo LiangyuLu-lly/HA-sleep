@@ -18,6 +18,7 @@ can assert on which service calls were issued.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -345,6 +346,11 @@ class TestLastActionFormatting:
         engine.infer = MagicMock(
             return_value=(stage_enum.LIGHT, 0.9),
         )
+        # v1.6.3 — the inference loop skips everything when the stage
+        # source goes stale, so we must force it to live for this
+        # test's happy-path assertions to fire.  capability_stats is
+        # also consulted now (v1.6.2), so stub it too.
+        engine.is_stale = MagicMock(return_value=False)
         action = ControlAction(
             domain="climate",
             service="set_temperature",
@@ -354,6 +360,7 @@ class TestLastActionFormatting:
         )
         controller = MagicMock()
         controller.apply = AsyncMock(return_value=[action])
+        controller.capability_stats = MagicMock(return_value={})
 
         # Short infer_interval so the wait_for returns quickly via
         # stop_event rather than sleeping the whole 30 s default.
@@ -374,3 +381,215 @@ class TestLastActionFormatting:
         # Positional arg is the formatted summary string.
         assert call.args[0] == "climate.set_temperature → climate.bedroom_ac"
         assert call.kwargs["executed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle + stale-source guard (v1.6.3)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionLifecycle:
+    """v1.6.3 — a 'session' now has proper onset / wake detection.
+
+    Before this release, stage_counts / stage_sequence / env_by_stage
+    were initialised once in ``__init__`` and never reset, so an
+    add-on running for a month reported one 30-day 'session' with a
+    meaningless quality score.  These tests lock in the new semantics.
+    """
+
+    async def test_reset_rotates_session_id_and_zeros_counts(
+        self, service_cls, tmp_path, stage_enum,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=True)
+        svc = service_cls(_args(cfg))
+
+        svc.stage_counts = {"AWAKE": 5, "LIGHT": 30, "DEEP": 12, "REM": 8}
+        svc.stage_sequence = [stage_enum.LIGHT] * 30
+        svc.env_by_stage = {"LIGHT": object()}
+        svc._in_session = True
+        svc._consecutive_awake_ticks = 7
+        original_id = svc.session_id
+
+        svc._reset_session_state()
+
+        assert svc.session_id != original_id
+        assert svc.stage_counts == {
+            "AWAKE": 0, "LIGHT": 0, "DEEP": 0, "REM": 0,
+        }
+        assert svc.stage_sequence == []
+        assert svc.env_by_stage == {}
+        assert svc._in_session is False
+        assert svc._consecutive_awake_ticks == 0
+
+    async def test_onset_requires_sustained_non_awake(
+        self, service_cls, tmp_path, stage_enum,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=True)
+        svc = service_cls(_args(cfg))
+        svc.args.infer_interval = 60.0
+        svc._session_onset_dwell_seconds = 300.0      # = 5 ticks
+        controller = MagicMock()
+
+        # 3 ticks of LIGHT isn't enough.
+        for _ in range(3):
+            svc._maybe_advance_session_lifecycle(
+                stage_enum.LIGHT, controller,
+            )
+        assert svc._in_session is False
+
+        # Two more and we cross the 5-tick threshold.
+        for _ in range(2):
+            svc._maybe_advance_session_lifecycle(
+                stage_enum.LIGHT, controller,
+            )
+        assert svc._in_session is True
+
+    async def test_brief_awake_stir_does_not_close_session(
+        self, service_cls, tmp_path, stage_enum,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=True)
+        svc = service_cls(_args(cfg))
+        svc.args.infer_interval = 60.0
+        svc._session_wake_dwell_seconds = 600.0       # = 10 ticks
+        # Pretend a session is already open.
+        svc._in_session = True
+        controller = MagicMock()
+
+        # 5 ticks AWAKE (under threshold) → still in session.
+        for _ in range(5):
+            svc._maybe_advance_session_lifecycle(
+                stage_enum.AWAKE, controller,
+            )
+        assert svc._in_session is True
+
+        # A LIGHT tick resets the AWAKE counter.
+        svc._maybe_advance_session_lifecycle(
+            stage_enum.LIGHT, controller,
+        )
+        assert svc._consecutive_awake_ticks == 0
+        # Even another 9 AWAKE ticks (not 10) doesn't close.
+        for _ in range(9):
+            svc._maybe_advance_session_lifecycle(
+                stage_enum.AWAKE, controller,
+            )
+        assert svc._in_session is True
+
+    async def test_sustained_awake_persists_and_resets_session(
+        self, service_cls, tmp_path, stage_enum,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=True)
+        svc = service_cls(_args(cfg))
+        svc.args.infer_interval = 60.0
+        svc._session_wake_dwell_seconds = 600.0       # = 10 ticks
+        svc._in_session = True
+        svc.stage_counts = {"AWAKE": 1, "LIGHT": 50, "DEEP": 10, "REM": 5}
+        svc.stage_sequence = [stage_enum.LIGHT] * 50
+        controller = MagicMock()
+        controller.feedback_score = MagicMock()
+        original_id = svc.session_id
+
+        # 10 AWAKE ticks → triggers wake-up.
+        for _ in range(10):
+            svc._maybe_advance_session_lifecycle(
+                stage_enum.AWAKE, controller,
+            )
+
+        # Session was persisted (learner records it) + state reset.
+        assert svc.learner is not None
+        assert len(svc.learner.sessions()) == 1
+        assert svc._in_session is False
+        assert svc.session_id != original_id
+        assert svc.stage_counts == {
+            "AWAKE": 0, "LIGHT": 0, "DEEP": 0, "REM": 0,
+        }
+
+
+class TestStaleStageSourceGuard:
+    """v1.6.3 — a dead wearable must NOT lock the bedroom into the
+    last-known stage's setpoints forever.
+    """
+
+    async def test_stale_skips_controller_apply(
+        self, service_cls, tmp_path, ha_client, stage_enum,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=False)
+        svc = service_cls(_args(cfg))
+        svc.args.infer_interval = 0.05
+
+        svc.publisher = MagicMock()
+        svc.publisher.publish_stage = AsyncMock()
+        svc.publisher.publish_duration = AsyncMock()
+        svc.publisher.publish_last_action = AsyncMock()
+
+        engine = MagicMock()
+        engine.infer = MagicMock(
+            return_value=(stage_enum.DEEP, 0.9),
+        )
+        engine.is_stale = MagicMock(return_value=True)
+        engine.stage_entity_id = "sensor.watch"
+        engine._stale_after = 1800.0
+
+        controller = MagicMock()
+        controller.apply = AsyncMock(return_value=[])
+        controller.capability_stats = MagicMock(return_value={})
+
+        async def _stop_soon():
+            await asyncio.sleep(0.02)
+            svc.stop_event.set()
+
+        await asyncio.gather(
+            svc._task_inference_loop(engine, controller, ha_client),
+            _stop_soon(),
+        )
+
+        # Controller.apply was NEVER awaited because the loop bailed
+        # out of every tick at the stale-guard branch.
+        controller.apply.assert_not_awaited()
+        # But we did publish the stage sensor so the user can see
+        # "stale" on their Lovelace dashboard.
+        svc.publisher.publish_stage.assert_awaited()
+        # last_action must NOT have been re-awaited with stale data.
+        svc.publisher.publish_last_action.assert_not_awaited()
+
+    async def test_live_source_resumes_after_stale(
+        self, service_cls, tmp_path, ha_client, stage_enum,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=False)
+        svc = service_cls(_args(cfg))
+        svc.args.infer_interval = 0.05
+        svc._stage_source_was_stale = True    # pretend we just recovered
+
+        svc.publisher = MagicMock()
+        svc.publisher.publish_stage = AsyncMock()
+        svc.publisher.publish_duration = AsyncMock()
+        svc.publisher.publish_last_action = AsyncMock()
+
+        engine = MagicMock()
+        engine.infer = MagicMock(
+            return_value=(stage_enum.LIGHT, 0.9),
+        )
+        engine.is_stale = MagicMock(return_value=False)
+        engine.stage_entity_id = "sensor.watch"
+
+        controller = MagicMock()
+        controller.apply = AsyncMock(return_value=[])
+        controller.capability_stats = MagicMock(return_value={})
+
+        async def _stop_soon():
+            await asyncio.sleep(0.02)
+            svc.stop_event.set()
+
+        with caplog.at_level("INFO"):
+            await asyncio.gather(
+                svc._task_inference_loop(engine, controller, ha_client),
+                _stop_soon(),
+            )
+
+        # Recovery transition was logged exactly once.
+        recovery_logs = [
+            r for r in caplog.records
+            if "live again" in r.message
+        ]
+        assert len(recovery_logs) == 1
+        assert svc._stage_source_was_stale is False
