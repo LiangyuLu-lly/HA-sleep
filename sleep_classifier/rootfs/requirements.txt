@@ -1,11 +1,16 @@
-# Default dev/CI install — pulls in everything (training + runtime + tests).
+# Default dev / CI install — runtime deps plus dev-time test tooling.
 #
-# Deployment layers (smallest → largest):
-#   * requirements-runtime.txt   — numpy-only inference  (~30 MB image)
-#   * requirements-train.txt     — adds TensorFlow/Keras + pytest/hypothesis
-#   * requirements.txt           — convenience alias for requirements-train.txt
+# Two deployment layers:
+#   * requirements-runtime.txt — minimal aiohttp + numpy; shipped in
+#     the add-on image (~10 MB of wheels).
+#   * requirements.txt (this file) — adds pytest + pytest-asyncio +
+#     pytest-timeout for running the test suite on a workstation.
 #
-# The Pi 4B add-on intentionally installs ONLY requirements-runtime.txt to
-# keep the image lean.  Numerical parity with the Keras path is enforced
-# by tests/test_numpy_keras_equivalence.py.
--r requirements-train.txt
+# v1.3.0 simplification: there is no longer a ``requirements-train.txt``
+# because the local CNN-BiLSTM model + its TensorFlow training pipeline
+# were removed in favour of subscribing to an existing HA sleep-stage
+# entity.  The Pi 4B add-on installs only ``requirements-runtime.txt``.
+-r requirements-runtime.txt
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-timeout>=2.2.0
