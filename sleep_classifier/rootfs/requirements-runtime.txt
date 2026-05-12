@@ -1,23 +1,20 @@
-# Runtime-only dependencies for the lightweight HA add-on / deployment.
+# Runtime-only dependencies for the v1.3.0 add-on.
 #
-# IMPORTANT
-# ---------
-# This file is consumed by the add-on Dockerfile to build a TensorFlow-free
-# image (~30 MB instead of ~650 MB).  Adding anything that pulls in TF
-# transitively here defeats the purpose.
+# Design notes
+# ------------
+# Since v1.3.0 the add-on no longer runs a local sleep-stage classifier —
+# it subscribes to a stage entity the user has already built in HA.  The
+# runtime image therefore needs none of the heavy scientific stack:
 #
-# Required invariant: ``import src.inference_pipeline`` must succeed using
-# only the packages listed below.  The Keras path inside cnn_extractor /
-# bilstm_analyzer / sleep_classifier silently degrades to the numpy fallback
-# when TENSORFLOW_AVAILABLE is False; that fallback is what runs in
-# production on the Pi.
+#   * no ``scipy`` / ``h5py`` / ``PyWavelets`` — those were only needed by
+#     the deleted CNN/BiLSTM/wavelet pipeline.
+#   * no ``paho-mqtt`` — the MQTT bridge modules were deleted too; we
+#     talk to HA over the REST + WebSocket API exclusively.
+#   * ``numpy`` stays because a handful of utilities (e.g. sleep-debt
+#     computations) still rely on it, and it's ~2 MB so the savings
+#     wouldn't justify a numpy-less refactor.
 #
-# Numerical equivalence between the Keras path (used at training time) and
-# the numpy path (used at runtime) is guaranteed by
-# ``tests/test_numpy_keras_equivalence.py``.
-numpy>=1.24.0
-scipy>=1.11.0
-h5py>=3.9.0
-PyWavelets>=1.4.1
-paho-mqtt>=1.6.1
+# Required invariant: ``import src`` must succeed using only the packages
+# listed below.
 aiohttp>=3.9.0
+numpy>=1.24.0

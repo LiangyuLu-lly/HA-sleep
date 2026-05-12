@@ -24,6 +24,6 @@ build_from:
 # Image labels — picked up by HA Supervisor's UI badges.
 labels:
   org.opencontainers.image.title: "Sleep Classifier"
-  org.opencontainers.image.description: "CNN-BiLSTM sleep stage classifier with closed-loop smart home control"
+  org.opencontainers.image.description: "Closed-loop smart-home sleep automation: learns your ideal bedtime + bedroom environment from HA sleep-stage data"
   org.opencontainers.image.source: "https://github.com/LiangyuLu-lly/HA-sleep"
   org.opencontainers.image.licenses: "MIT"
