@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.3.1"
+version: "1.4.0"
 slug: sleep_classifier
 description: >-
   Closed-loop smart-home sleep automation.  Subscribes to any HA
@@ -79,6 +79,15 @@ options:
   deadband_temperature_c: 0.5
   deadband_humidity_pct: 5
   deadband_brightness_pct: 10
+  # v1.4.0 — robustness against real-world timing variability.
+  # min_stage_dwell_seconds: filter brief 30 s wearable blips
+  # (LIGHT → AWAKE → LIGHT) so the controller doesn't flap.
+  # wind_down_minutes: start pre-cooling the bedroom this many
+  # minutes before the *learned* bedtime — addresses AC's 15 min
+  # response time so the room is at LIGHT setpoint when the user
+  # actually lies down.  Set to 0 to disable.
+  min_stage_dwell_seconds: 60
+  wind_down_minutes: 30
   log_level: "info"
 
   # ---- Slot bindings: sensors -------------------------------------------
@@ -170,6 +179,8 @@ schema:
   deadband_temperature_c: float(0,5)
   deadband_humidity_pct: float(0,30)
   deadband_brightness_pct: float(0,50)
+  min_stage_dwell_seconds: int(0,900)
+  wind_down_minutes: int(0,120)
   log_level: list(debug|info|warning|error)
 
   # NOTE: each entity_id field accepts three forms:

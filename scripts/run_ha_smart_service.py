@@ -80,6 +80,7 @@ from src.sleep_state_publisher import SleepStatePublisher
 from src.smart_environment_controller import (
     SmartControlConfig,
     SmartEnvironmentController,
+    is_in_wind_down,
 )
 from src.smart_wake import (
     SmartWakePlanner,
@@ -400,7 +401,21 @@ class SmartSleepService:
                     stage.name, conf,
                     self.last_env.temperature_c, self.last_env.humidity_pct,
                 )
-                actions = await controller.apply(stage, self.last_env)
+                # v1.4.0 — wind-down substitution.  When the user is
+                # still AWAKE but we are within `wind_down_minutes` of
+                # the learned bedtime, the controller treats them as
+                # already in LIGHT so the AC starts pre-cooling before
+                # they actually lie down.  The published sensor still
+                # reflects the truthful AWAKE — only the control path
+                # substitutes, so users aren't confused by a sensor
+                # that lies.
+                effective_stage = self._effective_control_stage(stage)
+                if effective_stage is not stage:
+                    logger.info(
+                        "  wind-down active: controlling as %s instead of %s",
+                        effective_stage.name, stage.name,
+                    )
+                actions = await controller.apply(effective_stage, self.last_env)
                 if actions:
                     logger.info("  → %d HA action(s) planned", len(actions))
 
@@ -574,8 +589,16 @@ class SmartSleepService:
         # The subscriber needs a non-empty entity_id to validate; in the
         # dry-run-without-binding path we substitute a placeholder so the
         # synthetic loop can still drive the controller.
+        #
+        # v1.4.0: the subscriber's dwell guard reads
+        # ``smart_control.min_stage_dwell_seconds`` from add-on config so
+        # users can tighten / loosen the debounce without rebuilding.
+        min_dwell = float(
+            getattr(self.ctrl_cfg, "min_stage_dwell_seconds", None) or 60.0
+        )
         engine = ExternalStageSubscriber(
             stage_entity_id=self.sleep_stage_source or "sensor.dry_run_stage",
+            min_stage_dwell_seconds=min_dwell,
         )
 
         # ----- Dry-run path: no HA ---------------------------------------
@@ -847,6 +870,37 @@ class SmartSleepService:
             )
         except Exception as exc:    # noqa: BLE001
             logger.warning("Soundscape control failed: %s", exc)
+
+    def _effective_control_stage(self, raw_stage: SleepStage) -> SleepStage:
+        """Map the *observed* stage to the stage the controller should act on.
+
+        Currently the only transformation is **wind-down substitution**:
+        if the user is still AWAKE but we're within
+        ``ctrl_cfg.wind_down_minutes`` of their learned bedtime,
+        substitute LIGHT so the bedroom is pre-cooled by the time they
+        actually lie down.  Any other stage passes through unchanged.
+
+        Returning ``raw_stage`` (identity) is the safe default whenever
+        the prerequisites for wind-down aren't met (no learner, no
+        history yet, or `wind_down_minutes=0`).
+        """
+        if raw_stage is not SleepStage.AWAKE:
+            return raw_stage
+        if self.learner is None or self.ctrl_cfg is None:
+            return raw_stage
+        wind_down_minutes = getattr(self.ctrl_cfg, "wind_down_minutes", 0) or 0
+        if wind_down_minutes <= 0:
+            return raw_stage
+        try:
+            bedtime = self.learner.recommend_bedtime(now=now_local())
+        except Exception as exc:    # noqa: BLE001
+            # If the learner can't decide a bedtime (e.g. corrupted
+            # history), don't pretend we're winding down.
+            logger.debug("wind-down: recommend_bedtime failed: %s", exc)
+            return raw_stage
+        if is_in_wind_down(now_local(), bedtime, wind_down_minutes):
+            return SleepStage.LIGHT
+        return raw_stage
 
     async def _publish_debt_and_bedtime(self) -> None:
         """Refresh sensor.sleep_classifier_debt_hours + recommended_bedtime."""

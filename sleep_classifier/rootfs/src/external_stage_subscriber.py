@@ -54,6 +54,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STALE_AFTER_SECONDS = 30 * 60     # 30 minutes
 
 
+# Stage-debouncing default (v1.4.0).  A new stage must hold for this many
+# seconds before we promote it to "stable" and let the controller act on
+# it.  Rationale: wearables routinely report 30-second AWAKE blips during
+# DEEP (a quick stir, not a real awakening); without a dwell guard the
+# add-on would flap the lights on, then off again 90 s later.  60 s is
+# short enough that a real transition (e.g. user actually wakes up) is
+# reflected within one inference tick, but long enough to absorb the
+# typical stir/cough false-positive.
+_DEFAULT_MIN_STAGE_DWELL_SECONDS = 60.0
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary maps                                                             #
 # ---------------------------------------------------------------------------
@@ -197,6 +208,7 @@ class ExternalStageSubscriber:
         *,
         stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
         initial_stage: SleepStage = SleepStage.LIGHT,
+        min_stage_dwell_seconds: float = _DEFAULT_MIN_STAGE_DWELL_SECONDS,
     ) -> None:
         if not stage_entity_id or not isinstance(stage_entity_id, str):
             raise ValueError(
@@ -204,11 +216,29 @@ class ExternalStageSubscriber:
             )
         self.stage_entity_id = stage_entity_id
         self._stale_after = float(stale_after_seconds)
+        self._min_dwell = max(0.0, float(min_stage_dwell_seconds))
 
         # Bootstrap state: until the first real update arrives we report
         # LIGHT @ low confidence so the controller stays conservative
         # (it won't aggressively crank the AC based on a default).
-        self._stage: SleepStage = initial_stage
+        #
+        # Two stage values are tracked since v1.4.0:
+        #   * ``_raw_stage``      — the most recent observation, no
+        #                           filtering.  Surfaces in :meth:`status`
+        #                           for debugging "why isn't the entity
+        #                           promoting?".
+        #   * ``_stable_stage``   — what :meth:`current` returns.  Only
+        #                           updates after a new candidate stage
+        #                           has held for ``min_stage_dwell``
+        #                           seconds, suppressing 30-second
+        #                           wearable blips.
+        self._raw_stage: SleepStage = initial_stage
+        self._stable_stage: SleepStage = initial_stage
+        # Candidate = the most recent *different* stage we've observed
+        # but haven't promoted yet.  None means "no pending candidate".
+        self._candidate_stage: Optional[SleepStage] = None
+        self._candidate_since_ts: float = 0.0
+
         self._confidence: float = 0.25
         self._last_update_ts: float = 0.0     # 0 means never updated
         self._update_count: int = 0
@@ -273,7 +303,8 @@ class ExternalStageSubscriber:
         if parsed is None:
             logger.debug(
                 "ExternalStageSubscriber: ignoring unparseable state %r "
-                "from %s (held %s)", new_state, entity_id, self._stage.name,
+                "from %s (held %s)",
+                new_state, entity_id, self._stable_stage.name,
             )
             return False
 
@@ -298,25 +329,88 @@ class ExternalStageSubscriber:
                 )
             self._numeric_convention_logged = True
 
-        self._stage = parsed
+        now = time.time()
+        self._raw_stage = parsed
         self._confidence = _parse_confidence(attributes)
-        self._last_update_ts = time.time()
+        self._last_update_ts = now
         self._update_count += 1
+
+        # ── Stage debouncing (v1.4.0) ────────────────────────────────
+        # If the raw observation matches what we're already publishing,
+        # cancel any pending candidate — the blip was transient.
+        if parsed == self._stable_stage:
+            if self._candidate_stage is not None:
+                logger.debug(
+                    "ExternalStageSubscriber: candidate %s cancelled "
+                    "(reverted to stable %s within dwell window)",
+                    self._candidate_stage.name, self._stable_stage.name,
+                )
+                self._candidate_stage = None
+        elif parsed != self._candidate_stage:
+            # New candidate — start the dwell timer.
+            self._candidate_stage = parsed
+            self._candidate_since_ts = now
+            logger.debug(
+                "ExternalStageSubscriber: %s -> candidate %s "
+                "(dwell %.0fs needed before promotion)",
+                entity_id, parsed.name, self._min_dwell,
+            )
+        # else: same candidate as before, just keep accumulating dwell time.
+
+        # Eager-promote on every observation to keep ``current()``
+        # cheap and stateless from the caller's perspective.
+        self._maybe_promote_candidate(now)
+
         logger.debug(
-            "ExternalStageSubscriber: %s -> %s (conf=%.2f)",
-            entity_id, parsed.name, self._confidence,
+            "ExternalStageSubscriber: %s raw=%s stable=%s (conf=%.2f)",
+            entity_id, parsed.name, self._stable_stage.name, self._confidence,
         )
         return True
 
+    def _maybe_promote_candidate(self, now: float) -> None:
+        """Promote ``_candidate_stage`` to ``_stable_stage`` if it has held.
+
+        Called from both :meth:`observe` (so periodic emitters promote
+        on the next sample) and :meth:`current` (so event-only emitters
+        promote when the inference loop polls — no extra observation
+        needed once the dwell timer has expired).
+        """
+        if self._candidate_stage is None:
+            return
+        if self._candidate_stage == self._stable_stage:
+            self._candidate_stage = None
+            return
+        if (now - self._candidate_since_ts) >= self._min_dwell:
+            logger.info(
+                "ExternalStageSubscriber: stable transition %s -> %s "
+                "(held %.0fs, threshold %.0fs)",
+                self._stable_stage.name, self._candidate_stage.name,
+                now - self._candidate_since_ts, self._min_dwell,
+            )
+            self._stable_stage = self._candidate_stage
+            self._candidate_stage = None
+
     def current(self) -> Tuple[SleepStage, float]:
-        """Return ``(stage, confidence)`` for the inference loop.
+        """Return ``(stable_stage, confidence)`` for the inference loop.
 
         Always returns a usable pair so the controller never has to
         worry about ``None``.  Confidence stays low until a real update
         arrives, which keeps the controller in a conservative regime
         during the cold-start window after add-on restart.
+
+        The returned stage is the *debounced* value (see :data:`_DEFAULT_MIN_STAGE_DWELL_SECONDS`).
+        Use :attr:`raw_stage` if you need the un-filtered most-recent
+        observation (e.g. for a diagnostic Lovelace sensor).
         """
-        return (self._stage, self._confidence)
+        # Lazy-promote in case enough time has elapsed since the last
+        # observation but no new event has arrived (event-only sources).
+        self._maybe_promote_candidate(time.time())
+        return (self._stable_stage, self._confidence)
+
+    @property
+    def raw_stage(self) -> SleepStage:
+        """The most recent un-filtered observation.  Useful for diagnostics."""
+        return self._raw_stage
 
     def is_stale(self, now: Optional[float] = None) -> bool:
         """True if no update has arrived within ``stale_after_seconds``.
@@ -336,7 +430,12 @@ class ExternalStageSubscriber:
         """Human-readable snapshot for logs / diagnostic publishing."""
         return {
             "stage_entity_id": self.stage_entity_id,
-            "current_stage": self._stage.name,
+            "current_stage": self._stable_stage.name,
+            "raw_stage": self._raw_stage.name,
+            "candidate_stage": (
+                self._candidate_stage.name if self._candidate_stage else None
+            ),
+            "min_dwell_seconds": self._min_dwell,
             "confidence": round(self._confidence, 3),
             "updates_received": self._update_count,
             "last_update_ts": self._last_update_ts,

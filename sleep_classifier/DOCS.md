@@ -1,4 +1,4 @@
-# Sleep Classifier — Home Assistant Add-on (v1.3.1)
+# Sleep Classifier — Home Assistant Add-on (v1.4.0)
 
 **What it actually does**: learn which bedroom environment is most
 restful *for you*, then adapt it continuously across the night, the
@@ -123,6 +123,8 @@ optional and either auto-discovered or defaults to a safe value.
 | `deadband_temperature_c` | `0.5` | Skip a climate update if the current target is within this many °C. |
 | `deadband_humidity_pct` | `5` | Skip a humidifier update if within this much %RH. |
 | `deadband_brightness_pct` | `10` | Skip a light update if within this much brightness. |
+| `wind_down_minutes` | `30` | v1.4.0: start treating the user as already in LIGHT this many minutes before their learned bedtime, so AC + humidifier pre-cool before sleep onset. `0` disables. |
+| `min_stage_dwell_seconds` | `60` | v1.4.0: a new candidate stage must hold for this many seconds before the subscriber promotes it.  Filters 30-second wearable blips (LIGHT → AWAKE → LIGHT) without delaying real transitions noticeably.  `0` disables. |
 | `log_level` | `info` | One of `debug`, `info`, `warning`, `error`. |
 
 ### Slot bindings — pin a specific entity to a role

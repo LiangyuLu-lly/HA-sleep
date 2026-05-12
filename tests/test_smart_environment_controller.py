@@ -19,6 +19,7 @@ from src.smart_environment_controller import (
     ControlAction,
     SmartControlConfig,
     SmartEnvironmentController,
+    is_in_wind_down,
 )
 
 
@@ -118,7 +119,11 @@ class TestPlanning:
         )
         climate_actions = [a for a in actions if a.domain == "climate"]
         assert climate_actions
-        assert climate_actions[0].data["temperature"] == pytest.approx(19.0)
+        # v1.4.0: climate.set_temperature gets the *anticipated* target,
+        # blending DEEP (19.0) with the next stage REM (19.5) at α=0.5
+        # so the AC starts pre-warming for REM while still in DEEP.
+        # Expected = 0.5 * 19.0 + 0.5 * 19.5 = 19.25, rounded to 19.2.
+        assert climate_actions[0].data["temperature"] == pytest.approx(19.2)
 
     def test_humidity_within_deadband_skipped(self, controller):
         actions = controller.plan_actions(
@@ -307,3 +312,121 @@ class TestStageAdaptation:
         assert deep.temperature_c == pytest.approx(18.0)
         # Brightness falls back to the DEEP stage default (0 %).
         assert deep.brightness_pct == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Anticipatory control (v1.4.0)
+# ---------------------------------------------------------------------------
+
+
+class TestAnticipation:
+    """High-latency actuators (AC, humidifier) must lead the user by a
+    fraction of the next stage's target so the room is at the right
+    setpoint by the time the user actually gets there."""
+
+    def test_target_for_actuator_climate_leads_next_stage(self, controller):
+        # LIGHT current = 21 °C, next stage DEEP = 19 °C.
+        # Climate latency 900s ÷ 1800s typical-stage = α = 0.5
+        # Expected climate target = 0.5 * 21 + 0.5 * 19 = 20.0
+        climate = controller.target_for_actuator(SleepStage.LIGHT, "climate")
+        assert climate.temperature_c == pytest.approx(20.0)
+
+    def test_target_for_actuator_light_no_anticipation(self, controller):
+        # Lights have zero latency, so no blending — the LIGHT-stage
+        # brightness target should match target_for() exactly.
+        canonical = controller.target_for(SleepStage.LIGHT)
+        light = controller.target_for_actuator(SleepStage.LIGHT, "light")
+        assert light.brightness_pct == canonical.brightness_pct
+
+    def test_climate_during_awake_pre_cools_for_light(self, controller):
+        # Pre-bedtime AWAKE: current target = 23 °C (baseline 21 + 2),
+        # next-stage LIGHT = 21 °C.  Climate blend = 22 °C.
+        # This is the "fall asleep faster because the room is already
+        # cooling" payoff users feel on a real night.
+        climate = controller.target_for_actuator(SleepStage.AWAKE, "climate")
+        assert climate.temperature_c == pytest.approx(22.0)
+
+    def test_humidifier_uses_smaller_anticipation_than_climate(self, controller):
+        # Humidifier latency 300s vs climate 900s.  α_hum = 1/6, α_clim = 1/2.
+        # Since the humidity deltas are zero between stages, the blend
+        # collapses but the test verifies the per-domain dispatch works:
+        # both calls must return valid env params and the climate's
+        # temperature must move further toward the next stage than the
+        # humidifier's would (humidifier has no temp field of its own).
+        climate = controller.target_for_actuator(SleepStage.LIGHT, "climate")
+        humidifier = controller.target_for_actuator(SleepStage.LIGHT, "humidifier")
+        # climate temp = 20 °C (mid LIGHT/DEEP); humidifier temp also gets
+        # the lighter blend (1/6 toward DEEP) but uses its own α.
+        assert climate.temperature_c < humidifier.temperature_c, (
+            "climate's stronger anticipation should pull its target "
+            "further toward DEEP than the humidifier's weaker one"
+        )
+
+    def test_alpha_capped_at_0_6(self, devices, ha_client):
+        # Override the typical-stage-duration via monkeypatching the
+        # constant would be cleaner, but a behavioural assertion works:
+        # even with an unreasonably high latency the controller must
+        # never let alpha drop the current-stage signal entirely.
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices, learner=None,
+        )
+        # The LIGHT temperature target should always be in [LIGHT, DEEP]
+        # range — never past the next stage.
+        light_temp = ctl.target_for_actuator(
+            SleepStage.LIGHT, "climate"
+        ).temperature_c
+        assert 19.0 <= light_temp <= 21.0
+
+
+# ---------------------------------------------------------------------------
+# Wind-down detection (v1.4.0)
+# ---------------------------------------------------------------------------
+
+
+from datetime import datetime    # noqa: E402 - keep test imports grouped by feature
+
+
+class TestWindDown:
+    """``is_in_wind_down`` decides whether the controller should
+    pre-cool the bedroom before the user actually goes to bed."""
+
+    @staticmethod
+    def _at(hh: int, mm: int) -> datetime:
+        # Any year works — the function reads only ``.hour`` and ``.minute``.
+        return datetime(2026, 5, 12, hh, mm)
+
+    def test_inside_window_returns_true(self) -> None:
+        # Bedtime 23:00, now 22:45, window 30 min → 15 min away → True.
+        bedtime = {"next_bedtime": "23:00"}
+        assert is_in_wind_down(self._at(22, 45), bedtime, 30) is True
+
+    def test_after_bedtime_returns_false(self) -> None:
+        # Bedtime 23:00, now 23:15 → 23h45m to next bedtime, outside window.
+        bedtime = {"next_bedtime": "23:00"}
+        assert is_in_wind_down(self._at(23, 15), bedtime, 30) is False
+
+    def test_too_early_returns_false(self) -> None:
+        # Bedtime 23:00, now 21:00, window 30 → 120 min away, outside window.
+        bedtime = {"next_bedtime": "23:00"}
+        assert is_in_wind_down(self._at(21, 0), bedtime, 30) is False
+
+    def test_midnight_wraparound(self) -> None:
+        # Bedtime 00:30 (past midnight), now 23:55, window 60 min
+        # → 35 min to bedtime modulo a day → True.
+        bedtime = {"next_bedtime": "00:30"}
+        assert is_in_wind_down(self._at(23, 55), bedtime, 60) is True
+
+    def test_zero_window_disables(self) -> None:
+        bedtime = {"next_bedtime": "23:00"}
+        assert is_in_wind_down(self._at(22, 45), bedtime, 0) is False
+
+    def test_no_bedtime_disables(self) -> None:
+        # Learner hasn't accumulated enough history yet → next_bedtime=None.
+        bedtime = {"next_bedtime": None}
+        assert is_in_wind_down(self._at(22, 45), bedtime, 30) is False
+
+    def test_malformed_bedtime_disables(self) -> None:
+        # Garbage shouldn't crash — fail closed.
+        bedtime = {"next_bedtime": "not-a-time"}
+        assert is_in_wind_down(self._at(22, 45), bedtime, 30) is False

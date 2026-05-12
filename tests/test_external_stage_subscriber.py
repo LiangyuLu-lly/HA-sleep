@@ -192,7 +192,10 @@ def test_bootstrap_state_is_conservative() -> None:
 
 
 def test_observe_updates_cache_and_marks_ready() -> None:
-    sub = ExternalStageSubscriber(ENTITY)
+    # min_stage_dwell_seconds=0 isolates this test from the v1.4.0
+    # debounce timer; we just want to assert that one observation
+    # propagates to current().
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     accepted = sub.observe(ENTITY, "DEEP", attributes={"confidence": 0.85})
     assert accepted is True
     assert sub.buffer_ready()
@@ -204,7 +207,7 @@ def test_observe_updates_cache_and_marks_ready() -> None:
 def test_observe_ignores_unrelated_entities() -> None:
     """Reuse: the caller routes *every* state_changed event through us,
     so we must drop ones for other entities silently."""
-    sub = ExternalStageSubscriber(ENTITY)
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     sub.observe(ENTITY, "DEEP")
     accepted = sub.observe("sensor.kitchen_temperature", 22.4)
     assert accepted is False
@@ -214,7 +217,7 @@ def test_observe_ignores_unrelated_entities() -> None:
 def test_observe_holds_stage_on_garbage_value() -> None:
     """Critical safety: when the device flaps to ``unknown`` we keep the
     last good stage, so the controller doesn't get a phantom AWAKE."""
-    sub = ExternalStageSubscriber(ENTITY)
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     sub.observe(ENTITY, "DEEP", attributes={"confidence": 0.9})
     sub.observe(ENTITY, "unavailable")
     assert sub.current() == (SleepStage.DEEP, 0.9)
@@ -222,7 +225,7 @@ def test_observe_holds_stage_on_garbage_value() -> None:
 
 def test_observe_updates_confidence_only_on_real_change() -> None:
     """A no-op observe shouldn't reset confidence to 1.0."""
-    sub = ExternalStageSubscriber(ENTITY)
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     sub.observe(ENTITY, "DEEP", attributes={"confidence": 0.6})
     sub.observe(ENTITY, "unknown")               # held
     assert sub.current() == (SleepStage.DEEP, 0.6)
@@ -240,10 +243,13 @@ def test_staleness_reports_after_window() -> None:
 def test_status_payload_round_trips_for_publishing() -> None:
     """``status()`` is published as a diagnostic sensor; must be
     JSON-serialisable and contain the fields a user would look at."""
-    sub = ExternalStageSubscriber(ENTITY)
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     sub.observe(ENTITY, "REM", attributes={"confidence": 0.72})
     s = sub.status()
     assert s["current_stage"] == "REM"
+    assert s["raw_stage"] == "REM"
+    assert s["min_dwell_seconds"] == 0.0
+    assert s["candidate_stage"] is None
     assert s["confidence"] == 0.72
     assert s["updates_received"] == 1
     assert s["stage_entity_id"] == ENTITY
@@ -267,17 +273,91 @@ def test_drop_in_compatibility_with_legacy_engine_surface() -> None:
 def test_numeric_string_2_maps_to_deep() -> None:
     """Mi Band exports as the string ``"2"`` for deep sleep — common
     regression source."""
-    sub = ExternalStageSubscriber(ENTITY)
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     sub.observe(ENTITY, "2")
     assert sub.current()[0] is SleepStage.DEEP
 
 
 def test_chinese_label_round_trip() -> None:
     """Chinese-locale ESPHome firmwares emit ``深睡`` / ``浅睡`` etc."""
-    sub = ExternalStageSubscriber(ENTITY)
+    sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
     sub.observe(ENTITY, "深睡")
     assert sub.current()[0] is SleepStage.DEEP
     sub.observe(ENTITY, "浅睡")
     assert sub.current()[0] is SleepStage.LIGHT
     sub.observe(ENTITY, "清醒")
     assert sub.current()[0] is SleepStage.AWAKE
+
+
+# ---------------------------------------------------------------------------
+# Stage debouncing (v1.4.0)                                                   #
+# ---------------------------------------------------------------------------
+
+
+class TestStageDebouncing:
+    """A 30-second AWAKE blip during DEEP must not flap the controller.
+
+    We don't actually sleep in tests — instead we backdate the internal
+    ``_candidate_since_ts`` to simulate the dwell window expiring.
+    """
+
+    def test_short_blip_does_not_promote(self) -> None:
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=60.0)
+        # Establish DEEP as the stable stage (the constructor seeds LIGHT,
+        # so we need >=60s of DEEP before promotion).
+        sub.observe(ENTITY, "DEEP")
+        # Backdate so the candidate dwell window has expired.
+        sub._candidate_since_ts -= 65.0
+        sub.observe(ENTITY, "DEEP")     # second tick re-checks promotion
+        assert sub.current()[0] is SleepStage.DEEP
+
+        # 30-second AWAKE blip — too short to promote.
+        sub.observe(ENTITY, "AWAKE")
+        assert sub.current()[0] is SleepStage.DEEP, (
+            "controller should not see the AWAKE blip yet"
+        )
+        # Raw stage *does* reflect the blip — that's what diagnostics need.
+        assert sub.raw_stage is SleepStage.AWAKE
+
+        # User settles back into DEEP within the dwell window:
+        # the pending AWAKE candidate must be cancelled.
+        sub.observe(ENTITY, "DEEP")
+        assert sub.current()[0] is SleepStage.DEEP
+        assert sub._candidate_stage is None
+
+    def test_sustained_change_promotes_after_dwell(self) -> None:
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=60.0)
+        sub.observe(ENTITY, "DEEP")
+        sub._candidate_since_ts -= 65.0
+        sub.observe(ENTITY, "DEEP")     # promote DEEP
+        assert sub.current()[0] is SleepStage.DEEP
+
+        # User actually wakes up: AWAKE must hold past the dwell window
+        # before we promote it.
+        sub.observe(ENTITY, "AWAKE")
+        assert sub.current()[0] is SleepStage.DEEP   # within window
+        # Backdate the candidate so the next read promotes it.
+        sub._candidate_since_ts -= 65.0
+        assert sub.current()[0] is SleepStage.AWAKE
+
+    def test_zero_dwell_acts_immediately(self) -> None:
+        # With dwell=0 the subscriber behaves exactly like pre-v1.4.0 — a
+        # backwards-compat guarantee tests depend on.
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.observe(ENTITY, "DEEP")
+        assert sub.current()[0] is SleepStage.DEEP
+        sub.observe(ENTITY, "AWAKE")
+        assert sub.current()[0] is SleepStage.AWAKE
+
+    def test_current_lazy_promotes_for_event_only_sources(self) -> None:
+        """Event-only sensors send one event per transition.  ``current()``
+        must promote on the next *poll* once the dwell timer has expired,
+        even if no further observation has arrived."""
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=60.0)
+        sub.observe(ENTITY, "AWAKE")     # one event, no follow-up
+        assert sub.current()[0] is SleepStage.LIGHT  # initial stable
+        # Simulate 90 seconds passing with no new events:
+        sub._candidate_since_ts -= 90.0
+        assert sub.current()[0] is SleepStage.AWAKE, (
+            "current() must lazy-promote even without a fresh observe()"
+        )

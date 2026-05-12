@@ -77,12 +77,46 @@ neighbour list, weights, effective sample size, decay half-life, and
 confidence as attributes that Lovelace renders in the More-Info
 dialog.
 
-## What's new in v1.3 — for the impatient
+## Real-world robustness (v1.4.0)
+
+Three things in the real world break the textbook
+"stage-change → setpoint → done" loop:
+
+1. **Actuators have latency.** An AC takes ~15 min to drop the room a
+   couple of degrees, a humidifier ~5 min.  By the time the user
+   actually enters DEEP, the room hasn't caught up yet.
+2. **Bedtime varies night to night.**  22:00 on Monday, 02:00 on
+   Friday — the controller can't wait for the stage signal to flip
+   before starting to cool.
+3. **Wearables produce stage noise.**  A 30-second AWAKE blip during
+   DEEP (just a stir) shouldn't switch the bedroom lights on.
+
+v1.4.0 addresses all three:
+
+- **Per-actuator anticipation** — each device's target is blended with
+  the *next* stage's target proportional to that device's known
+  response time.  Climate uses `α = min(0.6, 900s / 1800s) = 0.5`, so
+  while the user is in LIGHT the AC is already aimed at the midpoint
+  between LIGHT and DEEP setpoints; by the time DEEP arrives the room
+  is at temperature.  Lights and fans (zero latency) keep crisp
+  stage-boundary transitions.
+- **Wind-down pre-cool** — when the user is still AWAKE but within
+  the configurable `wind_down_minutes` (default 30) of their
+  *learned* bedtime, the controller treats them as already in LIGHT
+  for control purposes.  The HA stage sensor still reports the
+  truthful AWAKE — only the control path substitutes.
+- **Stage debouncing** — the subscriber requires a new candidate
+  stage to hold for `min_stage_dwell_seconds` (default 60) before
+  promoting it to "stable", filtering wearable blips without
+  delaying actual transitions noticeably.
+
+## What's new — for the impatient
 
 | Version | Headline |
 |---|---|
-| **v1.3.1** | Per-stage adaptation preserved when learning kicks in: AWAKE / LIGHT / DEEP / REM each apply a clinical delta on top of the learned baseline, instead of all stages collapsing onto one value. Safe-range clamps prevent runaway setpoints. |
-| **v1.3.0** | Local CNN-BiLSTM dropped — the add-on now subscribes to any HA sleep-stage sensor.  Image down from ~60 MB to ~20 MB.  Preference learner gains recorded_at + exponential decay, weekday/weekend bedtime split, current-context k-NN, and a JSON explainability panel; 4 new HA sensors mirror the reasoning. |
+| **v1.4.0** | Real-world robustness pass: per-actuator anticipation lets the AC lead the user by ~15 min; wind-down pre-cool starts dimming + cooling before the learned bedtime; stage debouncing filters 30-second wearable blips. |
+| **v1.3.1** | Per-stage adaptation preserved when learning kicks in: AWAKE / LIGHT / DEEP / REM each apply a clinical delta on top of the learned baseline. Safe-range clamps prevent runaway setpoints. |
+| **v1.3.0** | Local CNN-BiLSTM dropped — the add-on now subscribes to any HA sleep-stage sensor.  Image ~20 MB. Preference learner gains recorded_at + exponential decay, weekday/weekend bedtime split, current-context k-NN, and a JSON explainability panel; 4 new HA sensors mirror the reasoning. |
 
 Older release notes live in the git tag history (e.g. `git show v1.2.3`
 for the last release that bundled the local CNN-BiLSTM model).

@@ -118,6 +118,52 @@ _STAGE_DELTAS: Dict[SleepStage, EnvironmentParams] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Anticipatory control (v1.4.0)
+# ---------------------------------------------------------------------------
+#
+# Real-world problem: ``climate.set_temperature(19)`` does not cool the
+# bedroom to 19 °C instantly.  Typical actuator response times:
+#
+#   * lights      ≈ 0 s        (LED dim is electrical)
+#   * fans        ≈ 0 s        (mechanical, but air mixes in seconds)
+#   * humidifiers ≈ 300 s      (5 min to noticeably shift RH)
+#   * climate     ≈ 900 s      (15 min for a split AC to drop 2 °C in
+#                               a closed bedroom; longer in summer)
+#
+# If we wait until the user enters DEEP before lowering the climate
+# target, the room is still ~21 °C halfway through DEEP — exactly when
+# the literature says we should already be at 19 °C.  We have to *lead*
+# the user.
+#
+# Implementation: each actuator's target is blended with the *next*
+# stage's target proportional to ``actuator_latency / typical_stage_duration``.
+#
+# Typical stage duration of 30 min (1800 s) is the median dwell time
+# we see in our PSG data + commercial wearable hypnograms.  A bigger
+# number under-anticipates (climate lags behind reality); smaller
+# over-anticipates (room is already cold during AWAKE wind-down).
+_TYPICAL_STAGE_DURATION_S: float = 1800.0     # 30 min
+
+_ACTUATOR_LATENCY_S: Dict[str, float] = {
+    "climate":    900.0,        # 15 min
+    "humidifier": 300.0,        # 5 min
+    "fan":          0.0,        # instant
+    "light":        0.0,        # instant
+}
+
+# ``_NEXT_STAGE`` encodes the most likely next stage given the current
+# one.  Sleep architecture is non-deterministic (DEEP can return to
+# LIGHT, REM can briefly visit AWAKE) but these defaults match the
+# canonical NREM cycle and keep the anticipation logic predictable.
+_NEXT_STAGE: Dict[SleepStage, SleepStage] = {
+    SleepStage.AWAKE: SleepStage.LIGHT,    # AWAKE → fall-asleep → LIGHT
+    SleepStage.LIGHT: SleepStage.DEEP,     # NREM 1/2 → SWS
+    SleepStage.DEEP:  SleepStage.REM,      # SWS → REM (or back to LIGHT)
+    SleepStage.REM:   SleepStage.LIGHT,    # REM → cycle back into LIGHT
+}
+
+
 # Safe clamp ranges so a runaway delta + outlier baseline can't push
 # a device to a dangerous or simply-broken setpoint (e.g. negative
 # brightness, 5 °C in summer, 100 % humidity in a Pi-controlled
@@ -151,11 +197,78 @@ class SmartControlConfig:
     deadband_humidity_pct: float = 5.0
     deadband_brightness_pct: float = 10.0
     dry_run: bool = False
+    # v1.4.0 — minutes before the learned bedtime to start treating the
+    # user as already in the LIGHT stage for *environment* control
+    # purposes.  This makes the AC start pre-cooling toward sleep
+    # setpoints while the user is still winding down on the couch.  The
+    # stage *sensor* in HA still reflects the truthful AWAKE — only
+    # the controller substitutes.  Set to 0 to disable.
+    wind_down_minutes: int = 30
+    # v1.4.0 — debounce window for the ExternalStageSubscriber.  Lives
+    # on this config so it can be tuned from the add-on Configuration
+    # form alongside the rest of the smart-control behaviour, even
+    # though the orchestrator routes it to the subscriber rather than
+    # the controller.  A new candidate stage must hold for this many
+    # seconds before the subscriber's ``current()`` reports it.  Set
+    # to 0 to disable (controller acts on every observation).
+    min_stage_dwell_seconds: float = 60.0
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "SmartControlConfig":
         valid = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in raw.items() if k in valid})
+
+
+# ---------------------------------------------------------------------------
+# Wind-down helper (v1.4.0)
+# ---------------------------------------------------------------------------
+
+
+def is_in_wind_down(
+    now: "datetime.datetime",                # noqa: F821 - forward-ref for circular import
+    bedtime_recommendation: Dict[str, Any],
+    wind_down_minutes: int,
+) -> bool:
+    """Return True iff ``now`` is within ``wind_down_minutes`` of bedtime.
+
+    Inputs:
+        now: a local-time naive ``datetime`` (use :func:`src._time_utils.now_local`).
+        bedtime_recommendation: payload from
+            :meth:`src.preference_learner.PreferenceLearner.recommend_bedtime`.
+            Specifically reads the ``"next_bedtime"`` field as ``"HH:MM"``.
+        wind_down_minutes: window length in minutes.  ``0`` disables.
+
+    Why this lives in the controller module:
+        wind-down is *the* trigger that decides whether the controller
+        should treat the user as already-in-LIGHT.  Keeping the function
+        next to ``SmartControlConfig`` lets the orchestrator stay thin.
+
+    Edge cases:
+        * If ``recommend_bedtime`` couldn't fill the bucket yet
+          (``next_bedtime is None``) we return False — no wind-down
+          until we have enough history to predict a bedtime.
+        * If the bedtime is e.g. 00:30 and now is 23:55, the wrap-around
+          is handled by computing the *signed* minute distance modulo
+          24 h and treating only forward-in-time differences as
+          "approaching bedtime".
+    """
+    if wind_down_minutes <= 0:
+        return False
+    raw = bedtime_recommendation.get("next_bedtime")
+    if not raw:
+        return False
+    try:
+        hh, mm = (int(s) for s in str(raw).split(":", 1))
+    except (ValueError, AttributeError):
+        return False
+
+    bedtime_minutes_of_day = hh * 60 + mm
+    now_minutes_of_day = now.hour * 60 + now.minute
+    # Forward distance to bedtime modulo a day (in minutes).  E.g. if
+    # now is 23:55 and bedtime is 00:30, distance is 35 min — within
+    # the window.  If bedtime was 12 h ago, distance is 12 h — outside.
+    delta = (bedtime_minutes_of_day - now_minutes_of_day) % (24 * 60)
+    return 0 <= delta <= wind_down_minutes
 
 
 @dataclass
@@ -217,50 +330,38 @@ class SmartEnvironmentController:
             return False
         return self._recent_quality < 50.0   # below median → try something new
 
-    def target_for(self, stage: SleepStage) -> EnvironmentParams:
-        """Return the environment we want for ``stage``.
+    def _baseline(self) -> EnvironmentParams:
+        """The learner's "midpoint" recommendation (LIGHT-stage preference).
 
-        Composition (v1.3.1):
-
-        1. **Baseline** — `learner.recommend(defaults=LIGHT_defaults)`
-           returns the env that historically correlated with the user's
-           best sleep, falling back to the LIGHT-stage defaults when
-           there isn't enough history yet.
-        2. **Stage delta** — :data:`_STAGE_DELTAS[stage]` is added on
-           top, so AWAKE comes out warmer / brighter and DEEP comes out
-           cooler / dark relative to that baseline.
-        3. **Safe clamp** — every field is clipped into the conservative
-           range in :data:`_SAFE_RANGES` to make sure a noisy session or
-           an over-eager exploration step can never push a device to a
-           degenerate setpoint.
-
-        When ``self._should_explore()`` is true (recent quality < 50)
-        the learner adds Gaussian noise to the baseline before we apply
-        the stage delta — i.e. exploration happens on the *midpoint*,
-        not on the per-stage offsets, so the night's overall shape
-        stays coherent.
+        Returns the LIGHT defaults if the learner is absent or has no
+        history yet.  Exploration is opt-in via :meth:`_should_explore`.
         """
-        # The baseline is anchored on LIGHT defaults so the learner
-        # output is interpretable as "your LIGHT-stage preference".
-        baseline_defaults = _DEFAULT_TARGETS[SleepStage.LIGHT]
+        defaults = _DEFAULT_TARGETS[SleepStage.LIGHT]
         if self.learner is None:
-            baseline = baseline_defaults
-        else:
-            baseline = self.learner.recommend(
-                baseline_defaults, explore=self._should_explore(),
-            )
+            return defaults
+        return self.learner.recommend(
+            defaults, explore=self._should_explore(),
+        )
 
+    @staticmethod
+    def _compose(
+        baseline: EnvironmentParams,
+        stage: SleepStage,
+        fallback_stage: SleepStage,
+    ) -> EnvironmentParams:
+        """``baseline + _STAGE_DELTAS[stage]`` with safe-range clamps.
+
+        ``fallback_stage`` is consulted for any baseline field that is
+        ``None`` (e.g. learner had no humidity history yet).
+        """
         delta = _STAGE_DELTAS[stage]
 
         def _shift(
             base: Optional[float], d: Optional[float], field: str,
         ) -> Optional[float]:
             if base is None:
-                # No baseline value (e.g. learner had no data for this
-                # field) — return the stage default directly so the
-                # controller still has something to aim at.
-                fallback = getattr(_DEFAULT_TARGETS[stage], field)
-                return _clamp(fallback, *_SAFE_RANGES[field])
+                fb = getattr(_DEFAULT_TARGETS[fallback_stage], field)
+                return _clamp(fb, *_SAFE_RANGES[field])
             shifted = float(base) + float(d or 0.0)
             return _clamp(shifted, *_SAFE_RANGES[field])
 
@@ -277,6 +378,76 @@ class SmartEnvironmentController:
             fan_speed_pct=_shift(
                 baseline.fan_speed_pct, delta.fan_speed_pct, "fan_speed_pct",
             ),
+        )
+
+    def target_for(self, stage: SleepStage) -> EnvironmentParams:
+        """Return the *current-stage* environment target.
+
+        Composition (v1.3.1):
+
+        1. **Baseline** — :meth:`_baseline` returns the env that
+           historically correlated with the user's best sleep, falling
+           back to LIGHT-stage defaults when there isn't enough history
+           yet.
+        2. **Stage delta** — :data:`_STAGE_DELTAS[stage]` is added on
+           top, so AWAKE comes out warmer / brighter and DEEP comes out
+           cooler / dark relative to that baseline.
+        3. **Safe clamp** — every field is clipped into the conservative
+           range in :data:`_SAFE_RANGES`.
+
+        Note: this is the *non-anticipatory* target.  For actual device
+        actuation we use :meth:`target_for_actuator` which leads the
+        user by the actuator's response time so the room is at the right
+        setpoint by the time the stage transition completes.
+        """
+        return self._compose(self._baseline(), stage, fallback_stage=stage)
+
+    def target_for_actuator(
+        self,
+        stage: SleepStage,
+        domain: str,
+    ) -> EnvironmentParams:
+        """Return the target *for a given actuator domain*, anticipating ahead.
+
+        The blend factor is
+        ``min(0.6, actuator_latency / typical_stage_duration)`` —
+        capped at 0.6 so anticipation can never fully override the
+        current stage's setpoint (which would defeat the
+        stage-aware design and confuse the user).
+
+        Example: at 30-min typical stage duration with a 15-min climate
+        latency, the climate target = 0.5 * current + 0.5 * next.  An
+        AC therefore starts cooling toward the DEEP setpoint as soon as
+        the user enters LIGHT, reaching the DEEP target ~15 min later —
+        exactly when the user actually transitions.  Lights (latency 0)
+        get pure current-stage targets so they don't pre-dim.
+        """
+        baseline = self._baseline()
+        current = self._compose(baseline, stage, fallback_stage=stage)
+        latency = _ACTUATOR_LATENCY_S.get(domain, 0.0)
+        if latency <= 0.0:
+            return current
+        next_stage = _NEXT_STAGE[stage]
+        future = self._compose(baseline, next_stage, fallback_stage=stage)
+        # Cap at 0.6 to keep stage variation visible even for high-latency
+        # devices.  Otherwise a 30-min-latency under-floor heating system
+        # would render the controller's stage signal meaningless.
+        alpha = min(0.6, latency / _TYPICAL_STAGE_DURATION_S)
+
+        def _blend(c: Optional[float], n: Optional[float]) -> Optional[float]:
+            if c is None and n is None:
+                return None
+            if c is None:
+                return n
+            if n is None:
+                return c
+            return (1.0 - alpha) * float(c) + alpha * float(n)
+
+        return EnvironmentParams(
+            temperature_c=_blend(current.temperature_c, future.temperature_c),
+            humidity_pct=_blend(current.humidity_pct, future.humidity_pct),
+            brightness_pct=_blend(current.brightness_pct, future.brightness_pct),
+            fan_speed_pct=_blend(current.fan_speed_pct, future.fan_speed_pct),
         )
 
     # ------------------------------------------------------------------ #
@@ -303,15 +474,23 @@ class SmartEnvironmentController:
         if not self.config.enabled:
             return []
 
-        target = self.target_for(stage)
         actions: List[ControlAction] = []
         now = time.time()
 
+        # Each actuator domain gets its *own* target so high-latency
+        # devices (climate, humidifier) can anticipate the next stage
+        # while instantaneous ones (light, fan) act on the current
+        # stage only.  See :meth:`target_for_actuator`.
+        climate_target = self.target_for_actuator(stage, "climate")
+        humidifier_target = self.target_for_actuator(stage, "humidifier")
+        light_target = self.target_for_actuator(stage, "light")
+        fan_target = self.target_for_actuator(stage, "fan")
+
         # --- Temperature: climate.set_temperature ------------------------
-        if target.temperature_c is not None and self.devices.climates:
+        if climate_target.temperature_c is not None and self.devices.climates:
             outside_dead = (
                 current_env.temperature_c is None
-                or abs(current_env.temperature_c - target.temperature_c)
+                or abs(current_env.temperature_c - climate_target.temperature_c)
                 > self.config.deadband_temperature_c
             )
             if outside_dead and self._allow_action("climate", now):
@@ -321,16 +500,19 @@ class SmartEnvironmentController:
                             domain="climate",
                             service="set_temperature",
                             entity_id=c.entity_id,
-                            data={"temperature": round(target.temperature_c, 1)},
-                            reason=f"stage={stage.name} curr={current_env.temperature_c}",
+                            data={"temperature": round(climate_target.temperature_c, 1)},
+                            reason=(
+                                f"stage={stage.name} anticipating={_NEXT_STAGE[stage].name} "
+                                f"curr={current_env.temperature_c}"
+                            ),
                         )
                     )
 
         # --- Humidity: humidifier.set_humidity ---------------------------
-        if target.humidity_pct is not None and self.devices.humidifiers:
+        if humidifier_target.humidity_pct is not None and self.devices.humidifiers:
             outside_dead = (
                 current_env.humidity_pct is None
-                or abs(current_env.humidity_pct - target.humidity_pct)
+                or abs(current_env.humidity_pct - humidifier_target.humidity_pct)
                 > self.config.deadband_humidity_pct
             )
             if outside_dead and self._allow_action("humidifier", now):
@@ -340,21 +522,26 @@ class SmartEnvironmentController:
                             domain="humidifier",
                             service="set_humidity",
                             entity_id=h.entity_id,
-                            data={"humidity": int(round(target.humidity_pct))},
-                            reason=f"stage={stage.name} curr={current_env.humidity_pct}",
+                            data={"humidity": int(round(humidifier_target.humidity_pct))},
+                            reason=(
+                                f"stage={stage.name} anticipating={_NEXT_STAGE[stage].name} "
+                                f"curr={current_env.humidity_pct}"
+                            ),
                         )
                     )
 
         # --- Brightness: light.turn_on / turn_off ------------------------
-        if target.brightness_pct is not None and self.devices.lights:
+        # Lights have zero latency → no anticipation; they switch crisply
+        # at the stage boundary.
+        if light_target.brightness_pct is not None and self.devices.lights:
             outside_dead = (
                 current_env.brightness_pct is None
-                or abs(current_env.brightness_pct - target.brightness_pct)
+                or abs(current_env.brightness_pct - light_target.brightness_pct)
                 > self.config.deadband_brightness_pct
             )
             if outside_dead and self._allow_action("light", now):
                 for light in self.devices.lights:
-                    if target.brightness_pct <= 0.5:
+                    if light_target.brightness_pct <= 0.5:
                         actions.append(
                             ControlAction(
                                 domain="light",
@@ -368,7 +555,7 @@ class SmartEnvironmentController:
                         # Use warm kelvin for sleep stages so the user isn't
                         # blasted with daylight white.
                         data: Dict[str, Any] = {
-                            "brightness_pct": int(round(target.brightness_pct)),
+                            "brightness_pct": int(round(light_target.brightness_pct)),
                         }
                         if stage in {SleepStage.LIGHT, SleepStage.DEEP, SleepStage.REM}:
                             data["kelvin"] = 2200
@@ -378,15 +565,15 @@ class SmartEnvironmentController:
                                 service="turn_on",
                                 entity_id=light.entity_id,
                                 data=data,
-                                reason=f"stage={stage.name} target={target.brightness_pct}%",
+                                reason=f"stage={stage.name} target={light_target.brightness_pct}%",
                             )
                         )
 
         # --- Fan: fan.set_percentage -------------------------------------
-        if target.fan_speed_pct is not None and self.devices.fans:
+        if fan_target.fan_speed_pct is not None and self.devices.fans:
             if self._allow_action("fan", now):
                 for f in self.devices.fans:
-                    if target.fan_speed_pct <= 1.0:
+                    if fan_target.fan_speed_pct <= 1.0:
                         actions.append(
                             ControlAction(
                                 domain="fan",
@@ -402,8 +589,8 @@ class SmartEnvironmentController:
                                 domain="fan",
                                 service="set_percentage",
                                 entity_id=f.entity_id,
-                                data={"percentage": int(round(target.fan_speed_pct))},
-                                reason=f"stage={stage.name} target={target.fan_speed_pct}%",
+                                data={"percentage": int(round(fan_target.fan_speed_pct))},
+                                reason=f"stage={stage.name} target={fan_target.fan_speed_pct}%",
                             )
                         )
 
@@ -465,4 +652,5 @@ __all__ = [
     "SmartControlConfig",
     "SmartEnvironmentController",
     "ControlAction",
+    "is_in_wind_down",
 ]
