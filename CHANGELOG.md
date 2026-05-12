@@ -12,6 +12,62 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.6.4] — 2026-05-13
+
+Continues the "落地" thread from v1.6.3 — two more real-world failure
+modes where a technically-correct control loop produces practically
+wrong behaviour.
+
+### Fixed
+
+- **Stale environment readings haunted the deadband.** Previously,
+  when a temperature / humidity / illuminance sensor dropped off the
+  HA mesh, `_route_state_change` silently dropped the update but
+  `self.last_env` retained the last known value *forever*.  Hours
+  later the controller's deadband would still compare to that old
+  value: either refusing to act (thinks we're at setpoint) or acting
+  wrongly (fighting phantom drift).  Now each env field carries its
+  own last-update timestamp in `_env_ts`, and the inference loop
+  reads a freshness-masked copy via `_safe_last_env()`.  Fields older
+  than `env_freshness_window_seconds` (default 900 s = 15 min) come
+  through as `None`, which the existing deadband already treats as
+  "unknown, fall back to stage default" — strictly safer than "stale
+  reading, act as if current".
+- **Hammering saturated devices wasted network + wore the HA state
+  write path.** If an AC was already at max cooling but couldn't
+  fight a 35 °C outdoor temperature, the controller would keep firing
+  the same `set_temperature=19` at every deadband trigger.  New
+  `SmartEnvironmentController._is_entity_saturated()` tracks, for
+  each controllable entity, a rolling window of (target, observed_env,
+  ts) tuples.  After `_FUTILE_STREAK_THRESHOLD` (3) consecutive same-
+  setpoint attempts at least `_FUTILE_MIN_SETTLE_SECONDS` (15 min)
+  apart, if the observed environment hasn't moved by at least the
+  per-field minimum (0.3 °C / 1.5 %RH / 2 %bright) the entity is
+  marked saturated.  Further same-setpoint pushes are suppressed
+  until the next stage transition clears the flag.
+
+### Added
+
+- `home_assistant.env_freshness_window_seconds` config (default 900 s)
+  so installations with slow-updating sensors can widen the window.
+- `SmartEnvironmentController.futility_stats()` exposes saturation
+  bookkeeping; the orchestrator can surface it on the diagnostic
+  `last_action` sensor in a future pass.
+- 9 new tests (`TestEnvFreshness` × 4, `TestFutileRetrySuppression` × 5)
+  covering: fresh reading passes through, stale reading masked to
+  None, never-observed field stays None but not flagged stale, mixed
+  freshness fields, no saturation before streak, saturation after
+  futile streak, env movement resets the streak, stage change clears
+  saturation, settle-time required before suppression triggers.
+
+### Changed
+
+- `_track_per_stage_env` still snapshots the RAW `last_env`, not the
+  freshness-masked copy, so the learner has faithful evidence of what
+  the sensors *said* they saw during a stage (even if stale).
+  Freshness-masking is a control-path concern, not a learning-path
+  concern.
+
 ## [1.6.3] — 2026-05-13
 
 The "落地" pass — three real-world failure modes the v1.6.2 feature
@@ -261,7 +317,8 @@ misbehave on its first deployed night.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.3...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.4...HEAD
+[1.6.4]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.0...v1.6.2
 [1.6.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.5.0...v1.6.0

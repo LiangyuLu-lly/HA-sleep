@@ -741,3 +741,157 @@ class TestCapabilityGating:
         # But the skip counter kept growing, so capability_stats is
         # still useful for diagnostics.
         assert ctl.capability_stats().get("set_temperature") == 3
+
+
+# ---------------------------------------------------------------------------
+# Futile-retry suppression (v1.6.4)
+# ---------------------------------------------------------------------------
+
+
+class TestFutileRetrySuppression:
+    """v1.6.4 — hammering ``set_temperature=19`` at an AC that's already
+    at max cooling but unable to fight 35 °C outside is a waste of
+    service calls.  After a few futile retries we pause same-setpoint
+    actions for the entity until the stage changes.
+    """
+
+    async def test_no_suppression_before_streak_reached(
+        self, ha_client,
+    ) -> None:
+        # Brand new controller with climate entity.  A few same-target
+        # calls shouldn't trip saturation — we need a full streak.
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="cool",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        # Before the streak threshold, saturation returns False.
+        assert not ctl._is_entity_saturated(
+            "climate", "climate.bedroom_ac",
+            target_value=19.0, current_env_value=26.0, now=100.0,
+        )
+
+    async def test_streak_without_effective_movement_triggers_saturation(
+        self, ha_client,
+    ) -> None:
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="cool",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        # Simulate 3 consecutive set_temperature=19 calls, each 20 min
+        # apart, all observing ~26 °C (no effective cooling).
+        base_ts = 100.0
+        for i in range(3):
+            ctl._record_action_for_futility(
+                "climate", "climate.bedroom_ac",
+                target_value=19.0,
+                current_env_value=26.0 - i * 0.05,    # ~0.1 C drift
+                now=base_ts + i * 1200.0,
+            )
+        # Now ask if a 4th attempt would be futile.
+        saturated = ctl._is_entity_saturated(
+            "climate", "climate.bedroom_ac",
+            target_value=19.0,
+            current_env_value=25.9,
+            now=base_ts + 4 * 1200.0,
+        )
+        assert saturated
+        assert (
+            "climate.climate.bedroom_ac"
+            in ctl.futility_stats()["saturated_entities"]
+        )
+
+    async def test_env_movement_resets_streak(
+        self, ha_client,
+    ) -> None:
+        """If the environment actually moved by >= the min-effective
+        threshold, the device is working and should NOT be suppressed.
+        """
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="cool",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        base_ts = 100.0
+        # 3 same-target samples, but env moves from 26 → 23 — that's
+        # the AC actually working.
+        for i, env in enumerate([26.0, 24.5, 23.0]):
+            ctl._record_action_for_futility(
+                "climate", "climate.bedroom_ac",
+                target_value=19.0,
+                current_env_value=env,
+                now=base_ts + i * 1200.0,
+            )
+        assert not ctl._is_entity_saturated(
+            "climate", "climate.bedroom_ac",
+            target_value=19.0,
+            current_env_value=22.0,
+            now=base_ts + 4 * 1200.0,
+        )
+
+    async def test_stage_change_clears_saturation(
+        self, ha_client,
+    ) -> None:
+        """A new stage = a new setpoint = the previously-saturated
+        entity deserves a fresh chance.
+        """
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="cool",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        # Force saturation flag on.
+        ctl._saturated_entities.add("climate.climate.bedroom_ac")
+        ctl._stage_when_saturation_recorded = SleepStage.LIGHT
+
+        # A plan_actions() call against a different stage should clear it.
+        ctl.plan_actions(SleepStage.DEEP, EnvironmentParams(temperature_c=26.0))
+        assert ctl._saturated_entities == set()
+
+    async def test_settle_time_required(
+        self, ha_client,
+    ) -> None:
+        """3 calls 30 seconds apart can't count as saturation — the
+        AC hasn't had time to respond.
+        """
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="cool",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs, learner=None,
+        )
+        base_ts = 100.0
+        # Same setpoint, same env, but each attempt is only 30 s apart.
+        for i in range(3):
+            ctl._record_action_for_futility(
+                "climate", "climate.bedroom_ac",
+                target_value=19.0,
+                current_env_value=26.0,
+                now=base_ts + i * 30.0,     # way below _FUTILE_MIN_SETTLE_SECONDS
+            )
+        assert not ctl._is_entity_saturated(
+            "climate", "climate.bedroom_ac",
+            target_value=19.0,
+            current_env_value=26.0,
+            now=base_ts + 100.0,
+        )

@@ -593,3 +593,83 @@ class TestStaleStageSourceGuard:
         ]
         assert len(recovery_logs) == 1
         assert svc._stage_source_was_stale is False
+
+
+# ---------------------------------------------------------------------------
+# Env freshness (v1.6.4 P1)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvFreshness:
+    """v1.6.4 — stale environment sensor readings must not contaminate
+    the controller's deadband / anticipation logic.
+    """
+
+    async def test_fresh_reading_passes_through(
+        self, service_cls, tmp_path,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=False)
+        svc = service_cls(_args(cfg))
+        svc._env_freshness_window_seconds = 900.0
+        now = 1_700_000_000.0
+
+        svc.last_env.temperature_c = 22.5
+        svc._env_ts["temperature_c"] = now - 60.0    # 1 min ago
+
+        safe = svc._safe_last_env(now=now)
+        assert safe.temperature_c == 22.5
+        assert "temperature_c" not in svc._env_stale_fields
+
+    async def test_stale_reading_is_masked(
+        self, service_cls, tmp_path,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=False)
+        svc = service_cls(_args(cfg))
+        svc._env_freshness_window_seconds = 900.0
+        now = 1_700_000_000.0
+
+        svc.last_env.temperature_c = 22.5
+        svc._env_ts["temperature_c"] = now - 2000.0   # 33 min ago
+
+        safe = svc._safe_last_env(now=now)
+        assert safe.temperature_c is None
+        assert "temperature_c" in svc._env_stale_fields
+
+    async def test_never_observed_stays_none_not_stale(
+        self, service_cls, tmp_path,
+    ) -> None:
+        """Uninitialised field (ts=0) is semantically different from
+        stale — the controller falls back to stage default, but we
+        don't claim the sensor died.
+        """
+        cfg = _write_config(tmp_path, natural={}, learner=False)
+        svc = service_cls(_args(cfg))
+        now = 1_700_000_000.0
+
+        svc.last_env.humidity_pct = None
+        svc._env_ts["humidity_pct"] = 0.0
+
+        safe = svc._safe_last_env(now=now)
+        assert safe.humidity_pct is None
+        assert "humidity_pct" not in svc._env_stale_fields
+
+    async def test_mixed_fresh_and_stale_fields(
+        self, service_cls, tmp_path,
+    ) -> None:
+        cfg = _write_config(tmp_path, natural={}, learner=False)
+        svc = service_cls(_args(cfg))
+        svc._env_freshness_window_seconds = 900.0
+        now = 1_700_000_000.0
+
+        svc.last_env.temperature_c = 22.5
+        svc.last_env.humidity_pct = 55.0
+        svc.last_env.brightness_pct = 3.0
+        svc._env_ts["temperature_c"] = now - 60.0     # fresh
+        svc._env_ts["humidity_pct"] = now - 2000.0    # stale
+        svc._env_ts["brightness_pct"] = now - 120.0   # fresh
+
+        safe = svc._safe_last_env(now=now)
+        assert safe.temperature_c == 22.5
+        assert safe.humidity_pct is None
+        assert safe.brightness_pct == 3.0
+        assert svc._env_stale_fields == {"humidity_pct"}

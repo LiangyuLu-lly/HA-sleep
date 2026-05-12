@@ -278,6 +278,27 @@ class SmartSleepService:
         # Sequence of (SleepStage) per inference for SE/WASO/SOL scoring.
         self.stage_sequence: List[SleepStage] = []
         self.last_env = EnvironmentParams()
+        # v1.6.4 — per-field freshness timestamps so we don't feed the
+        # controller a 6-hour-old temperature reading if the sensor
+        # dropped off the network.  A field with ``ts=0`` means "never
+        # observed"; a field whose ts is older than
+        # ``_env_freshness_window_seconds`` is treated as None at read
+        # time, forcing the controller to treat it as unknown rather
+        # than stale (causing deadband to greenlight an action that
+        # might be fighting imaginary drift).  See _safe_last_env().
+        self._env_ts: Dict[str, float] = {
+            "temperature_c": 0.0,
+            "humidity_pct": 0.0,
+            "brightness_pct": 0.0,
+        }
+        self._env_freshness_window_seconds: float = float(
+            ha_cfg.get("env_freshness_window_seconds", 900.0),
+        )
+        # Which env fields are currently expired — updated on each
+        # inference tick.  Exposed via status() for the diagnostic
+        # last_action sensor so users see "temperature_c stale" on
+        # Lovelace.
+        self._env_stale_fields: set[str] = set()
         # v1.5.0 — per-stage env snapshots.  Updated by
         # :meth:`_track_per_stage_env` once per inference tick when the
         # *raw* (debounced) stage changes.  Empty until the user moves
@@ -372,14 +393,26 @@ class SmartSleepService:
 
         # ---- 3. Environment sensors ---------------------------------
         value = event.new_state.numeric_state()
+        # HA returns ``"unavailable"`` / ``"unknown"`` as the state
+        # string when a sensor drops off the mesh; ``numeric_state()``
+        # returns None in that case.  Previously we just returned and
+        # kept ``last_env`` at whatever value we had before, so a dead
+        # sensor's last reading could haunt the controller for hours.
+        # v1.6.4 makes this explicit: drop the update here but DON'T
+        # refresh the freshness timestamp, so _safe_last_env() will
+        # start returning None for that field after the grace window.
         if value is None:
             return
+        now = time.time()
         if any(e.entity_id == eid for e in discovery.sensors.temperature):
             self.last_env.temperature_c = value
+            self._env_ts["temperature_c"] = now
         elif any(e.entity_id == eid for e in discovery.sensors.humidity):
             self.last_env.humidity_pct = value
+            self._env_ts["humidity_pct"] = now
         elif any(e.entity_id == eid for e in discovery.sensors.illuminance):
             self.last_env.brightness_pct = value
+            self._env_ts["brightness_pct"] = now
 
     # ------------------------------------------------------------------ #
     # Tasks                                                              #
@@ -547,7 +580,14 @@ class SmartSleepService:
                         "  wind-down active: controlling as %s instead of %s",
                         effective_stage.name, stage.name,
                     )
-                actions = await controller.apply(effective_stage, self.last_env)
+                # v1.6.4 — feed the controller a freshness-masked copy
+                # of last_env.  Stale sensors appear as None and the
+                # deadband logic already treats None as "unknown"
+                # (always-outside-deadband), so we fall back to stage
+                # defaults rather than fighting a reading that's no
+                # longer reflective of the room.
+                safe_env = self._safe_last_env()
+                actions = await controller.apply(effective_stage, safe_env)
                 if actions:
                     logger.info("  → %d HA action(s) planned", len(actions))
 
@@ -1137,6 +1177,12 @@ class SmartSleepService:
             return
         # Capture a *copy* of last_env so subsequent env updates don't
         # mutate this stage's recorded snapshot via shared reference.
+        # v1.6.4 note: we intentionally snapshot the RAW last_env
+        # (not _safe_last_env) because env_by_stage is downstream
+        # evidence for the learner — if the temperature reading was
+        # stale on entry, the learner should know that happened on
+        # that stage rather than seeing a None.  Staleness is still
+        # visible via the env_ts timestamps carried alongside.
         self.env_by_stage[raw_stage.name] = EnvironmentParams(
             temperature_c=self.last_env.temperature_c,
             humidity_pct=self.last_env.humidity_pct,
@@ -1144,6 +1190,64 @@ class SmartSleepService:
             fan_speed_pct=self.last_env.fan_speed_pct,
         )
         self._last_sampled_stage = raw_stage
+
+    def _safe_last_env(
+        self, *, now: Optional[float] = None,
+    ) -> EnvironmentParams:
+        """Return a copy of ``last_env`` with stale fields masked to ``None``.
+
+        v1.6.4 — HA's ``state_changed`` event is fire-and-forget: when
+        a temperature sensor drops off the mesh the add-on doesn't get
+        notified.  Without freshness tracking the controller would
+        keep comparing to a 6-hour-old reading and either:
+
+        * stop acting (the deadband thinks we're already at setpoint), or
+        * act wrongly (fighting a reading that no longer reflects reality).
+
+        This method consults the per-field update timestamps written
+        by :meth:`_route_state_change` and substitutes ``None`` for
+        any field older than ``_env_freshness_window_seconds`` (default
+        15 min).  The controller treats ``None`` as "unknown" which
+        its deadband logic already handles safely — an unknown field
+        always falls outside any deadband so the stage's default
+        setpoint gets reapplied, but the *current* reading doesn't
+        contaminate future-stage anticipation.
+
+        Also populates ``self._env_stale_fields`` so the diagnostic
+        ``last_action`` sensor can surface which sensors went dark.
+        """
+        now = time.time() if now is None else now
+        window = self._env_freshness_window_seconds
+        stale: set[str] = set()
+
+        def _pick(field_name: str, value: Optional[float]) -> Optional[float]:
+            ts = self._env_ts.get(field_name, 0.0)
+            if ts == 0.0:
+                # Never observed — controller falls back to stage
+                # default anyway.  Don't count as "stale"; it's
+                # "uninitialised", which is semantically different.
+                return None if value is None else value
+            if now - ts > window:
+                stale.add(field_name)
+                return None
+            return value
+
+        env = EnvironmentParams(
+            temperature_c=_pick(
+                "temperature_c", self.last_env.temperature_c,
+            ),
+            humidity_pct=_pick(
+                "humidity_pct", self.last_env.humidity_pct,
+            ),
+            brightness_pct=_pick(
+                "brightness_pct", self.last_env.brightness_pct,
+            ),
+            # fan_speed_pct is never a sensor input — it's always a
+            # controller output, so freshness doesn't apply.
+            fan_speed_pct=self.last_env.fan_speed_pct,
+        )
+        self._env_stale_fields = stale
+        return env
 
     def _effective_control_stage(self, raw_stage: SleepStage) -> SleepStage:
         """Map the *observed* stage to the stage the controller should act on.

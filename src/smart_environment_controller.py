@@ -184,6 +184,42 @@ _SAFE_RANGES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Futile-retry suppression (v1.6.4)
+# ---------------------------------------------------------------------------
+#
+# After issuing N consecutive ``set_temperature=19`` calls against the
+# same climate entity, if the room temperature hasn't noticeably moved
+# we conclude the device is already saturated (e.g. an AC at max cooling
+# but outside is 35 °C, or a windowless tiny humidifier trying to hit
+# 55 % in a dry winter).  Continuing to hammer the service at every
+# tick wastes network + wears out the HA state write path.  Instead
+# we pause same-setpoint retries for this entity until the next stage
+# transition re-motivates them.
+#
+# The thresholds below are per-field; a degree Celsius is a much
+# bigger signal than a % brightness.
+
+_FUTILE_STREAK_THRESHOLD: int = 3   # retries before we mark saturated
+
+# Minimum env-reading delta we expect to see BETWEEN two consecutive
+# same-setpoint actions for it to count as "actually working".
+_FUTILE_MIN_EFFECTIVE_DELTA: Dict[str, float] = {
+    "temperature_c": 0.3,     # noise floor of most HA temp sensors
+    "humidity_pct": 1.5,
+    "brightness_pct": 2.0,
+    # fan_speed_pct — we don't track; fans either do or don't run,
+    # no "environment feedback" loop to check.
+}
+
+# Minimum elapsed time between two samples for the delta comparison
+# to be meaningful.  Shorter than this and we can't tell whether the
+# device just hadn't had time to act.  Matches the longest actuator
+# latency in _ACTUATOR_LATENCY_S so climate isn't unfairly marked as
+# saturated 60 s after the first attempt.
+_FUTILE_MIN_SETTLE_SECONDS: float = 900.0   # 15 min
+
+
 def _clamp(value: Optional[float], lo: float, hi: float) -> Optional[float]:
     """Clamp ``value`` into ``[lo, hi]``; pass through ``None`` unchanged."""
     if value is None:
@@ -338,6 +374,24 @@ class SmartEnvironmentController:
         self._current_targets: Dict[SleepStage, EnvironmentParams] = dict(
             _DEFAULT_TARGETS
         )
+        # v1.6.4 — futile-retry suppression.  When we tell an AC
+        # ``set_temperature=19`` but the room stays at 26 °C because
+        # it's 35 °C outside and the AC is already at max output,
+        # there's no point re-sending the same setpoint every
+        # ``min_seconds_between_actions``.  Record (for each
+        # per-entity action):
+        #   * the last N target values,
+        #   * the room env reading at that time,
+        #   * when the next stage transition happens (so we reset).
+        # If N consecutive attempts produce no meaningful change in
+        # the relevant environment field, mark the entity "saturated"
+        # and skip further setpoint pushes until a stage change.
+        self._futile_history: Dict[
+            str,    # "<domain>.<entity_id>"
+            List[tuple[float, float, float]],   # [(target, observed_env, ts), ...]
+        ] = {}
+        self._saturated_entities: set[str] = set()
+        self._stage_when_saturation_recorded: Optional[SleepStage] = None
         # v1.5.0 — learned per-stage delta cache.  Re-fetched at most
         # once every `_LEARNED_DELTA_TTL` seconds to amortise the
         # weighted-median computation across the high-frequency
@@ -611,6 +665,12 @@ class SmartEnvironmentController:
         if not self.config.enabled:
             return []
 
+        # v1.6.4 — whenever the effective-control stage changes, reset
+        # saturation tracking so a newly-minted setpoint gets a fresh
+        # attempt rather than inheriting the previous stage's "this
+        # entity is hopeless" verdict.
+        self._reset_futility_tracking_on_stage_change(stage)
+
         actions: List[ControlAction] = []
         now = time.time()
 
@@ -636,6 +696,16 @@ class SmartEnvironmentController:
                         # This climate entity is on/off-only or preset-only;
                         # skipping is strictly better than faking success.
                         continue
+                    # v1.6.4 — skip if previous attempts haven't moved
+                    # the room.  The controller will try again after
+                    # the next stage transition.
+                    if self._is_entity_saturated(
+                        "climate", c.entity_id,
+                        target_value=climate_target.temperature_c,
+                        current_env_value=current_env.temperature_c,
+                        now=now,
+                    ):
+                        continue
                     actions.append(
                         ControlAction(
                             domain="climate",
@@ -659,6 +729,13 @@ class SmartEnvironmentController:
             if outside_dead and self._allow_action("humidifier", now):
                 for h in self.devices.humidifiers:
                     if not self._device_supports(h, Capability.SET_HUMIDITY):
+                        continue
+                    if self._is_entity_saturated(
+                        "humidifier", h.entity_id,
+                        target_value=humidifier_target.humidity_pct,
+                        current_env_value=current_env.humidity_pct,
+                        now=now,
+                    ):
                         continue
                     actions.append(
                         ControlAction(
@@ -784,6 +861,150 @@ class SmartEnvironmentController:
         last = self._last_action_ts.get(domain, 0.0)
         return now - last >= self.config.min_seconds_between_actions
 
+    # ---------------------------------------------------------------- #
+    # Futile-retry suppression (v1.6.4)                                #
+    # ---------------------------------------------------------------- #
+
+    def _futility_key(self, domain: str, entity_id: str) -> str:
+        return f"{domain}.{entity_id}"
+
+    def _reset_futility_tracking_on_stage_change(
+        self, stage: SleepStage,
+    ) -> None:
+        """Clear saturation flags when the stage changes.
+
+        A new stage means a new setpoint, so a previously-saturated
+        entity deserves a fresh chance.  Called from plan_actions()
+        before any per-domain decision is made.
+        """
+        if self._stage_when_saturation_recorded == stage:
+            return
+        if self._saturated_entities:
+            logger.info(
+                "Stage changed to %s — clearing %d saturation flags so "
+                "the new setpoint gets a fresh chance.",
+                stage.name, len(self._saturated_entities),
+            )
+        self._stage_when_saturation_recorded = stage
+        self._saturated_entities.clear()
+        self._futile_history.clear()
+
+    def _env_field_for_domain(self, domain: str) -> Optional[str]:
+        """Which :class:`EnvironmentParams` field should move when we
+        issue a service in this domain?  Returns ``None`` for domains
+        we don't track (fans, lights after turn_off).
+        """
+        return {
+            "climate": "temperature_c",
+            "humidifier": "humidity_pct",
+            "light": "brightness_pct",
+        }.get(domain)
+
+    def _is_entity_saturated(
+        self,
+        domain: str,
+        entity_id: str,
+        target_value: float,
+        current_env_value: Optional[float],
+        now: float,
+    ) -> bool:
+        """Check whether hammering this entity again would be futile.
+
+        Strategy: look at the last N (target, observed_env, ts) tuples
+        for this entity.  If:
+
+        1. at least ``_FUTILE_STREAK_THRESHOLD`` entries exist,
+        2. all targeted the same value (within the field's deadband),
+        3. each pair is at least ``_FUTILE_MIN_SETTLE_SECONDS`` apart,
+        4. the observed env has moved less than
+           ``_FUTILE_MIN_EFFECTIVE_DELTA`` across the whole streak,
+
+        the entity is saturated and we should skip further retries
+        until the stage changes.
+        """
+        field = self._env_field_for_domain(domain)
+        if field is None or current_env_value is None:
+            # Can't form a feedback loop without an env reading.
+            return False
+        min_delta = _FUTILE_MIN_EFFECTIVE_DELTA.get(field)
+        if min_delta is None:
+            return False
+
+        key = self._futility_key(domain, entity_id)
+        if key in self._saturated_entities:
+            return True
+        history = self._futile_history.get(key, [])
+        if len(history) < _FUTILE_STREAK_THRESHOLD:
+            return False
+
+        # Same-target check — use the field's deadband as the "same"
+        # tolerance rather than exact equality (temperature setpoints
+        # are ints, but 18.9 and 19.1 are morally the same target).
+        target_tolerance = min_delta / 2.0
+        if any(
+            abs(t - target_value) > target_tolerance
+            for t, _, _ in history[-_FUTILE_STREAK_THRESHOLD:]
+        ):
+            return False
+
+        # Settle-time check — consecutive actions must be at least
+        # _FUTILE_MIN_SETTLE_SECONDS apart, else the device hasn't had
+        # time to act yet and we can't judge its effectiveness.
+        relevant = history[-_FUTILE_STREAK_THRESHOLD:]
+        for (_, _, earlier_ts), (_, _, later_ts) in zip(relevant, relevant[1:]):
+            if later_ts - earlier_ts < _FUTILE_MIN_SETTLE_SECONDS:
+                return False
+
+        # Env-movement check — from first sample to current, was there
+        # any useful movement?
+        initial_env = relevant[0][1]
+        if abs(current_env_value - initial_env) >= min_delta:
+            return False
+
+        logger.warning(
+            "Futile-retry suppression: %s.%s appears saturated "
+            "(target=%.1f, env barely moved from %.1f to %.1f over "
+            "%d attempts spanning %.0f min).  Pausing same-setpoint "
+            "retries until the stage changes.",
+            domain, entity_id, target_value,
+            initial_env, current_env_value,
+            _FUTILE_STREAK_THRESHOLD,
+            (relevant[-1][2] - relevant[0][2]) / 60.0,
+        )
+        self._saturated_entities.add(key)
+        return True
+
+    def _record_action_for_futility(
+        self,
+        domain: str,
+        entity_id: str,
+        target_value: Optional[float],
+        current_env_value: Optional[float],
+        now: float,
+    ) -> None:
+        """Append a (target, env, ts) tuple to the entity's history.
+
+        Keeps at most ``_FUTILE_STREAK_THRESHOLD`` entries so memory
+        doesn't grow over long sessions.
+        """
+        if target_value is None or current_env_value is None:
+            return
+        key = self._futility_key(domain, entity_id)
+        history = self._futile_history.setdefault(key, [])
+        history.append((float(target_value), float(current_env_value), now))
+        # Trim to fixed window to cap memory usage.
+        if len(history) > _FUTILE_STREAK_THRESHOLD + 1:
+            del history[:-(_FUTILE_STREAK_THRESHOLD + 1)]
+
+    def futility_stats(self) -> Dict[str, Any]:
+        """Expose saturation bookkeeping so the orchestrator can put
+        it on ``sensor.sleep_classifier_last_action``.
+        """
+        return {
+            "saturated_entities": sorted(self._saturated_entities),
+            "tracked_entities": sorted(self._futile_history.keys()),
+        }
+
     def _device_supports(
         self, entity: Any, capability: Capability,
     ) -> bool:
@@ -846,6 +1067,16 @@ class SmartEnvironmentController:
 
         for action in actions:
             self._actions_log.append(action)
+            # v1.6.4 — record this action into the futility tracker
+            # *before* dispatch.  If the service call fails we still
+            # want to see the record; saturation is about "we asked
+            # and nothing changed", not "we never asked".
+            target_value = self._target_value_from_action(action)
+            current_env_value = self._env_value_from_action(action, current_env)
+            self._record_action_for_futility(
+                action.domain, action.entity_id,
+                target_value, current_env_value, now=time.time(),
+            )
             if self.config.dry_run:
                 logger.info("[dry-run] would call %s  // %s",
                             action.describe(), action.reason)
@@ -867,6 +1098,37 @@ class SmartEnvironmentController:
                 )
 
         return actions
+
+    @staticmethod
+    def _target_value_from_action(action: ControlAction) -> Optional[float]:
+        """Extract the primary numeric target out of an action's data.
+
+        Used by futile-retry tracking — climate/humidifier/light
+        carry their setpoint under different keys, and turn_off
+        has no setpoint at all (returns None, which disables
+        tracking for that action).
+        """
+        data = action.data
+        for key in ("temperature", "humidity", "brightness_pct"):
+            if key in data:
+                try:
+                    return float(data[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    @staticmethod
+    def _env_value_from_action(
+        action: ControlAction, current_env: EnvironmentParams,
+    ) -> Optional[float]:
+        """Pick the env field that corresponds to this action."""
+        if action.domain == "climate":
+            return current_env.temperature_c
+        if action.domain == "humidifier":
+            return current_env.humidity_pct
+        if action.domain == "light":
+            return current_env.brightness_pct
+        return None
 
     @property
     def action_history(self) -> List[ControlAction]:

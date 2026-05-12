@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.6.3"
+version: "1.6.4"
 slug: sleep_classifier
 description: >-
   Closed-loop smart-home sleep automation.  Subscribes to any HA
