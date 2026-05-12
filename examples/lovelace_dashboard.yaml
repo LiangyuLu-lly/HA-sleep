@@ -1,0 +1,294 @@
+# Sleep Classifier — full Lovelace dashboard
+#
+# Drop this YAML into  Settings → Dashboards → New Dashboard →
+# ⋮ Raw configuration editor.  Or paste any individual `cards:` block
+# into an existing view.
+#
+# Covers all 14 sensors the add-on owns as of v1.6.0:
+#   - sensor.sleep_classifier_stage                   (current AWAKE/LIGHT/DEEP/REM)
+#   - sensor.sleep_classifier_confidence              (model confidence 0-100 %)
+#   - sensor.sleep_classifier_quality_score           (per-session 0-100)
+#   - sensor.sleep_classifier_session_duration        (live counter)
+#   - sensor.sleep_classifier_last_action             ("light.bedroom_main → off")
+#   - sensor.sleep_classifier_debt_hours              (sleep debt vs. profile)
+#   - sensor.sleep_classifier_recommended_bedtime     (tonight's bedtime)
+#   - sensor.sleep_classifier_wake_decision           (WAIT/PRE_RAMP/...)
+#   - sensor.sleep_classifier_soundscape              (noise / nature / ...)
+#   - sensor.sleep_classifier_learned_bedtime_workday (HH:MM)
+#   - sensor.sleep_classifier_learned_bedtime_weekend (HH:MM)
+#   - sensor.sleep_classifier_learned_environment     ("19.5 °C / 50 % / 5 %")
+#   - sensor.sleep_classifier_recommendation_explain  ("ready" / "not_ready")
+#   - sensor.sleep_classifier_per_stage_deltas        ("clinical" / "learning" / "personalised")
+#
+# Visualisations chosen for what each sensor's *attributes* support
+# without templating — open the More-Info dialog on any sensor for the
+# full attribute list.
+
+title: Sleep Classifier
+views:
+  # ===================================================================
+  # View 1 — Tonight (the at-a-glance dashboard)
+  # ===================================================================
+  - title: Tonight
+    path: tonight
+    icon: mdi:bed
+    cards:
+      - type: vertical-stack
+        cards:
+          - type: glance
+            title: Right now
+            columns: 4
+            entities:
+              - entity: sensor.sleep_classifier_stage
+                name: Stage
+              - entity: sensor.sleep_classifier_confidence
+                name: Conf.
+              - entity: sensor.sleep_classifier_quality_score
+                name: Quality
+              - entity: sensor.sleep_classifier_session_duration
+                name: Duration
+          - type: gauge
+            entity: sensor.sleep_classifier_quality_score
+            name: Tonight's quality
+            min: 0
+            max: 100
+            severity:
+              green: 75
+              yellow: 50
+              red: 0
+          - type: entities
+            title: Last action
+            entities:
+              - entity: sensor.sleep_classifier_last_action
+                name: Most recent control
+              - type: attribute
+                entity: sensor.sleep_classifier_last_action
+                attribute: executed
+                name: Executed?
+              - type: attribute
+                entity: sensor.sleep_classifier_last_action
+                attribute: at
+                name: When
+                # The publisher writes a unix timestamp here so
+                # the Lovelace timestamp formatter can render
+                # "5 minutes ago" without further templating.
+
+      - type: history-graph
+        title: Stage trace tonight
+        hours_to_show: 12
+        entities:
+          - entity: sensor.sleep_classifier_stage
+
+  # ===================================================================
+  # View 2 — Learned profile (the v1.3.0 + v1.5.0 panel)
+  # ===================================================================
+  - title: Learned profile
+    path: learned
+    icon: mdi:brain
+    cards:
+      - type: vertical-stack
+        cards:
+          - type: glance
+            title: Bedtime forecast
+            columns: 3
+            entities:
+              - entity: sensor.sleep_classifier_recommended_bedtime
+                name: Tonight
+              - entity: sensor.sleep_classifier_learned_bedtime_workday
+                name: Workdays
+              - entity: sensor.sleep_classifier_learned_bedtime_weekend
+                name: Weekends
+          - type: entities
+            title: Best environment (k-NN)
+            entities:
+              - entity: sensor.sleep_classifier_learned_environment
+                name: Pick tonight
+              - type: attribute
+                entity: sensor.sleep_classifier_learned_environment
+                attribute: temperature_c
+                name: Temperature
+                suffix: " °C"
+              - type: attribute
+                entity: sensor.sleep_classifier_learned_environment
+                attribute: humidity_pct
+                name: Humidity
+                suffix: " %"
+              - type: attribute
+                entity: sensor.sleep_classifier_learned_environment
+                attribute: brightness_pct
+                name: Brightness
+                suffix: " %"
+              - type: attribute
+                entity: sensor.sleep_classifier_learned_environment
+                attribute: confidence
+                name: Confidence
+              - type: attribute
+                entity: sensor.sleep_classifier_learned_environment
+                attribute: n_used
+                name: Sessions used
+          - type: entities
+            title: Why these numbers? (open me)
+            entities:
+              - entity: sensor.sleep_classifier_recommendation_explain
+                name: Status
+              - type: attribute
+                entity: sensor.sleep_classifier_recommendation_explain
+                attribute: method
+                name: Algorithm
+              - type: attribute
+                entity: sensor.sleep_classifier_recommendation_explain
+                attribute: n_total
+                name: Total sessions
+              - type: attribute
+                entity: sensor.sleep_classifier_recommendation_explain
+                attribute: avg_age_days
+                name: Avg age (days)
+              - type: attribute
+                entity: sensor.sleep_classifier_recommendation_explain
+                attribute: effective_sample_size
+                name: ESS
+
+      # ---- v1.5.0 per-stage deltas ----
+      - type: entities
+        title: Per-stage learned deltas (v1.5.0)
+        entities:
+          - entity: sensor.sleep_classifier_per_stage_deltas
+            name: Status
+            secondary_info: last-changed
+          # Attributes are flattened by publish_per_stage_deltas:
+          #   awake_temperature_c_delta, deep_temperature_c_delta, ...
+          #   awake_ess, deep_ess, rem_ess
+          - type: section
+            label: Temperature offset vs. LIGHT
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: awake_temperature_c_delta
+            name: AWAKE Δ
+            suffix: " °C"
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: deep_temperature_c_delta
+            name: DEEP Δ
+            suffix: " °C"
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: rem_temperature_c_delta
+            name: REM Δ
+            suffix: " °C"
+          - type: section
+            label: Effective sample size (≥ ess_threshold = personalised)
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: ess_threshold
+            name: Threshold
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: awake_ess
+            name: AWAKE ESS
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: deep_ess
+            name: DEEP ESS
+          - type: attribute
+            entity: sensor.sleep_classifier_per_stage_deltas
+            attribute: rem_ess
+            name: REM ESS
+
+  # ===================================================================
+  # View 3 — Sleep debt + smart wake + soundscape
+  # ===================================================================
+  - title: Recovery & wake
+    path: recovery
+    icon: mdi:weather-sunset-up
+    cards:
+      - type: vertical-stack
+        cards:
+          - type: gauge
+            entity: sensor.sleep_classifier_debt_hours
+            name: Sleep debt
+            min: 0
+            max: 12
+            severity:
+              green: 0
+              yellow: 4
+              red: 8
+            unit: " h"
+          - type: entities
+            title: Recovery plan
+            entities:
+              - entity: sensor.sleep_classifier_debt_hours
+                name: Current debt
+              - type: attribute
+                entity: sensor.sleep_classifier_debt_hours
+                attribute: recovery_extra_minutes
+                name: Extra sleep tonight
+                suffix: " min"
+              - type: attribute
+                entity: sensor.sleep_classifier_debt_hours
+                attribute: recovery_target_bedtime
+                name: Target bedtime
+              - type: attribute
+                entity: sensor.sleep_classifier_debt_hours
+                attribute: recovery_horizon_nights
+                name: Recovery horizon
+                suffix: " nights"
+          - type: entities
+            title: Smart wake
+            entities:
+              - entity: sensor.sleep_classifier_wake_decision
+                name: Decision
+              - type: attribute
+                entity: sensor.sleep_classifier_wake_decision
+                attribute: alarm_time
+                name: Alarm
+              - type: attribute
+                entity: sensor.sleep_classifier_wake_decision
+                attribute: light_ramp_start
+                name: Light ramp begins
+              - type: attribute
+                entity: sensor.sleep_classifier_wake_decision
+                attribute: matched_stage
+                name: Stage matched
+          - type: entities
+            title: Soundscape
+            entities:
+              - entity: sensor.sleep_classifier_soundscape
+                name: Active scape
+              - type: attribute
+                entity: sensor.sleep_classifier_soundscape
+                attribute: volume_pct
+                name: Volume
+                suffix: " %"
+              - type: attribute
+                entity: sensor.sleep_classifier_soundscape
+                attribute: reason
+                name: Why this scape
+
+  # ===================================================================
+  # View 4 — History (long-term trends)
+  # ===================================================================
+  - title: History
+    path: history
+    icon: mdi:chart-line
+    cards:
+      - type: history-graph
+        title: Quality scores
+        hours_to_show: 720       # 30 days
+        entities:
+          - entity: sensor.sleep_classifier_quality_score
+      - type: history-graph
+        title: Sleep debt drift
+        hours_to_show: 720
+        entities:
+          - entity: sensor.sleep_classifier_debt_hours
+      - type: statistics-graph
+        title: Confidence drift (does the wearable agree with itself?)
+        chart_type: line
+        period: hour
+        days_to_show: 7
+        stat_types:
+          - mean
+          - min
+          - max
+        entities:
+          - sensor.sleep_classifier_confidence
