@@ -221,3 +221,89 @@ class TestFeedback:
         assert controller._should_explore() is True
         controller.feedback_score(80.0)
         assert controller._should_explore() is False
+
+
+# ---------------------------------------------------------------------------
+# Per-stage adaptation (v1.3.1)
+# ---------------------------------------------------------------------------
+
+
+class _FakeLearner:
+    """Minimal stub matching :meth:`PreferenceLearner.recommend`'s signature.
+
+    Returns a fixed env regardless of inputs, which lets us assert that
+    :meth:`SmartEnvironmentController.target_for` correctly composes
+    that baseline with the per-stage delta table.
+    """
+
+    def __init__(self, env: EnvironmentParams) -> None:
+        self._env = env
+
+    def recommend(self, defaults, *, explore=False, now_ts=None):
+        return self._env
+
+
+class TestStageAdaptation:
+    """The controller must keep stage variation alive after learning kicks in."""
+
+    def test_no_learner_falls_back_to_per_stage_defaults(self, controller):
+        # Without a learner the AWAKE target should differ from DEEP across
+        # *all* stage-varying fields.
+        awake = controller.target_for(SleepStage.AWAKE)
+        deep = controller.target_for(SleepStage.DEEP)
+        assert awake.temperature_c > deep.temperature_c
+        assert awake.brightness_pct > deep.brightness_pct
+        assert awake.fan_speed_pct > deep.fan_speed_pct
+
+    def test_learner_baseline_preserves_stage_variation(self, devices, ha_client):
+        # User's "best LIGHT-stage" env: 20 °C, 52 %, 6 % bright, fan 12 %.
+        # AWAKE must still come out warmer + brighter than this; DEEP
+        # cooler + dark.
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        learner = _FakeLearner(EnvironmentParams(
+            temperature_c=20.0, humidity_pct=52.0,
+            brightness_pct=6.0, fan_speed_pct=12.0,
+        ))
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices, learner=learner,
+        )
+        awake = ctl.target_for(SleepStage.AWAKE)
+        light = ctl.target_for(SleepStage.LIGHT)
+        deep = ctl.target_for(SleepStage.DEEP)
+
+        # LIGHT target == the learner's baseline (zero delta).
+        assert light.temperature_c == pytest.approx(20.0)
+        assert light.brightness_pct == pytest.approx(6.0)
+        # AWAKE is the baseline + the AWAKE delta (+2 °C, +32 % brightness).
+        assert awake.temperature_c == pytest.approx(22.0)
+        assert awake.brightness_pct == pytest.approx(38.0)
+        # DEEP is the baseline + the DEEP delta (-2 °C, brightness clamped at 0).
+        assert deep.temperature_c == pytest.approx(18.0)
+        assert deep.brightness_pct == 0.0
+
+    def test_safe_clamp_prevents_runaway_setpoints(self, devices, ha_client):
+        # Pathological learner output (a hot baseline).  Even though the
+        # AWAKE delta would push it past the ceiling, the clamp must
+        # cap it at the safe-range maximum.
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        learner = _FakeLearner(EnvironmentParams(temperature_c=27.5))
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices, learner=learner,
+        )
+        target = ctl.target_for(SleepStage.AWAKE)
+        # 27.5 + 2.0 = 29.5 → clamped to the 28 °C ceiling.
+        assert target.temperature_c == pytest.approx(28.0)
+
+    def test_baseline_missing_field_uses_stage_default(self, devices, ha_client):
+        # Learner returns a temp-only baseline.  The shifted brightness
+        # should fall back to the stage default, not crash on ``None``.
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        learner = _FakeLearner(EnvironmentParams(temperature_c=20.0))
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devices, learner=learner,
+        )
+        deep = ctl.target_for(SleepStage.DEEP)
+        # Temperature got the personalised path (20 - 2 = 18).
+        assert deep.temperature_c == pytest.approx(18.0)
+        # Brightness falls back to the DEEP stage default (0 %).
+        assert deep.brightness_pct == 0.0

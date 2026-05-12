@@ -1,31 +1,108 @@
-# Sleep Classifier — Home Assistant Add-on (v1.3.0)
+# Sleep Classifier — Home Assistant Add-on (v1.3.1)
 
-Closed-loop smart-home sleep automation: subscribe to an existing HA
-sleep-stage sensor, score each night, learn which environment and
-bedtime correlate with your best sleep, then write those setpoints back
-to your lights / climate / humidifier / fan.
+**What it actually does**: learn which bedroom environment is most
+restful *for you*, then adapt it continuously across the night, the
+week and the seasons so you actually sleep in that environment
+instead of the room's resting state.
 
 The add-on is built around three pillars:
 
-1. **External stage source** — instead of running its own CNN-BiLSTM
-   model, the add-on follows any HA entity whose state cycles between
-   AWAKE / LIGHT / DEEP / REM.  Most mass-market wearables (Apple
-   Watch, Mi Band, Fitbit, Withings, Garmin, Eight Sleep,
-   sleep_as_android, …) and bedside radars already publish one out
-   of the box; the matcher is case-insensitive and bilingual so
-   "Deep" / "DEEP" / "deep" / "deep_sleep" / "深睡" all normalise to
-   the same internal stage.
-2. **Decay + k-NN preference learner** — every completed session is
-   recorded with the env params and a 0-100 quality score.  Past
-   sessions decay with a 14-day half-life (configurable) and the
-   bedtime recommender splits weekday vs weekend buckets by *wake
-   day*.  The env recommender does a weighted-median k-NN over the
-   top sessions, conditioned on tonight's hour-of-bedtime and ambient
-   temperature.
-3. **Bounded HA controller** — every actuation goes through deadbands
-   (e.g. don't update climate within ±0.5 °C of the current target)
-   and a 120-second inter-action cool-down, so the add-on never
-   flaps your devices.
+1. **Analyse** — every completed session is recorded as
+   `(env_params, stage_counts, quality_score, recorded_at)`.  A
+   rolling history (default 60 nights) feeds
+   :class:`PreferenceLearner`, which surfaces a personalised
+   recommendation weighted by **quality × exp(-age/half_life)** —
+   recent good nights dominate, ancient outliers fade.  The matcher
+   is case-insensitive and bilingual so the stage sensor can publish
+   "DEEP" or "deep_sleep" or "深睡" interchangeably.
+2. **Adapt across four time scales** — see
+   [§ Phases of regulation](#phases-of-regulation) below.  The
+   short version: AWAKE comes out warmer + brighter, DEEP cooler +
+   dark, weekend gets a later bedtime, winter and summer get
+   different env midpoints.
+3. **Actuate safely** — every device update passes through a
+   deadband (don't bump the AC for 0.1 °C), an inter-action
+   cool-down (default 120 s so two stages flipping back and forth
+   don't ping-pong the lights), and a safe-range clamp on every
+   field (T ∈ [16, 28] °C, brightness ∈ [0, 100] %, …) so a noisy
+   sample can never push a device to a degenerate setpoint.
+
+The single required input is one HA entity whose state cycles between
+AWAKE / LIGHT / DEEP / REM — anything from a Mi Band, Apple Watch,
+Fitbit, Withings, Garmin, Eight Sleep mattress, sleep_as_android, or a
+bedside mmWave radar with a tiny ESPHome template sensor works.
+
+## Phases of regulation
+
+The add-on personalises along **four nested time scales**:
+
+### 1. Within the night — per sleep stage
+
+`src/smart_environment_controller.py` composes every target as
+`learned_baseline + stage_delta`, where the deltas come from a
+clinically-motivated table (`_STAGE_DELTAS`) baked into the source
+code:
+
+| Stage | ΔT (°C) | ΔRH (%) | Δbrightness (%) | Δfan (%) |
+|---|---|---|---|---|
+| AWAKE | +2.0 | −5 | +32 | +5 |
+| LIGHT | 0 (reference) | 0 | 0 | 0 |
+| DEEP  | −2.0 | 0 | −8 (clamped 0) | −5 |
+| REM   | −1.5 | 0 | −8 (clamped 0) | −5 |
+
+So if `recommend_knn()` discovers your "best LIGHT" env is 20 °C / 50 % /
+6 % brightness, the controller will aim for ~22 °C / 45 % / 38 %
+during AWAKE wind-down, ~20 °C / 50 % / 6 % during LIGHT, and ~18 °C
+/ 50 % / 0 % during DEEP.  All four values are clamped into the
+hard-coded safe range before they leave the function.
+
+### 2. Within the week — workday vs weekend
+
+`PreferenceLearner.recommend_bedtime()` buckets sessions by *wake*
+day — a Friday-night-into-Saturday-morning sleep counts as **weekend**.
+For each bucket it computes the decay-weighted median of `started_at`
+modulo 24 h (so 23:30 and 00:30 cluster correctly) and publishes the
+two bedtimes as separate HA sensors.  Each bucket needs at least
+`min_per_bucket` sessions (default 3) before it produces a value; until
+then the corresponding entity says `"unknown"`.
+
+### 3. Within the month — recency decay
+
+The contribution of a session to every recommendation is
+``weight = (0.1 + quality/100) × 2^(-age_days / half_life)``, with
+`half_life = 14 days` by default.  Result:
+
+| Age | Weight (quality=80) |
+|---|---|
+| 0 d (tonight) | 0.90 |
+| 7 d ago | 0.64 |
+| 14 d ago | 0.45 |
+| 30 d ago | 0.20 |
+| 60 d ago | 0.045 |
+
+This is what makes the add-on track seasonal shifts: as November cools
+the room enough that you sleep best at a slightly higher setpoint than
+in August, the new sessions outweigh the old within ~3 weeks.  Tune
+the speed via `decay_half_life_days` (smaller = faster adaptation).
+
+### 4. Within tonight — current-context k-NN
+
+`PreferenceLearner.recommend_knn()` picks the `k` past sessions whose
+*context* most resembles tonight, where context = (bedtime hour,
+ambient temperature).  The kernel is a product of two Gaussians:
+
+```text
+weight = base_weight × N(hour_diff; σ_hour) × N(temp_diff; σ_temp)
+```
+
+with `σ_hour = σ_temp = 1.5` by default.  Practical effect: a winter
+recommendation stops blindly averaging in a July night, and a 02:00
+late-night bedtime stops being dominated by your usual 22:30 routine.
+
+All four scales are **explainable** — the
+`sensor.sleep_classifier_recommendation_explain` entity carries the
+neighbour list, weights, effective sample size, decay half-life and
+confidence as attributes that Lovelace renders in the More-Info dialog.
 
 ## Configuration
 

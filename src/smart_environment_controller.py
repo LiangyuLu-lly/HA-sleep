@@ -1,15 +1,34 @@
 """Stage-aware controller that drives Home Assistant devices directly.
 
-Where :class:`src.environment_controller.EnvironmentController` produces
-*MQTT command payloads*, :class:`SmartEnvironmentController` goes one step
-further: it **picks a target environment**, **diffs it against the current
-state** read from HA, and then **calls the matching HA services** through
-:class:`src.ha_api_client.HomeAssistantClient`.
+This is the **adaptive control** half of the add-on's value: pick the
+right bedroom environment for *the user's current sleep stage*, diff it
+against the current room state, then call the matching HA services
+through :class:`src.ha_api_client.HomeAssistantClient`.
 
-Personalised setpoints come from :class:`src.preference_learner.PreferenceLearner`
-if it has enough history; otherwise we fall back to the static, sleep-medicine
-inspired table below.  A configurable **deadband** prevents the controller
-from flapping (e.g. don't bump the HVAC for a 0.1 °C change).
+Phases of regulation
+--------------------
+The controller doesn't just learn one "ideal" env and apply it
+constantly — that would defeat the purpose of having a stage signal in
+the first place.  Instead it composes two layers:
+
+1. A **personalised baseline** from
+   :class:`src.preference_learner.PreferenceLearner` (when there is
+   enough history) — answers the question *"what room conditions did
+   you sleep best in?"*.
+2. **Stage-relative deltas** (the ``_STAGE_DELTAS`` table below) —
+   answers *"how should those conditions be modulated across the
+   night?"*: warmer + brighter pre-sleep, cooler + dark during DEEP,
+   gentle bedside lamp at the wake window.
+
+So if the learner discovers you sleep best at 20 °C (slightly cooler
+than the 21 °C default), the controller will aim for ~22 °C while you
+wind down, ~20 °C during LIGHT, ~18 °C during DEEP — preserving the
+medically-motivated stage variation while shifting the *midpoint*
+toward your personal preference.
+
+A configurable **deadband** prevents the controller from flapping
+(e.g. don't bump the HVAC for a 0.1 °C change), and an explore knob
+lets the learner probe nearby setpoints after a poor night.
 
 Closing the loop
 ----------------
@@ -55,6 +74,68 @@ _DEFAULT_TARGETS: Dict[SleepStage, EnvironmentParams] = {
         temperature_c=19.5, humidity_pct=55.0, brightness_pct=0.0,  fan_speed_pct=10.0,
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-stage deltas applied on top of the *learned* baseline (since v1.3.1)
+# ---------------------------------------------------------------------------
+#
+# The deltas below are derived from ``_DEFAULT_TARGETS`` by subtracting
+# the LIGHT row from each other row.  LIGHT is the reference because it
+# is the longest stage of a healthy night, so we treat the learner's
+# recommendation as "your LIGHT-stage preference" and modulate around it.
+#
+# Why deltas rather than per-stage learning?
+#   * A recorded session contains a mix of all stages — we observe one
+#     env per night, not one per stage.  So the learner cannot directly
+#     learn "your DEEP temperature" without first attributing the
+#     in-night env trace to each stage, which we don't store yet.
+#   * The clinical literature is consistent on the *direction* of stage
+#     variation (T drops into DEEP, brightness drops with sleep onset,
+#     etc.) even if individual midpoints vary.  Locking the deltas to
+#     the clinical consensus gives us a safe-by-default policy that
+#     still personalises the midpoint.
+#
+# Future work (v1.4): also learn the deltas from per-session
+# stage-segmented env traces.  Tracked in docs/BACKLOG.md.
+_STAGE_DELTAS: Dict[SleepStage, EnvironmentParams] = {
+    SleepStage.AWAKE: EnvironmentParams(
+        temperature_c=+2.0, humidity_pct=-5.0,
+        brightness_pct=+32.0, fan_speed_pct=+5.0,
+    ),
+    SleepStage.LIGHT: EnvironmentParams(
+        temperature_c=0.0, humidity_pct=0.0,
+        brightness_pct=0.0, fan_speed_pct=0.0,
+    ),
+    SleepStage.DEEP: EnvironmentParams(
+        temperature_c=-2.0, humidity_pct=0.0,
+        brightness_pct=-8.0, fan_speed_pct=-5.0,
+    ),
+    SleepStage.REM: EnvironmentParams(
+        temperature_c=-1.5, humidity_pct=0.0,
+        brightness_pct=-8.0, fan_speed_pct=-5.0,
+    ),
+}
+
+
+# Safe clamp ranges so a runaway delta + outlier baseline can't push
+# a device to a dangerous or simply-broken setpoint (e.g. negative
+# brightness, 5 °C in summer, 100 % humidity in a Pi-controlled
+# bedroom).  Picked conservatively; widen via config if you have a
+# medical reason to.
+_SAFE_RANGES = {
+    "temperature_c": (16.0, 28.0),
+    "humidity_pct": (30.0, 70.0),
+    "brightness_pct": (0.0, 100.0),
+    "fan_speed_pct": (0.0, 100.0),
+}
+
+
+def _clamp(value: Optional[float], lo: float, hi: float) -> Optional[float]:
+    """Clamp ``value`` into ``[lo, hi]``; pass through ``None`` unchanged."""
+    if value is None:
+        return None
+    return max(lo, min(hi, float(value)))
 
 
 # ---------------------------------------------------------------------------
@@ -139,17 +220,64 @@ class SmartEnvironmentController:
     def target_for(self, stage: SleepStage) -> EnvironmentParams:
         """Return the environment we want for ``stage``.
 
-        Combines:
+        Composition (v1.3.1):
 
-        * defaults (sleep-medicine table),
-        * learner recommendation (if there is enough history),
-        * optional perturbation when recent sleep was poor.
+        1. **Baseline** — `learner.recommend(defaults=LIGHT_defaults)`
+           returns the env that historically correlated with the user's
+           best sleep, falling back to the LIGHT-stage defaults when
+           there isn't enough history yet.
+        2. **Stage delta** — :data:`_STAGE_DELTAS[stage]` is added on
+           top, so AWAKE comes out warmer / brighter and DEEP comes out
+           cooler / dark relative to that baseline.
+        3. **Safe clamp** — every field is clipped into the conservative
+           range in :data:`_SAFE_RANGES` to make sure a noisy session or
+           an over-eager exploration step can never push a device to a
+           degenerate setpoint.
+
+        When ``self._should_explore()`` is true (recent quality < 50)
+        the learner adds Gaussian noise to the baseline before we apply
+        the stage delta — i.e. exploration happens on the *midpoint*,
+        not on the per-stage offsets, so the night's overall shape
+        stays coherent.
         """
-        defaults = _DEFAULT_TARGETS[stage]
+        # The baseline is anchored on LIGHT defaults so the learner
+        # output is interpretable as "your LIGHT-stage preference".
+        baseline_defaults = _DEFAULT_TARGETS[SleepStage.LIGHT]
         if self.learner is None:
-            return defaults
-        explore = self._should_explore()
-        return self.learner.recommend(defaults, explore=explore)
+            baseline = baseline_defaults
+        else:
+            baseline = self.learner.recommend(
+                baseline_defaults, explore=self._should_explore(),
+            )
+
+        delta = _STAGE_DELTAS[stage]
+
+        def _shift(
+            base: Optional[float], d: Optional[float], field: str,
+        ) -> Optional[float]:
+            if base is None:
+                # No baseline value (e.g. learner had no data for this
+                # field) — return the stage default directly so the
+                # controller still has something to aim at.
+                fallback = getattr(_DEFAULT_TARGETS[stage], field)
+                return _clamp(fallback, *_SAFE_RANGES[field])
+            shifted = float(base) + float(d or 0.0)
+            return _clamp(shifted, *_SAFE_RANGES[field])
+
+        return EnvironmentParams(
+            temperature_c=_shift(
+                baseline.temperature_c, delta.temperature_c, "temperature_c",
+            ),
+            humidity_pct=_shift(
+                baseline.humidity_pct, delta.humidity_pct, "humidity_pct",
+            ),
+            brightness_pct=_shift(
+                baseline.brightness_pct, delta.brightness_pct, "brightness_pct",
+            ),
+            fan_speed_pct=_shift(
+                baseline.fan_speed_pct, delta.fan_speed_pct, "fan_speed_pct",
+            ),
+        )
 
     # ------------------------------------------------------------------ #
     # Planning                                                           #

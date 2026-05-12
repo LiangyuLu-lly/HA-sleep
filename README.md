@@ -1,76 +1,91 @@
 # Sleep Classifier — Home Assistant Add-on
 
-**Closed-loop smart-home sleep automation.**  Subscribe to any HA
-sleep-stage sensor you already have (Apple Watch, Mi Band, Fitbit,
-sleep_as_android, bedside radars, …), and the add-on learns your
-preferred bedtime + bedroom environment from history, then writes it
-back to your lights / AC / humidifier / fan automatically.
+**Learns your ideal sleep environment and adapts the bedroom across
+the night.**  The add-on figures out — from your own history — which
+combination of temperature, humidity, light and fan speed correlates
+with the nights you sleep best, then tunes those values continuously:
+across each sleep stage, between weekday and weekend, and as the
+seasons shift.  Any HA-resident sleep-stage sensor (Apple Watch, Mi
+Band, Fitbit, sleep_as_android, mmWave radars, …) is enough input —
+the add-on doesn't need a dedicated wearable or its own sleep-staging
+model.
 
 ```text
-sleep-stage sensor ──▶ Sleep Classifier add-on ──▶ light · climate · fan
-                              │
-                              ▼
-                  learns bedtime + setpoints
-                  per weekday / weekend
-                  decayed by recency
+                  ┌── analyse ────┐
+sleep-stage  ──▶  │ which env did │  ──▶  warm + dim light  pre-sleep
+quality          │ you sleep    │  ──▶  cool + dark        DEEP / REM
+score            │ best in?     │  ──▶  gentle ramp        wake window
+                  └───────────────┘
+                          │
+                          ▼
+              learns the *midpoint*
+              you sleep best at;
+              clinical deltas shape
+              the curve across stages
 ```
 
-## What's new in v1.3.0
+## What it does for you, in one paragraph
 
-The add-on no longer trains or runs its own CNN-BiLSTM sleep-stage
-model.  Instead it subscribes to a stage entity you've **already**
-built into HA — usually because a mass-market wearable (Mi Band, Apple
-Watch, Garmin, Withings, Eight Sleep, sleep_as_android, …) publishes
-one out of the box.
+Every night, the add-on watches your sleep-stage sensor and records
+what your bedroom was actually like — temperature, humidity, light,
+fan speed — together with a 0-100 quality score that rewards DEEP /
+REM time and punishes fragmented wakefulness.  Over a week or two of
+this data, the `PreferenceLearner` figures out the env combination
+that consistently shows up under your *best* nights, weighted by how
+recent each session is.  When the next bedtime approaches it hands
+that "personal baseline" to the controller, which then walks the room
+through a stage-aware curve: warmer + brighter while you wind down,
+cool + dark while you're in DEEP, a gentle ramp back to daylight
+inside your configured wake window.  Everything that's learned is
+exposed as plain HA sensors with attribute panels so you can see
+exactly *why* tonight's setpoints look the way they do.
 
-What you gain:
+## Phases of regulation
 
-- **20 MB add-on image** (down from ~60 MB).  No PyWavelets / h5py /
-  scipy / hdf5; the only runtime deps are `aiohttp` and `numpy`.
-- **No model file shipping**.  Skip the whole "where do I put
-  ``best_model.h5``" dance.
-- **Four new "explainable" sensors** that mirror the
-  preference-learner's reasoning to Lovelace:
-  `sensor.sleep_classifier_learned_bedtime_workday`,
-  `sensor.sleep_classifier_learned_bedtime_weekend`,
-  `sensor.sleep_classifier_learned_environment`,
-  `sensor.sleep_classifier_recommendation_explain` (with neighbour
-  list + confidence + half-life as attributes).
-- **Recency-aware learning**: a session's contribution to the
-  recommendation decays exponentially with a 14-day half-life by
-  default, so seasonal changes (winter → spring) ripple into
-  setpoints within ~1 month without one bad night nuking the model.
-- **Weekend ≠ workday bedtime**.  Sessions are bucketed by *wake
-  day*, so a Friday-night-into-Saturday-morning sleep counts as
-  weekend even though it starts on a Friday.
-- **k-NN-style environment recommendation** conditioned on tonight's
-  hour-of-bedtime and ambient temperature, so a winter recommendation
-  doesn't blindly average in a July night.
+The product personalises along **four time scales**, each implemented
+by a different piece of the codebase:
 
-## How it works (1 page)
+1. **Within the night — per sleep stage.**
+   `src/smart_environment_controller.py` keeps the clinical
+   stage→setpoint table (`_STAGE_DELTAS`): AWAKE = baseline + 2 °C,
+   +32 % brightness, +5 % fan; DEEP = baseline − 2 °C, dark, slow
+   fan; REM ≈ DEEP.  The deltas are anchored on the user's *learned*
+   midpoint rather than the clinical default, so you sleep within
+   your own comfort zone but with the stage variation modern sleep
+   medicine recommends.
+2. **Within the week — workday vs weekend.**
+   `PreferenceLearner.recommend_bedtime()` buckets sessions by
+   *wake-day* (so a Friday-night-into-Saturday-morning sleep counts
+   as weekend) and surfaces both bedtimes as separate HA sensors.
+3. **Within the month — recency decay.**
+   Every session contributes
+   ``weight = quality × 2^(-age_days / half_life)`` to the
+   recommendation, with a 14-day half-life by default.  Seasonal
+   shifts (cool summer setpoints fading as autumn drops the room
+   temp on their own) ripple into the model within ~1 month, but a
+   single rough night never nukes a few weeks of stable data.
+4. **Within tonight — current-context k-NN.**
+   `PreferenceLearner.recommend_knn()` picks the `k` past sessions
+   that are most similar to *this evening* on bedtime hour + ambient
+   temperature, then weighted-median-averages their env params.  A
+   winter recommendation therefore stops blindly averaging in a
+   July night.
 
-1. **Subscribe**.  On startup the add-on uses HA's WebSocket
-   `state_changed` event to follow the entity you set in
-   `sleep_stage_source`.  Stage strings are normalised case-insensitively
-   so "Deep" / "deep" / "DEEP" / "deep_sleep" all map to the same
-   internal `SleepStage.DEEP`.
-2. **Score the session**.  When the entity transitions from a sleep
-   stage back to AWAKE (or the session times out), the add-on counts
-   how much time you spent in each stage, computes a 0-100 quality
-   score (DEEP/REM rewarded, fragmented AWAKE penalised), and records
-   it together with the bedroom environment that was active.
-3. **Learn**.  The `PreferenceLearner` keeps a rolling history of
-   sessions, weights them by `quality × exp(-age/half_life)`, and
-   surfaces three recommendations every inference tick:
-   - tonight's bedtime (separate workday/weekend medians);
-   - tonight's ideal env setpoints (weighted-median k-NN over the
-     top sessions, conditioned on current hour + temperature);
-   - a JSON "why" payload listing the neighbour sessions that drove
-     the recommendation, exposed as a sensor attribute.
-4. **Actuate**.  A bounded controller writes back to your
-   `light_targets` / `climate_target` / `humidifier_target` / `fan_target`
-   via the HA REST API, with deadbands and inter-action cool-downs so
-   it never flaps.
+All four are explainable: the
+`sensor.sleep_classifier_recommendation_explain` entity carries the
+neighbour list, weights, effective sample size, decay half-life, and
+confidence as attributes that Lovelace renders in the More-Info
+dialog.
+
+## What's new in v1.3 — for the impatient
+
+| Version | Headline |
+|---|---|
+| **v1.3.1** | Per-stage adaptation preserved when learning kicks in: AWAKE / LIGHT / DEEP / REM each apply a clinical delta on top of the learned baseline, instead of all stages collapsing onto one value. Safe-range clamps prevent runaway setpoints. |
+| **v1.3.0** | Local CNN-BiLSTM dropped — the add-on now subscribes to any HA sleep-stage sensor.  Image down from ~60 MB to ~20 MB.  Preference learner gains recorded_at + exponential decay, weekday/weekend bedtime split, current-context k-NN, and a JSON explainability panel; 4 new HA sensors mirror the reasoning. |
+
+Older release notes live in the git tag history (e.g. `git show v1.2.3`
+for the last release that bundled the local CNN-BiLSTM model).
 
 ## Installation
 
