@@ -12,6 +12,77 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.7.1] — 2026-05-13
+
+The **真·落地** release — the minimum set of fixes that separate
+"works in our test harness" from "survives a real user's first
+week".  All three of these scenarios were confirmed present in
+v1.7.0 by walking the code paths against a real HA setup:
+
+### Fixed
+
+- **Off-state AC was a no-op.**  Firing `climate.set_temperature=19`
+  against a climate entity whose state is `"off"` returns HTTP 200
+  but the AC stays off.  User wakes up in a 26 °C bedroom and
+  concludes the add-on is broken.  Fix: a new `LiveStateCache`
+  tracks each bound entity's state; when the controller plans a
+  setpoint against an off-state climate it now first injects a
+  `set_hvac_mode` (`cool` / `heat` / `auto` picked by the sign of
+  target-minus-ambient).  Same logic for `humidifier` → `turn_on`
+  before `set_humidity`.
+- **Unavailable entities got hammered silently.**  If a bulb
+  dropped off the Zigbee mesh its state became `"unavailable"`;
+  HA still accepted `light.turn_on` with a 200 but nothing changed.
+  Fix: `LiveStateCache.is_available()` gates every dispatch via
+  the new `_liveness_guard()` method.  Unreachable entities are
+  skipped and the count surfaces on
+  `sensor.sleep_classifier_last_action` under
+  `skipped_unavailable`.
+- **Manual user override got fought.**  At 03:30 the user got up
+  for the bathroom and turned the light on; 30 s later the
+  controller's next tick decided "stage=DEEP, brightness=0%" and
+  forced the light back off in the user's face.  Fix: the cache
+  classifies each state_changed event as self-echo (within 5 s of
+  our last dispatch) vs external; external changes open a
+  `user_override_grace_seconds` window (default 10 min) during
+  which the controller holds off on that entity.  Count surfaces
+  as `skipped_user_override`.
+
+### Added
+
+- **`src/live_state_cache.py`** — per-entity live state tracker
+  shared between the orchestrator (which pushes state_changed
+  events) and the controller (which reads availability / on-off /
+  override status before planning).  Seeded from the HA registry
+  snapshot at boot so the very first plan tick has accurate data.
+- `home_assistant.live_state.user_override_grace_seconds` config
+  (default 600 s) so power users can tune the manual-override
+  grace window.
+- `SmartEnvironmentController._climate_mode_for_target()` picks the
+  HVAC mode when waking an off-state climate entity.
+- 22 new tests: 15 in `test_live_state_cache.py` covering
+  availability / off-detection / user-override classification /
+  self-echo / grace expiry / stats counters; 7 in
+  `test_smart_environment_controller.py::TestOffStateAutoTurnOn /
+  TestUnavailableSkip / TestUserOverrideRespect` locking the
+  controller integration.
+
+### Changed
+
+- `SmartEnvironmentController.__init__` takes an optional
+  `live_state: LiveStateCache` parameter.  When omitted the
+  controller constructs an empty cache (pre-v1.7.1 behaviour);
+  the orchestrator wires a fully-seeded instance for production.
+- `publish_last_action` gains a `live_state_stats` parameter,
+  exposing the new counts on the existing diagnostic sensor under
+  three new attribute keys.  Empty sub-dicts are omitted so
+  healthy installs don't clutter the panel.
+
+### Medical / safety impact: none
+
+v1.7.1 touches only the device-control path.  Apnea (v1.7.0) and
+preference learning (v1.3.0 onwards) are unchanged.
+
 ## [1.7.0] — 2026-05-13
 
 Apnea / hypopnea trend monitoring lands in the main flow.  The
@@ -380,7 +451,8 @@ misbehave on its first deployed night.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.1...HEAD
+[1.7.1]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.4...v1.7.0
 [1.6.4]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.2...v1.6.3

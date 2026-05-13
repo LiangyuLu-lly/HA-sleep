@@ -48,6 +48,7 @@ from src.data_structures import SleepStage
 from src.device_capabilities import Capability, capabilities_of, is_available
 from src.device_discovery import ActionableDevices
 from src.ha_api_client import HomeAssistantClient
+from src.live_state_cache import LiveStateCache
 from src.preference_learner import (
     EnvironmentParams,
     PreferenceLearner,
@@ -361,11 +362,17 @@ class SmartEnvironmentController:
         ha_client: HomeAssistantClient,
         devices: ActionableDevices,
         learner: Optional[PreferenceLearner] = None,
+        live_state: Optional[LiveStateCache] = None,
     ) -> None:
         self.config = config
         self.ha = ha_client
         self.devices = devices
         self.learner = learner
+        # v1.7.1 — per-entity live state.  If the caller doesn't
+        # provide one, we construct an empty cache so the guards
+        # below still work (they'll just never trigger without
+        # upstream state push, matching pre-v1.7.1 behaviour).
+        self.live_state = live_state or LiveStateCache()
 
         # Bookkeeping for rate limiting and feedback signal
         self._last_action_ts: Dict[str, float] = {}
@@ -696,7 +703,9 @@ class SmartEnvironmentController:
                         # This climate entity is on/off-only or preset-only;
                         # skipping is strictly better than faking success.
                         continue
-                    # v1.6.4 — skip if previous attempts haven't moved
+                    if not self._liveness_guard(c):
+                        continue
+                    # v1.7.1 — skip if previous attempts haven't moved
                     # the room.  The controller will try again after
                     # the next stage transition.
                     if self._is_entity_saturated(
@@ -706,6 +715,32 @@ class SmartEnvironmentController:
                         now=now,
                     ):
                         continue
+                    # v1.7.1 — if the AC is currently off, inject a
+                    # climate.set_hvac_mode=auto (or cool) before the
+                    # setpoint so HA actually turns the unit on.  We
+                    # can't know whether the user wants heat vs cool
+                    # without polling the weather, so we pick the
+                    # stage-temperature vs current-temperature delta:
+                    # colder target than current → "cool", warmer →
+                    # "heat".  Same-temperature falls back to "auto"
+                    # which most ACs accept and which lets the unit
+                    # decide.
+                    if self.live_state.is_off(c.entity_id):
+                        mode = self._climate_mode_for_target(
+                            climate_target.temperature_c,
+                            current_env.temperature_c,
+                        )
+                        actions.append(ControlAction(
+                            domain="climate",
+                            service="set_hvac_mode",
+                            entity_id=c.entity_id,
+                            data={"hvac_mode": mode},
+                            reason=(
+                                f"stage={stage.name} climate is off; "
+                                f"turning on in {mode} mode before setpoint"
+                            ),
+                        ))
+                        self.live_state.count_auto_turn_on(c.entity_id)
                     actions.append(
                         ControlAction(
                             domain="climate",
@@ -730,6 +765,8 @@ class SmartEnvironmentController:
                 for h in self.devices.humidifiers:
                     if not self._device_supports(h, Capability.SET_HUMIDITY):
                         continue
+                    if not self._liveness_guard(h):
+                        continue
                     if self._is_entity_saturated(
                         "humidifier", h.entity_id,
                         target_value=humidifier_target.humidity_pct,
@@ -737,6 +774,21 @@ class SmartEnvironmentController:
                         now=now,
                     ):
                         continue
+                    # v1.7.1 — humidifier off → turn_on before set_humidity.
+                    # Unlike climate there's no "mode" question; the
+                    # humidifier just runs until target is reached.
+                    if self.live_state.is_off(h.entity_id):
+                        actions.append(ControlAction(
+                            domain="humidifier",
+                            service="turn_on",
+                            entity_id=h.entity_id,
+                            data={},
+                            reason=(
+                                f"stage={stage.name} humidifier is off; "
+                                f"turning on before setpoint"
+                            ),
+                        ))
+                        self.live_state.count_auto_turn_on(h.entity_id)
                     actions.append(
                         ControlAction(
                             domain="humidifier",
@@ -761,6 +813,8 @@ class SmartEnvironmentController:
             )
             if outside_dead and self._allow_action("light", now):
                 for light in self.devices.lights:
+                    if not self._liveness_guard(light):
+                        continue
                     if light_target.brightness_pct <= 0.5:
                         # turn_off is universal — every HA light entity
                         # answers it — so no capability gate needed.
@@ -805,6 +859,8 @@ class SmartEnvironmentController:
         if fan_target.fan_speed_pct is not None and self.devices.fans:
             if self._allow_action("fan", now):
                 for f in self.devices.fans:
+                    if not self._liveness_guard(f):
+                        continue
                     if fan_target.fan_speed_pct <= 1.0:
                         # turn_off is universal — skip the capability gate.
                         actions.append(
@@ -860,6 +916,36 @@ class SmartEnvironmentController:
         """Return True if we have waited long enough since the last action."""
         last = self._last_action_ts.get(domain, 0.0)
         return now - last >= self.config.min_seconds_between_actions
+
+    @staticmethod
+    def _climate_mode_for_target(
+        target_temp_c: float, current_env_temp_c: Optional[float],
+    ) -> str:
+        """Pick the HVAC mode string for waking a climate entity.
+
+        When the AC / heat-pump is currently off, HA needs us to set
+        ``hvac_mode`` to something other than ``"off"`` before
+        ``set_temperature`` will take effect.  We use the simplest
+        reliable heuristic:
+
+        * target > ambient → user wants warming → ``"heat"``
+        * target < ambient → user wants cooling → ``"cool"``
+        * unknown ambient or within 0.5 °C  → ``"auto"`` (most
+          modern AC / heat-pumps accept auto; the few that don't
+          will log an error in HA and we'll see it in the log).
+
+        We don't try to infer more — vendors diverge on mode names
+        (Panasonic ``heat_cool`` vs Mitsubishi ``auto`` vs Daikin
+        ``dry``) and guessing wrong is worse than asking HA's auto.
+        """
+        if current_env_temp_c is None:
+            return "auto"
+        delta = target_temp_c - current_env_temp_c
+        if delta > 0.5:
+            return "heat"
+        if delta < -0.5:
+            return "cool"
+        return "auto"
 
     # ---------------------------------------------------------------- #
     # Futile-retry suppression (v1.6.4)                                #
@@ -1035,6 +1121,36 @@ class SmartEnvironmentController:
         )
         return False
 
+    def _liveness_guard(self, entity: Any) -> bool:
+        """Return ``True`` iff the controller is allowed to dispatch a
+        service to this entity right now.
+
+        The three v1.7.1 guards, in priority order:
+
+        1. **Availability.**  If HA shows state ``unavailable`` /
+           ``unknown`` / ``""``, the device is physically unreachable
+           (dropped off the mesh, lost power, etc.).  Firing a service
+           returns 200 but the device won't hear us, and HA may start
+           buffering unsent calls.  Skip entirely.
+        2. **User override window.**  If the user manually touched this
+           entity within the grace period, they win.  The add-on's
+           whole point is to ease sleep; fighting the user in the
+           middle of the night is the fastest way to get uninstalled.
+        3. Otherwise allow.
+
+        Decisions are logged once per entity per state change (via the
+        underlying cache's own logging) and counted for the
+        diagnostic ``last_action`` sensor attribute.
+        """
+        eid = entity.entity_id
+        if not self.live_state.is_available(eid):
+            self.live_state.count_skip_unavailable(eid)
+            return False
+        if self.live_state.under_user_override(eid):
+            self.live_state.count_skip_user_override(eid)
+            return False
+        return True
+
     def capability_stats(self) -> Dict[str, int]:
         """Expose skipped-action counts keyed by capability name.
 
@@ -1089,6 +1205,10 @@ class SmartEnvironmentController:
                     **action.data,
                 )
                 self._last_action_ts[action.domain] = time.time()
+                # v1.7.1 — mark this dispatch so the resulting
+                # state_changed echo won't be misclassified as a
+                # user override when LiveStateCache sees it.
+                self.live_state.record_self_dispatch(action.entity_id)
                 logger.info("Executed %s  // %s",
                             action.describe(), action.reason)
             except Exception as exc:    # noqa: BLE001

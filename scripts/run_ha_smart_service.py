@@ -96,6 +96,7 @@ from src.smart_wake import (
 )
 from src.external_stage_subscriber import ExternalStageSubscriber
 from src.apnea_wiring import ApneaWiring, ApneaWiringConfig
+from src.live_state_cache import LiveStateCache
 from src.user_profile import UserProfile, UserProfileStore
 from src.whitenoise_matcher import Soundscape, WhiteNoiseMatcher
 
@@ -211,6 +212,18 @@ class SmartSleepService:
                 (PROJECT_ROOT / apnea_cfg.baseline_path).resolve(),
             )
         self.apnea = ApneaWiring(apnea_cfg)
+
+        # v1.7.1 — shared per-entity live-state cache.  Populated by
+        # the WebSocket listener; queried by the controller's
+        # liveness guard + off-state auto-turn-on logic.  One
+        # instance lives on the service so both routing and
+        # controller see the same data.
+        live_cfg = ha_cfg.get("live_state", {})
+        self.live_state = LiveStateCache(
+            user_override_grace_seconds=float(
+                live_cfg.get("user_override_grace_seconds", 600.0),
+            ),
+        )
 
         # --- Natural-sleep modules (v1.2.0) ----------------------------- #
         # All of these are *optional*: if the user didn't configure the
@@ -431,6 +444,13 @@ class SmartSleepService:
         # refresh the freshness timestamp, so _safe_last_env() will
         # start returning None for that field after the grace window.
         if value is None:
+            # v1.7.1 — still let the live_state cache see the event
+            # so e.g. a light going to "unavailable" is properly
+            # detected before the next plan_actions tick.
+            self._maybe_update_live_state(
+                eid, discovery, event.new_state.state,
+                event.new_state.attributes,
+            )
             return
         now = time.time()
         if any(e.entity_id == eid for e in discovery.sensors.temperature):
@@ -442,6 +462,52 @@ class SmartSleepService:
         elif any(e.entity_id == eid for e in discovery.sensors.illuminance):
             self.last_env.brightness_pct = value
             self._env_ts["brightness_pct"] = now
+        else:
+            # v1.7.1 — numeric state of a NON-sensor entity (rare:
+            # some fans report percentage as the state itself).
+            # Forward to live state for on/off + override tracking.
+            self._maybe_update_live_state(
+                eid, discovery, event.new_state.state,
+                event.new_state.attributes,
+            )
+            return
+
+        # Sensor updates also feed the live-state cache for
+        # availability/override tracking even though they don't carry
+        # on/off semantics — a temperature sensor going unavailable
+        # is useful signal for the diagnostic sensor.
+        self._maybe_update_live_state(
+            eid, discovery, event.new_state.state,
+            event.new_state.attributes,
+        )
+
+    def _maybe_update_live_state(
+        self,
+        entity_id: str,
+        discovery: DiscoveryResult,
+        new_state: str,
+        attributes: Optional[Dict[str, Any]],
+    ) -> None:
+        """Forward a state_changed to :attr:`live_state` iff the entity
+        is bound to us (either as an actionable device or a sensor
+        we read).  Random entities we don't touch shouldn't expand
+        the cache indefinitely.
+        """
+        bound_ids = set()
+        for bucket in (
+            discovery.devices.lights, discovery.devices.climates,
+            discovery.devices.fans, discovery.devices.humidifiers,
+            discovery.devices.switches, discovery.devices.media_players,
+            discovery.sensors.temperature, discovery.sensors.humidity,
+            discovery.sensors.illuminance,
+        ):
+            for e in bucket:
+                bound_ids.add(e.entity_id)
+        if entity_id not in bound_ids:
+            return
+        self.live_state.on_state_change(
+            entity_id, new_state, attributes,
+        )
 
     # ------------------------------------------------------------------ #
     # Tasks                                                              #
@@ -656,6 +722,11 @@ class SmartSleepService:
                             # devices aren't being controlled even
                             # though they're bound in Configuration.
                             skipped_by_capability=controller.capability_stats(),
+                            # v1.7.1: show unavailability / override /
+                            # auto-turn-on counts so the user can
+                            # diagnose "why didn't my AC move"
+                            # without reading the Supervisor log.
+                            live_state_stats=self.live_state.stats(),
                         )
 
                 # --- Smart-wake tick -------------------------------- #
@@ -865,10 +936,18 @@ class SmartSleepService:
                 ha_client=ha,
                 devices=discovery.devices,
                 learner=self.learner,
+                live_state=self.live_state,
             )
 
             # Initial environment snapshot
             self._seed_current_env(entities, discovery)
+
+            # v1.7.1 — seed the live-state cache with the current
+            # state of every actionable entity so the very first
+            # plan_actions() tick has accurate on/off + availability
+            # data, not just whatever state_changed events have
+            # arrived since the WebSocket connected.
+            self._seed_live_state(entities, discovery)
 
             # v1.3.0: no buffer to restore — the subscriber's first real
             # state-changed event will populate the cached stage within
@@ -1473,6 +1552,51 @@ class SmartSleepService:
             self.last_env.temperature_c, self.last_env.humidity_pct,
             self.last_env.brightness_pct,
         )
+
+    def _seed_live_state(
+        self,
+        entities: List[HAEntity],
+        discovery: DiscoveryResult,
+    ) -> None:
+        """Seed :attr:`live_state` with the HA-registry snapshot so the
+        very first plan_actions() tick has accurate on/off + availability
+        data.
+
+        Without this, the controller would see every bound entity as
+        "unknown → optimistic → let's dispatch!" for the first
+        state_changed event's worth of time (up to ``infer_interval``
+        seconds), which is long enough to send a climate.set_temperature
+        to an AC that's been off all day and have nothing happen.
+
+        Timestamps are back-dated to the entity's ``last_changed`` from
+        HA where available so the user-override grace window doesn't
+        fire spuriously for an entity that last changed hours ago.
+        """
+        now = time.time()
+        bound_ids: set[str] = set()
+        for bucket in (
+            discovery.devices.lights, discovery.devices.climates,
+            discovery.devices.fans, discovery.devices.humidifiers,
+            discovery.devices.switches, discovery.devices.media_players,
+        ):
+            for e in bucket:
+                bound_ids.add(e.entity_id)
+        by_id = {e.entity_id: e for e in entities}
+        seeded = 0
+        for eid in bound_ids:
+            ent = by_id.get(eid)
+            if ent is None:
+                continue
+            self.live_state.seed_from_registry(
+                eid, ent.state, ent.attributes, now=now,
+            )
+            seeded += 1
+        if seeded:
+            logger.info(
+                "Live-state cache seeded with %d actionable entities "
+                "from the HA registry.",
+                seeded,
+            )
 
     async def _run_dry_with_synthetic_signals(self, engine: _Engine) -> None:
         """Tiny offline smoke-test path: cycles synthetic stages and prints actions.

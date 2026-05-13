@@ -895,3 +895,212 @@ class TestFutileRetrySuppression:
             current_env_value=26.0,
             now=base_ts + 100.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# 落地 safety: live-state-cache integration (v1.7.1)
+# ---------------------------------------------------------------------------
+
+
+class TestOffStateAutoTurnOn:
+    """v1.7.1 — when the AC is off, firing set_temperature is a no-op.
+    The controller must inject set_hvac_mode first to actually wake
+    the device up before asking it for a setpoint.
+    """
+
+    async def test_climate_off_gets_set_hvac_mode_before_set_temperature(
+        self, ha_client,
+    ) -> None:
+        from src.live_state_cache import LiveStateCache
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="off",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        cache = LiveStateCache()
+        cache.seed_from_registry("climate.bedroom_ac", "off", {}, now=100.0)
+
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs,
+            learner=None, live_state=cache,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.DEEP,
+            EnvironmentParams(temperature_c=25.0),
+        )
+        climate_actions = [a for a in actions if a.domain == "climate"]
+        # Must be exactly two: hvac_mode first, set_temperature second.
+        assert len(climate_actions) == 2
+        assert climate_actions[0].service == "set_hvac_mode"
+        # Target < current (25) → cool.
+        assert climate_actions[0].data["hvac_mode"] == "cool"
+        assert climate_actions[1].service == "set_temperature"
+
+    async def test_climate_already_on_skips_set_hvac_mode(
+        self, ha_client,
+    ) -> None:
+        from src.live_state_cache import LiveStateCache
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="cool",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        cache = LiveStateCache()
+        cache.seed_from_registry("climate.bedroom_ac", "cool", {}, now=100.0)
+
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs,
+            learner=None, live_state=cache,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.DEEP,
+            EnvironmentParams(temperature_c=25.0),
+        )
+        services = [a.service for a in actions if a.domain == "climate"]
+        assert services == ["set_temperature"]
+
+    async def test_humidifier_off_gets_turn_on_before_set_humidity(
+        self, ha_client,
+    ) -> None:
+        from src.live_state_cache import LiveStateCache
+        hum = HAEntity(
+            entity_id="humidifier.bedroom", state="off",
+            attributes={},
+        )
+        devs = ActionableDevices(humidifiers=[hum])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        cache = LiveStateCache()
+        cache.seed_from_registry("humidifier.bedroom", "off", {}, now=100.0)
+
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs,
+            learner=None, live_state=cache,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.DEEP,
+            EnvironmentParams(humidity_pct=40.0),
+        )
+        hum_actions = [a for a in actions if a.domain == "humidifier"]
+        assert len(hum_actions) == 2
+        assert hum_actions[0].service == "turn_on"
+        assert hum_actions[1].service == "set_humidity"
+
+
+class TestUnavailableSkip:
+    """v1.7.1 — firing a service at an 'unavailable' entity returns 200
+    but does nothing.  The controller must skip the dispatch and
+    record the skip in diagnostics."""
+
+    async def test_unavailable_climate_skipped(self, ha_client) -> None:
+        from src.live_state_cache import LiveStateCache
+        climate = HAEntity(
+            entity_id="climate.bedroom_ac", state="unavailable",
+            attributes={"supported_features": 1},
+        )
+        devs = ActionableDevices(climates=[climate])
+        cfg = SmartControlConfig(min_seconds_between_actions=0.0)
+        cache = LiveStateCache()
+        cache.seed_from_registry(
+            "climate.bedroom_ac", "unavailable", {}, now=100.0,
+        )
+
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs,
+            learner=None, live_state=cache,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.DEEP,
+            EnvironmentParams(temperature_c=25.0),
+        )
+        assert [a for a in actions if a.domain == "climate"] == []
+        assert cache.stats()["skipped_unavailable"].get(
+            "climate.bedroom_ac",
+        ) == 1
+
+    async def test_unavailable_light_skipped(self, ha_client) -> None:
+        from src.live_state_cache import LiveStateCache
+        light = HAEntity(
+            entity_id="light.bedroom", state="unavailable",
+            attributes={"supported_color_modes": ["brightness"]},
+        )
+        devs = ActionableDevices(lights=[light])
+        cfg = SmartControlConfig(
+            min_seconds_between_actions=0.0,
+            deadband_brightness_pct=0.0,
+        )
+        cache = LiveStateCache()
+        cache.seed_from_registry(
+            "light.bedroom", "unavailable", {}, now=100.0,
+        )
+
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs,
+            learner=None, live_state=cache,
+        )
+        actions = ctl.plan_actions(
+            SleepStage.AWAKE,
+            EnvironmentParams(brightness_pct=0.0),
+        )
+        assert [a for a in actions if a.domain == "light"] == []
+
+
+class TestUserOverrideRespect:
+    """v1.7.1 — if the user just manually toggled the light, leave it
+    alone.  Auto-fighting the user is the fastest way to get
+    uninstalled."""
+
+    async def test_user_override_suppresses_actions(self, ha_client) -> None:
+        from src.live_state_cache import LiveStateCache
+        light = HAEntity(
+            entity_id="light.bedroom", state="on",
+            attributes={"supported_color_modes": ["brightness"]},
+        )
+        devs = ActionableDevices(lights=[light])
+        cfg = SmartControlConfig(
+            min_seconds_between_actions=0.0,
+            deadband_brightness_pct=0.0,
+        )
+        cache = LiveStateCache(user_override_grace_seconds=600.0)
+        # Seed off at t=100.
+        cache.seed_from_registry("light.bedroom", "off", {}, now=100.0)
+        # User manually flipped it on at t=200 (no self-dispatch
+        # recorded → classified as user).
+        cache.on_state_change("light.bedroom", "on", now=200.0)
+
+        ctl = SmartEnvironmentController(
+            config=cfg, ha_client=ha_client, devices=devs,
+            learner=None, live_state=cache,
+        )
+
+        # Monkey-patch `under_user_override` to use an unambiguous
+        # "now" so the test is deterministic regardless of wall-clock.
+        _orig = cache.under_user_override
+        cache.under_user_override = lambda eid, now=None: _orig(
+            eid, now=300.0,     # 100 s after override → well within 600 s grace
+        )
+        actions = ctl.plan_actions(
+            SleepStage.DEEP,
+            EnvironmentParams(brightness_pct=100.0),   # stage wants 0%
+        )
+        # Would have fired turn_off, but user override holds us back.
+        assert [a for a in actions if a.domain == "light"] == []
+        assert cache.stats()["skipped_user_override"].get(
+            "light.bedroom",
+        ) == 1
+
+    async def test_self_dispatch_not_classified_as_override(
+        self, ha_client,
+    ) -> None:
+        """After we fire turn_on, the state_changed echo must NOT
+        trigger the override grace window."""
+        from src.live_state_cache import LiveStateCache
+        cache = LiveStateCache(user_override_grace_seconds=600.0)
+        cache.seed_from_registry("light.bedroom", "off", {}, now=100.0)
+        # Controller dispatches turn_on.
+        cache.record_self_dispatch("light.bedroom", now=200.0)
+        # HA echoes 1 s later.
+        cache.on_state_change("light.bedroom", "on", now=201.0)
+        # NOT override.
+        assert not cache.under_user_override("light.bedroom", now=300.0)

@@ -587,6 +587,7 @@ class SleepStatePublisher:
         *,
         executed: bool,
         skipped_by_capability: Optional[Dict[str, int]] = None,
+        live_state_stats: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> None:
         """Surface the most recent device action (or 'planned only' in dry-run).
 
@@ -597,12 +598,17 @@ class SleepStatePublisher:
         ``skipped_by_capability`` (v1.6.2) is a mapping from
         :class:`src.device_capabilities.Capability` value strings to the
         count of actions the controller declined to issue because the
-        bound entity didn't advertise that feature.  Exposing it on
-        the diagnostics sensor lets the user see, on their Lovelace
-        dashboard, that e.g. their AC was skipped 12 times today for
-        ``set_temperature`` support — a strong hint that the
-        entity_id in Configuration is pointing at a preset-only
-        device and should be rebound.
+        bound entity didn't advertise that feature.
+
+        ``live_state_stats`` (v1.7.1) is the dict returned by
+        :meth:`src.live_state_cache.LiveStateCache.stats`: three sub-dicts
+        keyed by entity_id showing how many times the controller
+        skipped a dispatch because the device was unavailable,
+        respected a user override, or injected an auto-turn-on.
+        Exposing it on the diagnostics sensor lets users see, on
+        their Lovelace dashboard, why the system is sometimes
+        deliberately silent — "light.bedroom was in user override
+        3 times today" is a much clearer signal than "no actions".
         """
         attrs = dict(_STATIC_ATTRS_LAST_ACTION)
         attrs["executed"] = bool(executed)
@@ -616,6 +622,17 @@ class SleepStatePublisher:
                 )
             )
             attrs["skipped_by_capability"] = ordered
+        if live_state_stats:
+            # Only surface sub-dicts that have any entries, to keep
+            # the attribute panel uncluttered on healthy installs.
+            for key in (
+                "skipped_unavailable",
+                "skipped_user_override",
+                "auto_turn_on_injected",
+            ):
+                value = live_state_stats.get(key)
+                if value:
+                    attrs[key] = value
         truncated = (summary or "—")[:255]
         await self._safe_update(ENTITY_LAST_ACTION, truncated, attrs)
 
