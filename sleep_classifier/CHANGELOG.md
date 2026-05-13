@@ -71,3 +71,16 @@
 - 📱 移除本地 CNN-BiLSTM 模型
 - 🔗 改为订阅任意 HA 睡眠分阶实体
 - 🌏 支持 Apple Watch / 小米手环 / Fitbit / sleep_as_android 等所有设备
+
+---
+
+## v2.0.1 (2026-05-13) — 构建系统切到 Docker Hub
+
+用户 HA 的 Docker 拉 `ghcr.io/home-assistant/*-base:3.19` 时卡死
+10+ 分钟（国内网络 ghcr.io 不稳定）。改为 `python:3.11-alpine`
+基础镜像，走 Docker Hub（国内镜像加速器有缓存）。
+
+- Dockerfile base image: `ghcr.io/home-assistant/aarch64-base:3.19`
+  → `python:3.11-alpine`
+- 镜像体积略减（~15 MB → ~12 MB，省去 bashio/s6-overlay）
+- 构建时间从卡死 → Pi 4B 上约 90 秒
