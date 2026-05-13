@@ -392,3 +392,60 @@ class TestPerStageDeltas:
         # Allow some slack for decay over the millisecond between record
         # and read.
         assert result["DEEP"]["ess"] > 5.9
+
+
+# ---------------------------------------------------------------------------
+# v1.9.0 — Timezone robustness
+# ---------------------------------------------------------------------------
+
+
+class TestTimezoneRobustness:
+    """Verify recommend_bedtime handles DST transitions gracefully."""
+
+    def test_recommend_bedtime_handles_dst_transition(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """recommend_bedtime must not crash when now_local() lands on a
+        DST spring-forward boundary (e.g. 2024-03-31 02:30 in CET,
+        which doesn't exist in wall-clock time but can appear if the
+        system clock is slightly off or the TZ database is stale).
+
+        We monkeypatch now_local to return a naive datetime on the
+        transition day and verify the method returns a sane result.
+        """
+        from datetime import datetime
+        from src import _time_utils
+
+        # Simulate a DST spring-forward day: 2024-03-31 02:30 (CET→CEST).
+        # In reality 02:30 doesn't exist (clocks jump 02:00→03:00), but
+        # naive local datetimes can still hold this value.
+        dst_moment = datetime(2024, 3, 31, 2, 30, 0)
+        monkeypatch.setattr(_time_utils, "now_local", lambda: dst_moment)
+
+        cfg = PreferenceConfig(
+            history_path=str(tmp_path / "h.json"),
+            min_sessions_for_personalisation=3,
+        )
+        learner = PreferenceLearner(cfg)
+
+        # Seed enough sessions so the bedtime recommendation fires.
+        # Place bedtimes around 23:00 on weekdays.
+        base_ts = datetime(2024, 3, 25, 23, 0, 0).timestamp()
+        for i in range(5):
+            learner.record_session(SleepSession(
+                session_id=f"dst_{i}",
+                started_at=base_ts + i * 86400,
+                ended_at=base_ts + i * 86400 + 7 * 3600,
+                env_params=EnvironmentParams(temperature_c=20.0, humidity_pct=50.0),
+                stage_counts={"AWAKE": 5, "LIGHT": 70, "DEEP": 15, "REM": 10},
+                quality_score=75.0,
+                n_samples=100,
+            ))
+
+        # Must not raise — and should return a non-None weekday bedtime.
+        result = learner.recommend_bedtime(now=dst_moment)
+        assert result is not None
+        assert result["weekday_bedtime"] is not None
+        # Sanity: the recommended bedtime should be in the evening range.
+        hh = int(result["weekday_bedtime"].split(":")[0])
+        assert hh >= 20 or hh <= 2, f"Unexpected bedtime hour: {hh}"

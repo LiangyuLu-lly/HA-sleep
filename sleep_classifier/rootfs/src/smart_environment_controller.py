@@ -274,6 +274,10 @@ class SmartControlConfig:
     # seconds before the subscriber's ``current()`` reports it.  Set
     # to 0 to disable (controller acts on every observation).
     min_stage_dwell_seconds: float = 60.0
+    # v1.9.0 — user temperature override.  When set (via an HA
+    # input_number entity), the controller uses this value instead of
+    # the learner's recommended temperature_c in _baseline().
+    user_temperature_override_c: Optional[float] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "SmartControlConfig":
@@ -458,13 +462,25 @@ class SmartEnvironmentController:
 
         Returns the LIGHT defaults if the learner is absent or has no
         history yet.  Exploration is opt-in via :meth:`_should_explore`.
+
+        v1.9.0: if ``config.user_temperature_override_c`` is set (from
+        an HA input_number), it replaces the learner's temperature_c.
         """
         defaults = _DEFAULT_TARGETS[SleepStage.LIGHT]
         if self.learner is None:
-            return defaults
-        return self.learner.recommend(
-            defaults, explore=self._should_explore(),
-        )
+            baseline = defaults
+        else:
+            baseline = self.learner.recommend(
+                defaults, explore=self._should_explore(),
+            )
+        if self.config.user_temperature_override_c is not None:
+            baseline = EnvironmentParams(
+                temperature_c=self.config.user_temperature_override_c,
+                humidity_pct=baseline.humidity_pct,
+                brightness_pct=baseline.brightness_pct,
+                fan_speed_pct=baseline.fan_speed_pct,
+            )
+        return baseline
 
     # Cache TTL for the learner's per-stage-delta computation.  120 s
     # is well under our typical 30 s inference cadence × 4 stages, so

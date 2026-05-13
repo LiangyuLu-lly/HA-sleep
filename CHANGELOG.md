@@ -12,6 +12,42 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.9.0] — 2026-05-15
+
+**商业化完善 pass** — 用户反馈机制、边缘场景加固、压力测试。
+
+### Added
+
+- **用户温度覆盖 input_number（Sprint 2A）**：
+  `home_assistant.natural_sleep.temperature_override_entity` 配置项。
+  用户通过 HA `input_number` 实体设置温度后，controller 的
+  `_baseline()` 使用该值覆盖 learner 推荐的 `temperature_c`。
+  `SmartControlConfig` 新增 `user_temperature_override_c: Optional[float]`
+  字段。
+
+- **首晚诊断报告（Sprint 2B）**：
+  第一个完整 session 结束后，log 一条 INFO 级别的诊断摘要，
+  包含 session 时长、quality_score、stage 分布百分比、环境快照，
+  以及"预计 3 晚后开始个性化推荐"的提示。
+
+- **DST 时区稳健性测试（Sprint 3A）**：
+  `test_recommend_bedtime_handles_dst_transition` 验证
+  `recommend_bedtime()` 在 DST 切换日不崩溃且返回合理值。
+
+- **HA core 重启延迟（Sprint 3B）**：
+  `run()` 中 `publish_initial_placeholders()` 前增加
+  `await asyncio.sleep(2.0)` 延迟，让 HA REST API 完全就绪。
+
+- **7 天 learner 收敛测试（Sprint 4A）**：
+  `tests/test_learner_convergence.py`，验证 7 个一致 session 后
+  `recommend()` 的 temperature_c 收敛到 ±0.5°C、
+  `recommend_bedtime()` 返回非 None、
+  `recommend_knn()` confidence > 0.5。
+
+- **事件风暴压力测试（Sprint 4B）**：
+  `tests/test_event_storm.py`，1000 个 state_changed 事件在
+  快速连续到达时不崩、不丢事件、env 最终值正确。
+
 ## [1.8.0] — 2026-05-14
 
 **商业化落地 pass** — 面向生产环境的可观测性、质量细分、

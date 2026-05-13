@@ -295,6 +295,13 @@ class SmartSleepService:
                 scale=int(natural_cfg.get("feedback_scale", 5)),
             )
 
+        # v1.9.0 — user temperature override input_number.  When the
+        # user sets a value via this entity, the controller's _baseline()
+        # uses it instead of the learner's recommended temperature_c.
+        self._temperature_override_entity: str = str(
+            natural_cfg.get("temperature_override_entity") or ""
+        ).strip()
+
         # v1.3.0: stage now comes from an external HA entity (Mi Band /
         # Apple Watch / Withings / etc) instead of a local CNN-BiLSTM
         # forward pass.  The entity_id is mandatory in live mode but the
@@ -428,6 +435,25 @@ class SmartSleepService:
         # entities sometimes hold non-numeric text (e.g. "skipped").
         if self.feedback is not None and eid == self.feedback.entity_id:
             self.feedback.on_state_change(event)
+            return
+
+        # ---- 2a. Temperature override input_number (v1.9.0) ----------
+        # When the user sets a value via this entity, the controller's
+        # _baseline() uses it instead of the learner's temperature_c.
+        if self._temperature_override_entity and eid == self._temperature_override_entity:
+            try:
+                value = float(event.new_state.state)
+                self.ctrl_cfg.user_temperature_override_c = value
+                logger.info(
+                    "User temperature override updated: %.1f °C", value,
+                )
+            except (TypeError, ValueError):
+                # Non-numeric state (e.g. "unavailable") — clear override.
+                self.ctrl_cfg.user_temperature_override_c = None
+                logger.debug(
+                    "Temperature override cleared (state=%r)",
+                    event.new_state.state,
+                )
             return
 
         # ---- 2b. Apnea wiring (v1.7.0) ------------------------------
@@ -852,6 +878,31 @@ class SmartSleepService:
                 "Session %s checkpoint — quality=%.1f (history: %s)",
                 session.session_id, score, self.learner.status(),
             )
+
+            # v1.9.0 — first-night diagnostic report.  After the very
+            # first complete session, log a summary so the user knows
+            # the system is working and what to expect next.
+            if not partial and self.learner.n_sessions() == 1:
+                duration_h = (session.ended_at - session.started_at) / 3600.0
+                total_epochs = sum(session.stage_counts.values()) or 1
+                stage_pcts = {
+                    k: f"{v / total_epochs * 100:.1f}%"
+                    for k, v in session.stage_counts.items()
+                }
+                logger.info(
+                    "═══ 首晚诊断报告 ═══\n"
+                    "  session 时长: %.1f 小时\n"
+                    "  quality_score: %.1f\n"
+                    "  stage 分布: %s\n"
+                    "  环境快照: temperature=%.1f°C humidity=%.0f%% brightness=%.0f%%\n"
+                    "  系统已开始学习您的偏好，预计 3 晚后开始个性化推荐",
+                    duration_h,
+                    score,
+                    stage_pcts,
+                    self.last_env.temperature_c or 0.0,
+                    self.last_env.humidity_pct or 0.0,
+                    self.last_env.brightness_pct or 0.0,
+                )
             # Feed the same evidence into the user profile so the
             # recommended-sleep-hours estimate tracks the user's
             # actual "good night" distribution.
@@ -980,6 +1031,12 @@ class SmartSleepService:
 
             # Diagnostic state publisher — populates HA Lovelace entities.
             self.publisher = SleepStatePublisher(ha)
+
+            # v1.9.0 — delay before first publish to let HA core's REST
+            # API fully initialise after a restart.  Without this, the
+            # first POST /api/states/<entity> can 502 if the add-on
+            # starts faster than HA core's internal state machine.
+            await asyncio.sleep(2.0)
 
             # Seed every entity at boot so Lovelace cards stop showing
             # "Entity not available" for the first ~10 minutes.
