@@ -1,8 +1,30 @@
 # Sleep Classifier — Home Assistant Add-on 用户手册
 
+> **当前版本：v2.0.0** · [查看更新日志](#更新日志) · [GitHub](https://github.com/LiangyuLu-lly/HA-sleep)
+
 **这个 Add-on 做什么**：从你自己的睡眠历史中学习最佳卧室环境（温度、湿度、亮度、风扇），然后在整夜各个睡眠阶段自动调节，让你每晚都睡在"最好的那几晚"的条件里。
 
 唯一必需的输入是一个 HA 中已有的睡眠阶段实体——小米手环、Apple Watch、Fitbit、sleep_as_android、毫米波雷达等都可以。Add-on 不需要专用硬件，也不运行本地模型。
+
+---
+
+## 🆕 v2.0.0 亮点（相对 v1.6.0）
+
+一年内从 v1.6.0 → v2.0.0 的 8 次迭代，把一个 MVP 打磨成了可商业化的产品：
+
+- **20 个 HA sensor**（从 v1.6.0 的 14 个扩展）—— 包括健康状态、质量 4 子分、呼吸暂停趋势
+- **设备能力感知**（v1.6.2）—— 不会给不支持温控的空调发 `set_temperature`
+- **真实世界稳健性**（v1.6.3+）—— 手环掉线不会锁死卧室、睡眠 session 独立统计、空调饱和时不再重复发指令
+- **Zigbee2MQTT / Matter 支持**（最新）—— 即使 `supported_features=0` 也能从属性推断设备能力
+- **午睡过滤**（v1.8.0）—— < 60 分钟的 session 不污染学习模型
+- **数据滚动备份**（v1.8.0）—— `user_preferences.json` 损坏时自动从 `.bak` 恢复
+- **用户反馈通道**（v1.9.0）—— `input_number` 直接覆盖学到的温度
+- **白噪音一键降音量**（v2.0.0）—— `input_button` 触发音量降 30%
+- **双语日志**（v2.0.0）—— 关键消息中英双语（`LANG=zh` 自动切换）
+- **4-view Lovelace 仪表板**（v2.0.0）—— 覆盖全部 20 个 sensor
+- **诊断导出命令**（v2.0.0）—— `docker exec ... python scripts/diagnostic_export.py`
+
+完整更新日志见底部 [更新日志](#更新日志) 章节。
 
 ---
 
@@ -275,3 +297,82 @@ docker exec -it addon_local_sleep_classifier \
 - 安装指南：[INSTALL.md](https://github.com/LiangyuLu-lly/HA-sleep/blob/main/INSTALL.md)
 - 常见问题：[docs/FAQ.md](https://github.com/LiangyuLu-lly/HA-sleep/blob/main/docs/FAQ.md)
 - 开发者文档：`docs/` 目录
+
+
+---
+
+## 更新日志
+
+> 下面只列出**用户能感受到的**变化；完整工程日志见 GitHub 上的 [`CHANGELOG.md`](https://github.com/LiangyuLu-lly/HA-sleep/blob/main/CHANGELOG.md)。
+
+### v2.0.0 — 2026-05-14（当前版本）
+
+**商业化打磨版**。面向"第一次装上就能用得好"的体验全面升级。
+
+- ✨ **4-view Lovelace 仪表板**：从单卡片升级到完整的 4 页面仪表板（今晚/学习/健康/质量细分），覆盖全部 20 个 sensor。YAML 在 GitHub 的 `examples/lovelace_dashboard.yaml`
+- 🌐 **双语日志**：关键用户可见消息中英双语（系统 LANG 包含 zh 时显示中文）
+- 📋 **FAQ 常见问题**：新增 11 条常见问题解答（本文档下方）
+- 🔧 **诊断导出**：`docker exec addon_xxx_sleep_classifier python scripts/diagnostic_export.py` 可导出配置 + 学习状态（不含 token）
+- 🎵 **白噪音一键降音量**：创建 `input_button.sleep_classifier_too_loud`，按一下音量降 30%
+- ✅ **min_ha_version 声明**：强制 HA ≥ 2024.1.0，防止老版本安装失败
+- 🧪 **501 个测试**（从 483 增加）
+
+### v1.9.0 — 2026-05-13
+
+**用户反馈 + 边界加固**。
+
+- 🎛️ **用户温度覆盖**：配置 `temperature_override_entity`（`input_number`），用户调一下就能手动覆盖学到的温度
+- 📊 **首晚诊断报告**：第一次完整 session 结束时，Add-on 日志会输出一份详细报告（时长、阶段分布、质量分、环境快照）
+- 🕐 **时区稳健性**：夏令时切换日不再崩溃
+- ⏱️ **HA 重启兼容**：Add-on 启动时延迟 2 秒再发首次数据，避免抢跑 HA REST API
+- 🧪 **压力测试**：1000 个事件/秒不丢数据、7 天合成数据验证学习收敛
+
+### v1.8.0 — 2026-05-13
+
+**可观测性 + 数据保护**。
+
+- 🚥 **健康状态 sensor** (`sensor.sleep_classifier_health`)：一眼看系统是 `healthy` / `degraded` / `error`，属性暴露每项子状态
+- 📈 **质量 4 子分 sensor**：`quality_architecture` / `_efficiency` / `_fragmentation` / `_onset`，分开看才知道哪里扣分
+- 💤 **午睡过滤**：< 60 分钟的 session 不会被记录到学习器，避免污染夜间模型
+- 💾 **滚动备份**：`user_preferences.json` 每次保存前复制到 `.bak`，主文件损坏时自动从备份恢复
+- ✅ **端到端测试**：合成 8 小时完整夜晚测试整条链路
+
+### v1.7.0 — 2026-05-13
+
+**呼吸暂停趋势监测**（opt-in，带医疗免责）。
+
+- 🫁 **apnea_index sensor**：配置毫米波雷达的呼吸率实体 + `input_boolean` 同意开关，7 晚校准后开始显示 `green` / `amber` / `red` 趋势
+- ⚠️ **完全不公开 AHI 数值**：只显示等级，防止误读为医疗诊断
+- 🔒 **撤销同意立即清除所有基线数据**
+
+### v1.6.4 — 2026-05-13
+
+**环境稳健性**。
+
+- 🌡️ **传感器过期守卫**：15 分钟没报告的传感器视为无效，不会用旧数据做决策
+- 🛑 **饱和设备抑制**：空调已经全力制冷但房间温度不降时，不再每 2 分钟重复发同一个设定点
+- 🔄 **stage 切换自动重置抑制**
+
+### v1.6.3 — 2026-05-13
+
+**Session 生命周期重构**。
+
+- ⏰ **Session 边界检测**：非 AWAKE 持续 5 分钟 = session 开始；AWAKE 持续 10 分钟 = session 结束
+- 👤 **每个 session 独立统计**：不再把两晚的数据混在一起算 quality
+- 🔁 **Session 结束后自动 rotate**：新 session_id、stage_counts 归零
+
+### v1.6.2 — 2026-05-12
+
+**设备能力感知**。
+
+- 🧠 **capability gating**：启动时读每个绑定设备的 `supported_features`，不支持 `set_temperature` 的空调不会收到温度指令（避免 HA 假装执行成功但实际无动作的坑）
+- 🔄 **优雅降级**：只能 on/off 的灯不会收到 `brightness_pct`；只有 preset_mode 的风扇自动转换 20%→`low` / 50%→`medium` / 80%→`high`
+
+### v1.6.0 及更早
+
+完整日志见 [`CHANGELOG.md`](https://github.com/LiangyuLu-lly/HA-sleep/blob/main/CHANGELOG.md)。主要里程碑：
+
+- **v1.6.0**：`LearningPanelPublisher` 抽象 + WebSocket 断线重连 + 60 秒 bedtime 缓存
+- **v1.5.0**：Per-stage deltas 也从用户数据学习（不仅学中点）
+- **v1.4.0**：per-actuator 预测（AC 提前 15 分钟预冷）+ wind-down 预冷 + stage 抖动过滤
+- **v1.3.0**：移除本地 CNN-BiLSTM 模型，改为订阅任意 HA 睡眠阶段实体
