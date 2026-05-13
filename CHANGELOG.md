@@ -12,6 +12,53 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [2.0.2] — 2026-05-14
+
+**First-install bring-up hardening.** v2.0.1 made the container build on
+Chinese networks but exposed a second class of problems: during the very
+first install the user has no `sleep_stage_source` bound yet, which made
+the smart service exit with code 4, which made Supervisor restart the
+container, which took the Web UI offline for ~3 s every cycle — exactly
+when the user clicked "Reload entities" the browser hit the restart
+window and HA Ingress returned 502.
+
+### Fixed
+
+- **Web UI now runs as PID 1 (`exec` at end of `run.sh`)**; the Python
+  smart service is supervised in the background by a small bash loop
+  with exponential back-off (2 s → 60 s).  Crashes in the service no
+  longer take the Web UI down with them, so Ingress always has someone
+  to talk to.
+- **Missing `sleep_stage_source` no longer triggers a container restart
+  loop.**  The supervisor checks the effective config before each launch
+  attempt and sleeps for 30 s (re-reading the config) when the binding
+  is empty, keeping the Web UI alive until the user picks an entity.
+- **Heredoc-embedded Python in `run.sh` is gone.**  User-supplied
+  options (particularly Chinese entity names or values containing
+  quotes) could break the `"""$VAR"""` shell interpolation.  The
+  effective-config generator is now its own file
+  (`sleep_classifier/render_effective_config.py`) that reads every
+  option via `os.environ.get("SC_*")` — no string injection anywhere.
+- **Image slim-down**: Dockerfile now strips `__pycache__` / `.pyc`
+  from `/app` as part of the build so any stray files left behind by
+  `prepare.sh` on a dev machine don't bloat or confuse the runtime
+  image.
+
+### Notes for upgraders
+
+If you were already on v2.0.1, restart the add-on once after updating to
+v2.0.2.  The new supervisor pattern reconciles itself automatically
+(old runtime state in `/data` is compatible).
+
+## [2.0.1] — 2026-05-14
+
+**Build-time network fix for mainland-China users.**  Switched the
+Docker base image from `ghcr.io/home-assistant/aarch64-base:3.19` to
+`python:3.11-alpine` so Supervisor can pull through Docker Hub mirrors.
+Before: builds stalled at 3 % CPU for 10+ minutes.  After: 2 minutes.
+
+No runtime behaviour changes.
+
 ## [2.0.0] — 2026-05-16
 
 **商业化最终 pass** — 把所有剩余的可自闭环完成的问题一次性解决。

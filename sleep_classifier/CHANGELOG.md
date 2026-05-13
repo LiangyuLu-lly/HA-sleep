@@ -3,6 +3,25 @@
 > 这个文件会显示在 HA 的 Add-on 更新提示对话框里。
 > 完整工程日志见 GitHub 上的 [`CHANGELOG.md`](https://github.com/LiangyuLu-lly/HA-sleep/blob/main/CHANGELOG.md)。
 
+## v2.0.2 (2026-05-14) — 首次安装体验修复
+
+- 🩹 **修复 Web UI 点「重新加载实体列表」偶发 502**：容器架构重构 —
+  Web UI 现在是前台 PID 1（永远在线），主服务在后台由 bash 循环监管，
+  崩溃不再拖垮容器。
+- 🔒 **修复未配置 `sleep_stage_source` 时的死循环**：主服务不再直接退出触发
+  容器重启，而是等到用户在 Web UI 绑定了睡眠阶段实体再启动。
+- 🛡️ **修复用户输入含中文/引号时 `run.sh` 的 heredoc 注入问题**：
+  把 Python 配置生成器从 run.sh 的 heredoc 搬到独立文件
+  `render_effective_config.py`，通过环境变量传参，彻底消除 shell 字符串
+  插值。
+- 🧹 镜像构建时自动清理 `__pycache__` 和 `.pyc` 残留。
+
+## v2.0.1 (2026-05-14) — 网络适配
+
+- 🐳 切换基础镜像从 `ghcr.io/home-assistant/aarch64-base:3.19` 到
+  Docker Hub 的 `python:3.11-alpine`，在国内网络环境下构建速度从「卡 10+ 分钟」
+  变成「2 分钟内完成」。
+
 ## v2.0.0 (2026-05-14) — 商业化打磨版
 
 - 🎨 全新 4-view Lovelace 仪表板（覆盖全部 20 个 sensor）

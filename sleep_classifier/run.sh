@@ -2,11 +2,29 @@
 # Entrypoint for the Sleep Classifier add-on.
 #
 # Reads user-supplied options from /data/options.json (populated by the HA
-# supervisor from the add-on Configuration UI), then exec's the smart service
-# with the matching CLI flags.
+# supervisor from the add-on Configuration UI), then generates an effective
+# config + launches the Web UI (always) and the Python smart service (only
+# when a sleep-stage entity has been bound).
 #
-# The supervisor injects SUPERVISOR_TOKEN; we use the Supervisor's HA core
-# proxy URL (http://supervisor/core) so the user never deals with a token.
+# v2.0.2 architectural change
+# ---------------------------
+# Previously this script ``exec``'d the smart service in the foreground,
+# so when the service exited (e.g. ``sleep_stage_source`` not configured
+# yet) the whole container died and Supervisor restarted it in a tight
+# loop.  During each restart the Web UI was unreachable for ~3 s, which
+# was exactly when users clicked "Reload entities" → HA Ingress returned
+# 502 ("Cannot connect to host ..:8099").
+#
+# The new pattern keeps the Web UI as the container's foreground
+# process and supervises the smart service in the background:
+#
+#   * Web UI is ALWAYS up, even before any entity is bound.
+#   * Smart service starts only when sleep_stage_source is non-empty;
+#     if it crashes we restart it with exponential back-off without
+#     killing the container (so Ingress never 502s during crash loops).
+#
+# The supervisor injects SUPERVISOR_TOKEN; we use the HA core proxy URL
+# (http://supervisor/core) so the user never deals with a token.
 set -euo pipefail
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -63,6 +81,7 @@ WHITENOISE_TARGET=$(opt '.whitenoise_target // ""')
 WHITENOISE_VOLUME_SCALE=$(opt '.whitenoise_volume_scale // 1.0')
 # `key=value` pairs, joined with `;` so we can survive a shell var.
 WHITENOISE_TRACK_OVERRIDES=$(jq -r '.whitenoise_track_overrides // [] | join(";")' /data/options.json)
+WHITENOISE_VOLUME_FEEDBACK_ENTITY=$(opt '.whitenoise_volume_feedback_entity // ""')
 FEEDBACK_ENTITY=$(opt '.feedback_entity // ""')
 FEEDBACK_SCALE=$(opt '.feedback_scale // 5')
 
@@ -72,203 +91,52 @@ APNEA_AMPLITUDE=$(opt '.apnea_chest_amplitude_source // ""')
 APNEA_CONSENT=$(opt '.apnea_consent_entity // ""')
 APNEA_CALIBRATION_NIGHTS=$(opt '.apnea_calibration_nights // 7')
 
-# ── Generate an effective config.json that merges user options on top of the
-# ── bundled defaults.  Done in Python because jq + nested merge is awkward.
-python3 - <<PY
-import json, os
-from pathlib import Path
+# ── Export to env so the Python generator script sees them.  We use
+# env-var passing rather than heredoc ``"""$VAR"""`` injection because
+# any user-provided value can contain quotes / backslashes / Chinese
+# text that would break the heredoc quoting.
+export SC_AREA="$AREA"
+export SC_DRY_RUN="$DRY_RUN"
+export SC_MIN_SECONDS_BETWEEN_ACTIONS="$MIN_SECONDS_BETWEEN_ACTIONS"
+export SC_DEADBAND_T="$DEADBAND_T"
+export SC_DEADBAND_H="$DEADBAND_H"
+export SC_DEADBAND_B="$DEADBAND_B"
+export SC_WIND_DOWN_MINUTES="$WIND_DOWN_MINUTES"
+export SC_MIN_STAGE_DWELL_SECONDS="$MIN_STAGE_DWELL_SECONDS"
+export SC_EXPLORATION_RATE="$EXPLORATION_RATE"
+export SC_STAGE_SOURCE="$STAGE_SOURCE"
+export SC_TEMP_SOURCE="$TEMP_SOURCE"
+export SC_HUM_SOURCE="$HUM_SOURCE"
+export SC_LUX_SOURCE="$LUX_SOURCE"
+export SC_LIGHT_TARGETS="$LIGHT_TARGETS"
+export SC_CLIMATE_TARGET="$CLIMATE_TARGET"
+export SC_HUMIDIFIER_TARGET="$HUMIDIFIER_TARGET"
+export SC_FAN_TARGET="$FAN_TARGET"
+export SC_SWITCH_TARGETS="$SWITCH_TARGETS"
+export SC_DOMAINS="$DOMAINS"
+export SC_INCLUDES="$INCLUDES"
+export SC_EXCLUDES="$EXCLUDES"
+export SC_BIRTH_YEAR="$BIRTH_YEAR"
+export SC_CHRONOTYPE="$CHRONOTYPE"
+export SC_WAKE_START="$WAKE_START"
+export SC_WAKE_END="$WAKE_END"
+export SC_WAKE_LIGHTS="$WAKE_LIGHTS"
+export SC_WHITENOISE_TARGET="$WHITENOISE_TARGET"
+export SC_WHITENOISE_VOLUME_SCALE="$WHITENOISE_VOLUME_SCALE"
+export SC_WHITENOISE_TRACK_OVERRIDES="$WHITENOISE_TRACK_OVERRIDES"
+export SC_WHITENOISE_VOLUME_FEEDBACK_ENTITY="$WHITENOISE_VOLUME_FEEDBACK_ENTITY"
+export SC_FEEDBACK_ENTITY="$FEEDBACK_ENTITY"
+export SC_FEEDBACK_SCALE="$FEEDBACK_SCALE"
+export SC_APNEA_RATE="$APNEA_RATE"
+export SC_APNEA_AMPLITUDE="$APNEA_AMPLITUDE"
+export SC_APNEA_CONSENT="$APNEA_CONSENT"
+export SC_APNEA_CALIBRATION_NIGHTS="$APNEA_CALIBRATION_NIGHTS"
 
-base = json.loads(Path("/app/training_config/config.json").read_text(encoding="utf-8"))
-ha = base.setdefault("home_assistant", {})
-api = ha.setdefault("api", {})
-
-# ── Web-UI overrides (entity picker) ─────────────────────────────────
-# If the user used the embedded picker, /data/web_ui_overrides.json
-# carries their selections.  These take precedence over whatever they
-# typed (or didn't type) into the Configuration form, because the picker
-# only writes entity_ids that are guaranteed to exist in HA.
-_overrides_path = Path("/data/web_ui_overrides.json")
-_overrides = {}
-if _overrides_path.is_file():
-    try:
-        _overrides = json.loads(_overrides_path.read_text(encoding="utf-8"))
-        print(f"[run.sh] applied {_overrides_path} (web UI picks)")
-    except Exception as exc:    # noqa: BLE001
-        print(f"[run.sh] WARN: could not parse {_overrides_path}: {exc}")
-
-# Supervisor proxy auth — no user token needed
-api["base_url"] = "http://supervisor/core"
-api["access_token"] = os.environ.get("SUPERVISOR_TOKEN", "")
-api["verify_ssl"] = False
-api["area_filter"] = """$AREA"""    # _norm() applied below where needed
-
-def _norm(value):
-    """Treat literal ``""`` / ``''`` (which users frequently type into the
-    HA Configuration UI thinking it means *empty*) as a real empty
-    string.  Without this, downstream code mistakes a 2-char ``"\""``
-    for a valid entity_id and tries to subscribe to it.
-    """
-    v = (value or "").strip()
-    if v in ('""', "''"):
-        return ""
-    return v
-
-def csv_to_list(s):
-    return [v for v in (_norm(x) for x in s.split(",")) if v]
-
-def one(value):
-    """Wrap a single non-empty entity_id in a list, otherwise empty list."""
-    v = _norm(value)
-    return [v] if v else []
-
-domains = csv_to_list("""$DOMAINS""")
-inc = csv_to_list("""$INCLUDES""")
-exc = csv_to_list("""$EXCLUDES""")
-
-if domains: api["controllable_domains"] = domains
-if inc: api["explicit_includes"] = inc
-if exc: api["explicit_excludes"] = exc
-
-# v1.3.0: stash the sleep-stage entity at the top level of ``api``;
-# SmartSleepService reads it from ``home_assistant.api.sleep_stage_source``.
-_stage = _norm("""$STAGE_SOURCE""")
-if _stage:
-    api["sleep_stage_source"] = _stage
-
-# ----- Slot bindings -----------------------------------------------------
-# Each slot maps to a list of entity_ids; empty list ⇒ keyword scan owns it.
-# ``_with_override(slot, form_value)`` — if the web UI picker wrote an
-# entry for this slot, use that; otherwise fall back to the Configuration
-# form value.  Single-valued slots wrap a non-empty string into a list.
-def _slot_single(override_key, form_value):
-    if override_key in _overrides:
-        v = _norm(_overrides[override_key])
-        return [v] if v else []
-    return one(form_value)
-
-def _slot_multi(override_key, form_value_csv):
-    if override_key in _overrides:
-        raw = _overrides[override_key]
-        if isinstance(raw, list):
-            return [v for v in (_norm(x) for x in raw) if v]
-        v = _norm(raw)
-        return [v] if v else []
-    return csv_to_list(form_value_csv)
-
-slot_bindings = {
-    "temperature":    _slot_single("temperature_source", """$TEMP_SOURCE"""),
-    "humidity":       _slot_single("humidity_source", """$HUM_SOURCE"""),
-    "illuminance":    _slot_single("illuminance_source", """$LUX_SOURCE"""),
-    "lights":         _slot_multi("light_targets", """$LIGHT_TARGETS"""),
-    "climates":       _slot_single("climate_target", """$CLIMATE_TARGET"""),
-    "humidifiers":    _slot_single("humidifier_target", """$HUMIDIFIER_TARGET"""),
-    "fans":           _slot_single("fan_target", """$FAN_TARGET"""),
-    "switches":       _slot_multi("switch_targets", """$SWITCH_TARGETS"""),
-}
-# Drop empty slots so DiscoveryConfig.from_dict gets a tidy dict.
-api["slot_bindings"] = {k: v for k, v in slot_bindings.items() if v}
-
-sc = ha.setdefault("smart_control", {})
-sc["dry_run"] = """$DRY_RUN""" == "true"
-sc["min_seconds_between_actions"] = int("""$MIN_SECONDS_BETWEEN_ACTIONS""")
-sc["deadband_temperature_c"] = float("""$DEADBAND_T""")
-sc["deadband_humidity_pct"] = float("""$DEADBAND_H""")
-sc["deadband_brightness_pct"] = float("""$DEADBAND_B""")
-# v1.4.0 knobs — used to be silently swallowed so edits in the
-# Configuration form had no effect.  SmartControlConfig.from_dict
-# ignores unknown keys, so writing them unconditionally is safe
-# across downgrade scenarios too.
-sc["wind_down_minutes"] = int("""$WIND_DOWN_MINUTES""")
-sc["min_stage_dwell_seconds"] = float("""$MIN_STAGE_DWELL_SECONDS""")
-
-learner = ha.setdefault("preference_learner", {})
-learner["exploration_rate"] = float("""$EXPLORATION_RATE""")
-# Persist preferences on the supervisor's /data volume so they survive
-# add-on reinstalls.
-learner["history_path"] = "/data/user_preferences.json"
-
-# ----- Natural-sleep block (v1.2.0) ------------------------------------
-# ``SmartSleepService`` reads everything under home_assistant.natural_sleep
-# and treats each sub-field as independently optional.  We drop empty
-# strings / zero ints so absent fields stay absent (vs. confusing the
-# dataclass with "" defaults).
-# Parse track overrides ``"pink_noise=URL;rain=URL"`` → dict.
-track_overrides_raw = """$WHITENOISE_TRACK_OVERRIDES"""
-track_overrides: dict[str, str] = {}
-for item in track_overrides_raw.split(";"):
-    item = item.strip()
-    if not item or "=" not in item:
-        continue
-    k, _, v = item.partition("=")
-    track_overrides[k.strip()] = v.strip()
-
-def _override_or(key, fallback):
-    """Use the web UI's pick if present (and non-empty after normalisation),
-    otherwise the Configuration form value."""
-    if key in _overrides:
-        v = _norm(_overrides[key])
-        if v != "":
-            return v
-    return fallback
-
-# Wake-light targets accept multi-select.
-_wake_lights_override = _overrides.get("wake_light_targets")
-if isinstance(_wake_lights_override, list):
-    _wake_lights = [v for v in (_norm(x) for x in _wake_lights_override) if v]
-else:
-    _wake_lights = csv_to_list("""$WAKE_LIGHTS""")
-
-natural = {
-    "user_id": "default",
-    "chronotype": _norm("""$CHRONOTYPE""") or "neutral",
-    "wake_window_start": _norm("""$WAKE_START"""),
-    "wake_window_end": _norm("""$WAKE_END"""),
-    "wake_light_targets": _wake_lights,
-    "whitenoise_target": _override_or("whitenoise_target", _norm("""$WHITENOISE_TARGET""")),
-    "whitenoise_volume_scale": float("""$WHITENOISE_VOLUME_SCALE"""),
-    "whitenoise_track_overrides": track_overrides,
-    "feedback_entity": _override_or("feedback_entity", _norm("""$FEEDBACK_ENTITY""")),
-    "feedback_scale": int("""$FEEDBACK_SCALE"""),
-}
-try:
-    by = int("""$BIRTH_YEAR""" or 0)
-except Exception:
-    by = 0
-if by > 0:
-    natural["birth_year"] = by
-# Drop empty strings so Python's ``or`` short-circuits in the service.
-natural = {k: v for k, v in natural.items() if v != ""}
-ha["natural_sleep"] = natural
-
-# ----- Apnea wiring block (v1.7.0) -------------------------------------
-# Feature is OFF unless the breathing-rate source is bound (the
-# amplitude source is optional — some radars only expose rate).  Even
-# when both are bound the detector still waits for the consent
-# input_boolean before publishing anything beyond pending_consent.
-_apnea_rate = _norm("""$APNEA_RATE""")
-_apnea_amplitude = _norm("""$APNEA_AMPLITUDE""")
-_apnea_consent = _norm("""$APNEA_CONSENT""") or (
-    "input_boolean.sleep_classifier_apnea_consent"
-)
-apnea = {
-    "enabled": bool(_apnea_rate),
-    "breathing_rate_source": _apnea_rate,
-    "chest_amplitude_source": _apnea_amplitude,
-    "consent_entity": _apnea_consent,
-    "baseline_path": "/data/apnea_baseline.json",
-    "calibration_nights": int("""$APNEA_CALIBRATION_NIGHTS"""),
-}
-ha["apnea"] = apnea
-
-# Write the effective config inside /data so we don't mutate the read-only
-# image layer.
-out_path = Path("/data/effective_config.json")
-out_path.write_text(json.dumps(base, indent=2, ensure_ascii=False),
-                    encoding="utf-8")
-bound = sum(1 for v in api["slot_bindings"].values() if v)
-print(f"[run.sh] effective config written to {out_path}")
-print(f"[run.sh] slot bindings active: {bound} role(s)")
-PY
+# ── Generate an effective config.json that merges user options on top of
+# ── the bundled defaults.  Done in Python (in a separate file, not a
+# ── heredoc) because jq + nested merge is awkward AND heredoc-embedded
+# ── Python is fragile when user input contains quotes / Chinese.
+python3 /app/render_effective_config.py
 
 # ── Map log level ───────────────────────────────────────────────────────────
 case "$LOG_LEVEL" in
@@ -284,26 +152,83 @@ echo "[run.sh] Starting Sleep Classifier add-on (area=$AREA_LABEL, infer_interva
 echo "[run.sh] Using SUPERVISOR_TOKEN to authenticate against http://supervisor/core"
 
 # ── Web UI (entity picker via Supervisor Ingress) ──────────────────────────
-# Started in the background so the user can open it from the add-on detail
-# page while the inference loop runs in the foreground.  We trap SIGTERM
-# to make sure the helper dies cleanly when the supervisor restarts us
-# (otherwise the port would be held by an orphan).
+# The Web UI is the FOREGROUND process of this container.  It runs under
+# ``exec`` at the very end so its PID is 1 (after tini) — meaning:
+#
+#   * Docker SIGTERM reaches it immediately for clean shutdown.
+#   * Even if the smart service crashes repeatedly, the container keeps
+#     running and Ingress sees a stable :8099 listener.
+#
+# The smart service is supervised in the BACKGROUND by a tiny bash loop
+# below; it restarts with exponential back-off on crash and skips
+# startup entirely when the user hasn't bound a sleep-stage entity yet.
 export WEB_UI_PORT=8099
-python3 /app/web_ui.py &
-WEB_UI_PID=$!
-echo "[run.sh] Web UI started (PID $WEB_UI_PID) on :$WEB_UI_PORT"
-trap 'kill $WEB_UI_PID 2>/dev/null || true' EXIT INT TERM
 
-# ── Hand off to the Python service ──────────────────────────────────────────
-# We pass --config explicitly so the service reads the merged file we just
-# generated, not the bundled defaults.  HA_TOKEN env var is honoured by
-# scripts/run_ha_smart_service.py as the highest priority.
+# ── Smart-service supervisor (background) ──────────────────────────────────
+# Runs the Python smart service in a retry loop so one crash doesn't
+# bring down the container (= Web UI unreachable = Ingress 502).
+# Exponential back-off capped at 60 s.  Skips startup entirely when
+# the sleep-stage binding is missing — user must pick one in Web UI
+# or the Configuration form first.
 export HA_TOKEN="${SUPERVISOR_TOKEN:-}"
-cd /app
-exec python3 scripts/run_ha_smart_service.py \
-    --config /data/effective_config.json \
-    --base-url "http://supervisor/core" \
-    --area "$AREA" \
-    --infer-interval "$INFER_INTERVAL" \
-    --session-interval "$SESSION_INTERVAL" \
-    $PY_LOG_FLAG
+
+supervise_smart_service() {
+    local backoff=2
+    local max_backoff=60
+    while true; do
+        # Re-check the effective config on every iteration so after the
+        # user binds a stage entity in Web UI → Restart add-on, the
+        # supervisor picks it up without another Web UI regeneration.
+        local stage
+        stage=$(jq -r '.home_assistant.api.sleep_stage_source // ""' \
+                    /data/effective_config.json 2>/dev/null || echo "")
+        if [[ -z "$stage" || "$stage" == "null" || "$stage" == '""' ]]; then
+            echo "[run.sh] sleep_stage_source not bound yet."
+            echo "[run.sh] Open the Web UI (left sidebar) to pick a sleep-stage entity,"
+            echo "[run.sh] or fill 'sleep_stage_source' under the Configuration tab,"
+            echo "[run.sh] then click Restart on the add-on detail page."
+            # Sleep for 30 s and re-check (instead of exiting) so the Web
+            # UI stays up and users can iterate.  A genuine config change
+            # from the Supervisor will kill the container anyway.
+            sleep 30
+            continue
+        fi
+
+        echo "[run.sh] Launching smart service (stage=$stage)"
+        cd /app
+        if python3 scripts/run_ha_smart_service.py \
+                --config /data/effective_config.json \
+                --base-url "http://supervisor/core" \
+                --area "$AREA" \
+                --infer-interval "$INFER_INTERVAL" \
+                --session-interval "$SESSION_INTERVAL" \
+                $PY_LOG_FLAG ; then
+            echo "[run.sh] Smart service exited cleanly — will re-check binding in 10 s."
+            sleep 10
+            backoff=2
+        else
+            local rc=$?
+            echo "[run.sh] Smart service exited rc=$rc; restarting in ${backoff}s"
+            sleep "$backoff"
+            backoff=$(( backoff * 2 ))
+            if (( backoff > max_backoff )); then backoff=$max_backoff; fi
+        fi
+    done
+}
+
+# Launch the supervisor as a background job so this shell can exec into
+# the Web UI below.  Capture its PID so we can kill it on container stop.
+supervise_smart_service &
+SUPERVISOR_PID=$!
+echo "[run.sh] Smart-service supervisor PID $SUPERVISOR_PID"
+
+# Forward container-level SIGTERM/SIGINT to the background supervisor so
+# the Python service gets a chance to flush preferences before exit.
+trap 'kill $SUPERVISOR_PID 2>/dev/null || true' INT TERM EXIT
+
+# ── Hand off PID 1 to the Web UI ───────────────────────────────────────────
+# Last line of the script uses exec so the Web UI inherits PID 1 (after
+# tini).  This is what keeps Ingress working through smart-service
+# crashes: the container never dies just because the Python service died.
+echo "[run.sh] Starting Web UI on :$WEB_UI_PORT (foreground)"
+exec python3 /app/web_ui.py

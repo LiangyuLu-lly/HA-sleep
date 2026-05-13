@@ -73,6 +73,17 @@ RUN set -eux; \
 # container, served via Supervisor Ingress.  See web_ui.py for details.
 COPY web_ui.py /app/web_ui.py
 
+# v2.0.2: effective-config generator extracted out of run.sh so user-
+# supplied Chinese / quoted option values can't break a shell heredoc.
+COPY render_effective_config.py /app/render_effective_config.py
+
+# Belt-and-braces: strip any __pycache__ / .pyc that might have slipped
+# into rootfs/ during local development so the image layer stays slim
+# and Python doesn't import stale bytecode from a mismatched source.
+RUN find /app -type d -name '__pycache__' -prune \
+        -exec rm -rf {} + 2>/dev/null || true; \
+    find /app -name '*.pyc' -delete 2>/dev/null || true
+
 # Add-on entrypoint sits at the image root.
 COPY run.sh /run.sh
 RUN chmod +x /run.sh
