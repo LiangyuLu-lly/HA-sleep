@@ -174,6 +174,17 @@ def capabilities_of(entity: "HAEntity") -> Set[Capability]:
             caps.add(Capability.SET_TEMPERATURE)
         if features & _CLIMATE_TARGET_HUMIDITY:
             caps.add(Capability.SET_HUMIDITY_VIA_CLIMATE)
+        # v2.1.0 — Zigbee2MQTT / Matter / custom integrations often
+        # don't bother populating supported_features (value 0) but
+        # still expose functional attributes.  If the bitmask is
+        # empty, infer capability from observable attributes.
+        if features == 0:
+            attrs = entity.attributes or {}
+            # "temperature" is the conventional target-temp attr name
+            # in climate entities; "current_temperature" confirms it's
+            # a real HA climate entity rather than a free-form state.
+            if "temperature" in attrs and "current_temperature" in attrs:
+                caps.add(Capability.SET_TEMPERATURE)
 
     elif domain == "humidifier":
         caps.add(Capability.SET_HUMIDITY)
@@ -201,6 +212,11 @@ def capabilities_of(entity: "HAEntity") -> Set[Capability]:
         # Color-temp control: any of the kelvin-capable modes.
         if modes_set & {"color_temp", "color_temp_kelvin"}:
             caps.add(Capability.SET_COLOR_TEMP)
+        # v2.1.0 — Zigbee2MQTT fallback: ``brightness`` attribute
+        # present with numeric value indicates brightness support.
+        if Capability.SET_BRIGHTNESS not in caps:
+            if entity.attributes.get("brightness") is not None:
+                caps.add(Capability.SET_BRIGHTNESS)
 
     elif domain == "fan":
         caps.add(Capability.TURN_ON_OFF)
@@ -208,6 +224,15 @@ def capabilities_of(entity: "HAEntity") -> Set[Capability]:
             caps.add(Capability.SET_SPEED_PCT)
         if features & _FAN_PRESET_MODE:
             caps.add(Capability.SET_PRESET_MODE)
+        # v2.1.0 — Zigbee2MQTT fallback.  A fan that exposes a
+        # numeric ``percentage`` attribute clearly supports speed
+        # control even if supported_features is 0.  Same for
+        # ``preset_modes`` as a non-empty list.
+        if features == 0:
+            if entity.attributes.get("percentage") is not None:
+                caps.add(Capability.SET_SPEED_PCT)
+            if entity.attributes.get("preset_modes"):
+                caps.add(Capability.SET_PRESET_MODE)
 
     elif domain == "switch":
         caps.add(Capability.TURN_ON_OFF)
