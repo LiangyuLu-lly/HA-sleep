@@ -6,7 +6,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "1.9.0"
+version: "2.0.0"
 slug: sleep_classifier
 description: >-
   Closed-loop smart-home sleep automation.  Subscribes to any HA
@@ -14,6 +14,7 @@ description: >-
   then learns your preferred bedtime and bedroom environment from
   history and writes back temperature / humidity / lighting / fan
   setpoints that match the nights you slept best in.
+homeassistant: "2024.1.0"
 
 # This add-on is built locally (no pre-built image).  Both Pi 4B (aarch64)
 # and amd64 are supported; the others are excluded to keep the build matrix
@@ -157,6 +158,11 @@ options:
   #   spotify:track:0VjIjW4GlUZAMYd2vXMi3b
   whitenoise_track_overrides: []  # e.g. ["pink_noise=media-source://..."]
 
+  # --- White noise volume one-click feedback (v2.0.0) ---
+  # Point this at an input_button helper.  When pressed, the add-on
+  # reduces the current whitenoise volume_scale by 30 %.
+  whitenoise_volume_feedback_entity: ""  # e.g. input_button.sleep_classifier_too_loud
+
   # --- Subjective feedback (morning "how did you sleep?" rating) ---
   # Point this at an input_number helper you created in HA Settings
   # → Devices & Services → Helpers.  The add-on picks up state changes
@@ -239,6 +245,7 @@ schema:
   whitenoise_volume_scale: "float(0,2)?"
   whitenoise_track_overrides:
     - str
+  whitenoise_volume_feedback_entity: 'match(^$|^""$|^input_button\.[a-zA-Z0-9_]+$)?'
   feedback_entity: 'match(^$|^""$|^input_number\.[a-zA-Z0-9_]+$)?'
   feedback_scale: "int(2,10)?"
 

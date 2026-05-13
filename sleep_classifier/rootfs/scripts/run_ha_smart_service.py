@@ -50,7 +50,12 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+
+def _L(en: str, zh: str) -> str:
+    """Return zh if LANG contains 'zh', else en. Used for user-facing log messages."""
+    return zh if "zh" in os.environ.get("LANG", "").lower() else en
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -302,6 +307,13 @@ class SmartSleepService:
             natural_cfg.get("temperature_override_entity") or ""
         ).strip()
 
+        # v2.0.0 — white noise volume one-click feedback.  When the
+        # user presses this input_button, the WhiteNoiseMatcher's
+        # volume_scale is reduced by 30 % (multiplied by 0.7).
+        self._whitenoise_volume_feedback_entity: str = str(
+            natural_cfg.get("whitenoise_volume_feedback_entity") or ""
+        ).strip()
+
         # v1.3.0: stage now comes from an external HA entity (Mi Band /
         # Apple Watch / Withings / etc) instead of a local CNN-BiLSTM
         # forward pass.  The entity_id is mandatory in live mode but the
@@ -453,6 +465,23 @@ class SmartSleepService:
                 logger.debug(
                     "Temperature override cleared (state=%r)",
                     event.new_state.state,
+                )
+            return
+
+        # ---- 2c. White noise volume feedback button (v2.0.0) ---------
+        # When the user presses this input_button, reduce the
+        # WhiteNoiseMatcher's volume_scale by 30 %.
+        if (
+            self._whitenoise_volume_feedback_entity
+            and eid == self._whitenoise_volume_feedback_entity
+        ):
+            if self.sound_matcher is not None:
+                self.sound_matcher.volume_scale *= 0.7
+                logger.info(
+                    _L(
+                        "White noise volume reduced by user feedback",
+                        "用户反馈：白噪音音量已降低",
+                    ),
                 )
             return
 
@@ -638,16 +667,23 @@ class SmartSleepService:
                 is_stale = engine.is_stale()
                 if is_stale and not self._stage_source_was_stale:
                     logger.warning(
-                        "Stage source %s has not updated for > %d s; "
-                        "pausing control loop until the tracker comes "
-                        "back online.",
+                        _L(
+                            "Stage source %s has not updated for > %d s; "
+                            "pausing control loop until the tracker comes "
+                            "back online.",
+                            "Stage source stale / 睡眠阶段源已断开: %s has not updated for > %d s; "
+                            "pausing control loop.",
+                        ),
                         engine.stage_entity_id,
                         int(engine._stale_after),
                     )
                     self._stage_source_was_stale = True
                 elif not is_stale and self._stage_source_was_stale:
                     logger.info(
-                        "Stage source %s is live again — resuming control.",
+                        _L(
+                            "Stage source %s is live again — resuming control.",
+                            "Stage source live again / 睡眠阶段源已恢复: %s — resuming control.",
+                        ),
                         engine.stage_entity_id,
                     )
                     self._stage_source_was_stale = False
@@ -868,7 +904,10 @@ class SmartSleepService:
             ) / 60.0
             if not partial and session_duration_min < self._min_session_minutes:
                 logger.warning(
-                    "Session too short (%.0f min), not feeding to learner",
+                    _L(
+                        "Session too short (%.0f min), not feeding to learner",
+                        "Session too short / 会话过短，未记录 (%.0f min)",
+                    ),
                     session_duration_min,
                 )
             else:
@@ -1336,7 +1375,10 @@ class SmartSleepService:
                     self._consecutive_non_awake_ticks * interval
                 )
                 logger.info(
-                    "Session %s started (non-AWAKE held for >= %d s).",
+                    _L(
+                        "Session %s started (non-AWAKE held for >= %d s).",
+                        "Session %s started / 睡眠会话已开始 (non-AWAKE held for >= %d s).",
+                    ),
                     self.session_id, int(self._session_onset_dwell_seconds),
                 )
                 # v1.7.0 — kick off the apnea sample buffer at the
@@ -1348,7 +1390,10 @@ class SmartSleepService:
         # Already in a session — check for wake-up.
         if self._consecutive_awake_ticks >= wake_ticks:
             logger.info(
-                "Session %s ending (AWAKE held for >= %d s).",
+                _L(
+                    "Session %s ending (AWAKE held for >= %d s).",
+                    "Session %s ending / 睡眠会话结束 (AWAKE held for >= %d s).",
+                ),
                 self.session_id, int(self._session_wake_dwell_seconds),
             )
             self._persist_session(controller, partial=False)

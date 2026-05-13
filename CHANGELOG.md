@@ -12,6 +12,51 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [2.0.0] — 2026-05-16
+
+**商业化最终 pass** — 把所有剩余的可自闭环完成的问题一次性解决。
+
+### Added
+
+- **日志双语化（D4）**：`scripts/run_ha_smart_service.py` 顶部新增
+  `_L(en, zh)` 辅助函数，根据 `LANG` 环境变量选择中/英文。5 条
+  关键用户可见日志消息改为双语：Session started / 睡眠会话已开始、
+  Session ending / 睡眠会话结束、Stage source stale / 睡眠阶段源已断开、
+  Stage source live again / 睡眠阶段源已恢复、Session too short / 会话过短，未记录。
+
+- **`min_ha_version` 声明（D3）**：`sleep_classifier/config.yaml` 新增
+  `homeassistant: "2024.1.0"` 字段，HA Supervisor 用此阻止在过旧的
+  HA 版本上安装。
+
+- **白噪音音量一键反馈（B3）**：新增
+  `whitenoise_volume_feedback_entity` 配置项（默认空）。当用户按下
+  绑定的 `input_button` 时，`WhiteNoiseMatcher.volume_scale` 乘以
+  0.7（降 30%），并记录双语日志。
+
+- **完整 4-view Lovelace 仪表板（A5）**：重写
+  `examples/lovelace_dashboard.yaml`，覆盖全部 20 个 sensor：
+  今晚（stage/confidence/quality/duration/last_action/health）、
+  学习（bedtime_workday/weekend/learned_environment/recommendation_explain/per_stage_deltas）、
+  健康（debt_hours/recommended_bedtime/wake_decision/soundscape/apnea_index）、
+  质量细分（architecture/efficiency/fragmentation/onset + history-graph）。
+
+- **README 中文 30 天导览（A2 + E2）**：README.md 末尾新增
+  `## 30 天使用指南` 中文章节，覆盖第 1/2/3/7/14/30 天的里程碑。
+
+- **FAQ 故障排查（E4）**：`sleep_classifier/DOCS.md` 末尾新增
+  `## 常见问题 FAQ` 中文章节，覆盖 11 个最常见问题（含诊断导出）。
+
+- **诊断导出命令（D1）**：新建 `scripts/diagnostic_export.py`，
+  读取 `/data/` 下的 JSON 文件，输出安全的诊断 JSON 到 stdout
+  （含 n_sessions、last_session_at、learner_status、apnea_baseline、
+  config_summary、version），不含任何 token 或密码。
+
+### Changed
+
+- `sleep_classifier/config.yaml` version → `"2.0.0"`。
+- `pyproject.toml` version → `"2.0.0"`。
+- `setup.py` version → `"2.0.0"`。
+
 ## [1.9.0] — 2026-05-15
 
 **商业化完善 pass** — 用户反馈机制、边缘场景加固、压力测试。
@@ -521,7 +566,8 @@ misbehave on its first deployed night.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.1...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.9.0...v2.0.0
 [1.7.1]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.4...v1.7.0
 [1.6.4]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.3...v1.6.4

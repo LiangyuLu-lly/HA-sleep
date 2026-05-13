@@ -1,55 +1,43 @@
-# Sleep Classifier — full Lovelace dashboard
+# Sleep Classifier — 完整 Lovelace 仪表板（v2.0.0）
 #
-# Drop this YAML into  Settings → Dashboards → New Dashboard →
-# ⋮ Raw configuration editor.  Or paste any individual `cards:` block
-# into an existing view.
+# 使用方法：Settings → Dashboards → New Dashboard →
+# ⋮ Raw configuration editor → 粘贴此文件全部内容。
 #
-# Covers all 14 sensors the add-on owns as of v1.6.0:
-#   - sensor.sleep_classifier_stage                   (current AWAKE/LIGHT/DEEP/REM)
-#   - sensor.sleep_classifier_confidence              (model confidence 0-100 %)
-#   - sensor.sleep_classifier_quality_score           (per-session 0-100)
-#   - sensor.sleep_classifier_session_duration        (live counter)
-#   - sensor.sleep_classifier_last_action             ("light.bedroom_main → off")
-#   - sensor.sleep_classifier_debt_hours              (sleep debt vs. profile)
-#   - sensor.sleep_classifier_recommended_bedtime     (tonight's bedtime)
-#   - sensor.sleep_classifier_wake_decision           (WAIT/PRE_RAMP/...)
-#   - sensor.sleep_classifier_soundscape              (noise / nature / ...)
-#   - sensor.sleep_classifier_learned_bedtime_workday (HH:MM)
-#   - sensor.sleep_classifier_learned_bedtime_weekend (HH:MM)
-#   - sensor.sleep_classifier_learned_environment     ("19.5 °C / 50 % / 5 %")
-#   - sensor.sleep_classifier_recommendation_explain  ("ready" / "not_ready")
-#   - sensor.sleep_classifier_per_stage_deltas        ("clinical" / "learning" / "personalised")
-#
-# Visualisations chosen for what each sensor's *attributes* support
-# without templating — open the More-Info dialog on any sensor for the
-# full attribute list.
+# 覆盖全部 20 个 sensor.sleep_classifier_* 实体，分为 4 个视图：
+#   View 1 "今晚"：stage + confidence + quality + duration + last_action + health
+#   View 2 "学习"：learned_bedtime_workday/weekend + learned_environment +
+#                   recommendation_explain + per_stage_deltas
+#   View 3 "健康"：debt_hours + recommended_bedtime + wake_decision +
+#                   soundscape + apnea_index
+#   View 4 "质量细分"：quality_architecture + quality_efficiency +
+#                       quality_fragmentation + quality_onset + history-graph
 
 title: Sleep Classifier
 views:
   # ===================================================================
-  # View 1 — Tonight (the at-a-glance dashboard)
+  # View 1 — 今晚（实时一览）
   # ===================================================================
-  - title: Tonight
+  - title: 今晚
     path: tonight
     icon: mdi:bed
     cards:
       - type: vertical-stack
         cards:
           - type: glance
-            title: Right now
+            title: 实时状态
             columns: 4
             entities:
               - entity: sensor.sleep_classifier_stage
-                name: Stage
+                name: 阶段
               - entity: sensor.sleep_classifier_confidence
-                name: Conf.
+                name: 置信度
               - entity: sensor.sleep_classifier_quality_score
-                name: Quality
+                name: 质量分
               - entity: sensor.sleep_classifier_session_duration
-                name: Duration
+                name: 时长
           - type: gauge
             entity: sensor.sleep_classifier_quality_score
-            name: Tonight's quality
+            name: 今晚质量
             min: 0
             max: 100
             severity:
@@ -57,109 +45,135 @@ views:
               yellow: 50
               red: 0
           - type: entities
-            title: Last action
+            title: 最近操作
             entities:
               - entity: sensor.sleep_classifier_last_action
-                name: Most recent control
+                name: 最近一次控制
               - type: attribute
                 entity: sensor.sleep_classifier_last_action
                 attribute: executed
-                name: Executed?
+                name: 已执行？
               - type: attribute
                 entity: sensor.sleep_classifier_last_action
                 attribute: at
-                name: When
-                # The publisher writes a unix timestamp here so
-                # the Lovelace timestamp formatter can render
-                # "5 minutes ago" without further templating.
+                name: 时间
+              - type: attribute
+                entity: sensor.sleep_classifier_last_action
+                attribute: skipped_by_capability
+                name: 能力跳过
+              - type: attribute
+                entity: sensor.sleep_classifier_last_action
+                attribute: skipped_unavailable
+                name: 不可用跳过
+              - type: attribute
+                entity: sensor.sleep_classifier_last_action
+                attribute: skipped_user_override
+                name: 用户覆盖跳过
+          - type: entities
+            title: 系统健康
+            entities:
+              - entity: sensor.sleep_classifier_health
+                name: 聚合状态
+              - type: attribute
+                entity: sensor.sleep_classifier_health
+                attribute: stage_source_stale
+                name: 阶段源 stale
+              - type: attribute
+                entity: sensor.sleep_classifier_health
+                attribute: env_stale_fields
+                name: 环境 stale 字段
+              - type: attribute
+                entity: sensor.sleep_classifier_health
+                attribute: publisher_failures
+                name: 发布失败次数
+              - type: attribute
+                entity: sensor.sleep_classifier_health
+                attribute: learner_sessions
+                name: 学习器 session 数
 
       - type: history-graph
-        title: Stage trace tonight
+        title: 今晚阶段轨迹
         hours_to_show: 12
         entities:
           - entity: sensor.sleep_classifier_stage
 
   # ===================================================================
-  # View 2 — Learned profile (the v1.3.0 + v1.5.0 panel)
+  # View 2 — 学习（偏好学习面板）
   # ===================================================================
-  - title: Learned profile
+  - title: 学习
     path: learned
     icon: mdi:brain
     cards:
       - type: vertical-stack
         cards:
           - type: glance
-            title: Bedtime forecast
+            title: 入睡时间预测
             columns: 3
             entities:
               - entity: sensor.sleep_classifier_recommended_bedtime
-                name: Tonight
+                name: 今晚推荐
               - entity: sensor.sleep_classifier_learned_bedtime_workday
-                name: Workdays
+                name: 工作日
               - entity: sensor.sleep_classifier_learned_bedtime_weekend
-                name: Weekends
+                name: 周末
           - type: entities
-            title: Best environment (k-NN)
+            title: 最佳环境（k-NN）
             entities:
               - entity: sensor.sleep_classifier_learned_environment
-                name: Pick tonight
+                name: 今晚推荐
               - type: attribute
                 entity: sensor.sleep_classifier_learned_environment
                 attribute: temperature_c
-                name: Temperature
+                name: 温度
                 suffix: " °C"
               - type: attribute
                 entity: sensor.sleep_classifier_learned_environment
                 attribute: humidity_pct
-                name: Humidity
+                name: 湿度
                 suffix: " %"
               - type: attribute
                 entity: sensor.sleep_classifier_learned_environment
                 attribute: brightness_pct
-                name: Brightness
+                name: 亮度
                 suffix: " %"
               - type: attribute
                 entity: sensor.sleep_classifier_learned_environment
                 attribute: confidence
-                name: Confidence
+                name: 置信度
               - type: attribute
                 entity: sensor.sleep_classifier_learned_environment
                 attribute: n_used
-                name: Sessions used
+                name: 使用 session 数
           - type: entities
-            title: Why these numbers? (open me)
+            title: 推荐理由
             entities:
               - entity: sensor.sleep_classifier_recommendation_explain
-                name: Status
+                name: 状态
               - type: attribute
                 entity: sensor.sleep_classifier_recommendation_explain
                 attribute: method
-                name: Algorithm
+                name: 算法
               - type: attribute
                 entity: sensor.sleep_classifier_recommendation_explain
                 attribute: n_total
-                name: Total sessions
+                name: 总 session 数
               - type: attribute
                 entity: sensor.sleep_classifier_recommendation_explain
                 attribute: avg_age_days
-                name: Avg age (days)
+                name: 平均年龄（天）
               - type: attribute
                 entity: sensor.sleep_classifier_recommendation_explain
                 attribute: effective_sample_size
-                name: ESS
+                name: 有效样本量 ESS
 
-      # ---- v1.5.0 per-stage deltas ----
       - type: entities
-        title: Per-stage learned deltas (v1.5.0)
+        title: 各阶段学习偏移（v1.5.0）
         entities:
           - entity: sensor.sleep_classifier_per_stage_deltas
-            name: Status
+            name: 状态
             secondary_info: last-changed
-          # Attributes are flattened by publish_per_stage_deltas:
-          #   awake_temperature_c_delta, deep_temperature_c_delta, ...
-          #   awake_ess, deep_ess, rem_ess
           - type: section
-            label: Temperature offset vs. LIGHT
+            label: 温度偏移 vs. LIGHT
           - type: attribute
             entity: sensor.sleep_classifier_per_stage_deltas
             attribute: awake_temperature_c_delta
@@ -176,11 +190,11 @@ views:
             name: REM Δ
             suffix: " °C"
           - type: section
-            label: Effective sample size (≥ ess_threshold = personalised)
+            label: 有效样本量（≥ 阈值 = personalised）
           - type: attribute
             entity: sensor.sleep_classifier_per_stage_deltas
             attribute: ess_threshold
-            name: Threshold
+            name: 阈值
           - type: attribute
             entity: sensor.sleep_classifier_per_stage_deltas
             attribute: awake_ess
@@ -195,17 +209,17 @@ views:
             name: REM ESS
 
   # ===================================================================
-  # View 3 — Sleep debt + smart wake + soundscape
+  # View 3 — 健康（睡眠债 + 唤醒 + 音景 + 呼吸）
   # ===================================================================
-  - title: Recovery & wake
-    path: recovery
-    icon: mdi:weather-sunset-up
+  - title: 健康
+    path: health
+    icon: mdi:heart-pulse
     cards:
       - type: vertical-stack
         cards:
           - type: gauge
             entity: sensor.sleep_classifier_debt_hours
-            name: Sleep debt
+            name: 睡眠债
             min: 0
             max: 12
             severity:
@@ -214,75 +228,158 @@ views:
               red: 8
             unit: " h"
           - type: entities
-            title: Recovery plan
+            title: 恢复计划
             entities:
               - entity: sensor.sleep_classifier_debt_hours
-                name: Current debt
+                name: 当前睡眠债
               - type: attribute
                 entity: sensor.sleep_classifier_debt_hours
                 attribute: recovery_extra_minutes
-                name: Extra sleep tonight
+                name: 今晚需多睡
                 suffix: " min"
               - type: attribute
                 entity: sensor.sleep_classifier_debt_hours
                 attribute: recovery_target_bedtime
-                name: Target bedtime
+                name: 目标入睡时间
               - type: attribute
                 entity: sensor.sleep_classifier_debt_hours
                 attribute: recovery_horizon_nights
-                name: Recovery horizon
-                suffix: " nights"
+                name: 恢复周期
+                suffix: " 晚"
           - type: entities
-            title: Smart wake
+            title: 推荐入睡时间
+            entities:
+              - entity: sensor.sleep_classifier_recommended_bedtime
+                name: 今晚推荐
+              - type: attribute
+                entity: sensor.sleep_classifier_recommended_bedtime
+                attribute: bucket
+                name: 分桶
+              - type: attribute
+                entity: sensor.sleep_classifier_recommended_bedtime
+                attribute: n_sessions
+                name: 依据 session 数
+          - type: entities
+            title: 智能唤醒
             entities:
               - entity: sensor.sleep_classifier_wake_decision
-                name: Decision
+                name: 决策
               - type: attribute
                 entity: sensor.sleep_classifier_wake_decision
                 attribute: alarm_time
-                name: Alarm
+                name: 闹钟时间
               - type: attribute
                 entity: sensor.sleep_classifier_wake_decision
                 attribute: light_ramp_start
-                name: Light ramp begins
+                name: 灯光渐亮开始
               - type: attribute
                 entity: sensor.sleep_classifier_wake_decision
                 attribute: matched_stage
-                name: Stage matched
+                name: 匹配阶段
           - type: entities
-            title: Soundscape
+            title: 音景
             entities:
               - entity: sensor.sleep_classifier_soundscape
-                name: Active scape
+                name: 当前音景
               - type: attribute
                 entity: sensor.sleep_classifier_soundscape
                 attribute: volume_pct
-                name: Volume
+                name: 音量
                 suffix: " %"
               - type: attribute
                 entity: sensor.sleep_classifier_soundscape
                 attribute: reason
-                name: Why this scape
+                name: 选择原因
+          - type: entities
+            title: 呼吸暂停趋势
+            entities:
+              - entity: sensor.sleep_classifier_apnea_index
+                name: 趋势
+              - type: attribute
+                entity: sensor.sleep_classifier_apnea_index
+                attribute: status
+                name: 状态
+              - type: attribute
+                entity: sensor.sleep_classifier_apnea_index
+                attribute: disclaimer
+                name: 免责声明
 
   # ===================================================================
-  # View 4 — History (long-term trends)
+  # View 4 — 质量细分（子分 + 长期趋势）
   # ===================================================================
-  - title: History
-    path: history
+  - title: 质量细分
+    path: quality
     icon: mdi:chart-line
     cards:
+      - type: vertical-stack
+        cards:
+          - type: glance
+            title: 质量子分（0-100）
+            columns: 4
+            entities:
+              - entity: sensor.sleep_classifier_quality_architecture
+                name: 结构
+              - entity: sensor.sleep_classifier_quality_efficiency
+                name: 效率
+              - entity: sensor.sleep_classifier_quality_fragmentation
+                name: 碎片化
+              - entity: sensor.sleep_classifier_quality_onset
+                name: 入睡速度
+          - type: gauge
+            entity: sensor.sleep_classifier_quality_architecture
+            name: 睡眠结构分
+            min: 0
+            max: 100
+            severity:
+              green: 75
+              yellow: 50
+              red: 0
+          - type: gauge
+            entity: sensor.sleep_classifier_quality_efficiency
+            name: 睡眠效率分
+            min: 0
+            max: 100
+            severity:
+              green: 85
+              yellow: 70
+              red: 0
+          - type: gauge
+            entity: sensor.sleep_classifier_quality_fragmentation
+            name: 碎片化分（越高越好）
+            min: 0
+            max: 100
+            severity:
+              green: 75
+              yellow: 50
+              red: 0
+          - type: gauge
+            entity: sensor.sleep_classifier_quality_onset
+            name: 入睡速度分
+            min: 0
+            max: 100
+            severity:
+              green: 75
+              yellow: 50
+              red: 0
+
       - type: history-graph
-        title: Quality scores
-        hours_to_show: 720       # 30 days
+        title: 质量分趋势（30 天）
+        hours_to_show: 720
         entities:
           - entity: sensor.sleep_classifier_quality_score
+          - entity: sensor.sleep_classifier_quality_architecture
+          - entity: sensor.sleep_classifier_quality_efficiency
+          - entity: sensor.sleep_classifier_quality_fragmentation
+          - entity: sensor.sleep_classifier_quality_onset
+
       - type: history-graph
-        title: Sleep debt drift
+        title: 睡眠债趋势（30 天）
         hours_to_show: 720
         entities:
           - entity: sensor.sleep_classifier_debt_hours
+
       - type: statistics-graph
-        title: Confidence drift (does the wearable agree with itself?)
+        title: 置信度趋势（7 天）
         chart_type: line
         period: hour
         days_to_show: 7
