@@ -121,10 +121,46 @@ async def _fetch_states() -> List[Dict[str, Any]]:
     headers = {"Authorization": f"Bearer {_TOKEN}",
                "Content-Type": "application/json"}
     timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(f"{_HA_BASE}/api/states", headers=headers) as r:
-            r.raise_for_status()
-            return await r.json()
+    url = f"{_HA_BASE}/api/states"
+    logger.info("Fetching HA states from %s", url)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as r:
+                if r.status != 200:
+                    body_preview = (await r.text())[:200]
+                    logger.error(
+                        "HA states returned HTTP %s from %s: %s",
+                        r.status, url, body_preview,
+                    )
+                    raise aiohttp.ClientError(
+                        f"HA Core returned HTTP {r.status}: {body_preview}"
+                    )
+                data = await r.json()
+                logger.info("HA states fetched OK: %d entities", len(data))
+                return data
+    except asyncio.TimeoutError as exc:
+        logger.error("HA states fetch timed out after 10s from %s", url)
+        raise aiohttp.ClientError(f"Timeout fetching HA states: {exc}") from exc
+    except aiohttp.ClientConnectorError as exc:
+        # The most common failure: DNS / routing / firewall stopping us
+        # from reaching the Supervisor-proxied HA Core URL.
+        logger.error(
+            "Cannot connect to HA Core at %s (%s). "
+            "Check that homeassistant_api: true is set in config.yaml "
+            "and that SUPERVISOR_TOKEN is present in the container env.",
+            url, exc,
+        )
+        raise aiohttp.ClientError(
+            f"Cannot reach HA Core at {url}: {exc}"
+        ) from exc
+    except Exception as exc:    # noqa: BLE001
+        logger.error(
+            "Unexpected error fetching HA states from %s: %s: %s",
+            url, type(exc).__name__, exc,
+        )
+        raise aiohttp.ClientError(
+            f"Unexpected error: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _filter_states(
