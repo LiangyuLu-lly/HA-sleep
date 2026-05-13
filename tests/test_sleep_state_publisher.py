@@ -20,12 +20,17 @@ from src.sleep_state_publisher import (
     ENTITY_CONFIDENCE,
     ENTITY_DEBT,
     ENTITY_DURATION,
+    ENTITY_HEALTH,
     ENTITY_LAST_ACTION,
     ENTITY_LEARNED_BEDTIME_WEEKEND,
     ENTITY_LEARNED_BEDTIME_WORKDAY,
     ENTITY_LEARNED_ENVIRONMENT,
     ENTITY_PER_STAGE_DELTAS,
     ENTITY_QUALITY,
+    ENTITY_QUALITY_ARCHITECTURE,
+    ENTITY_QUALITY_EFFICIENCY,
+    ENTITY_QUALITY_FRAGMENTATION,
+    ENTITY_QUALITY_ONSET,
     ENTITY_RECOMMENDATION_EXPLAIN,
     ENTITY_RECOMMENDED_BEDTIME,
     ENTITY_SOUNDSCAPE,
@@ -385,13 +390,14 @@ class TestLearningPanelPublishers:
 class TestInitialPlaceholders:
     """Boot-time seeding: every owned entity must get a state immediately."""
 
-    async def test_publishes_all_fifteen_entities(
+    async def test_publishes_all_twenty_entities(
         self, publisher: SleepStatePublisher, ha_client: AsyncMock,
     ) -> None:
         await publisher.publish_initial_placeholders()
         called = {c.args[0] for c in ha_client.update_state.call_args_list}
-        # v1.7.0: 5 legacy + 4 natural-sleep + 4 learning +
-        # 1 per-stage-deltas + 1 apnea-index = 15 entities.
+        # v1.8.0: 5 legacy + 4 natural-sleep + 4 learning +
+        # 1 per-stage-deltas + 1 apnea-index + 1 health +
+        # 4 quality sub-scores = 20 entities.
         expected = {
             ENTITY_STAGE, ENTITY_CONFIDENCE, ENTITY_QUALITY, ENTITY_DURATION,
             ENTITY_LAST_ACTION, ENTITY_DEBT, ENTITY_RECOMMENDED_BEDTIME,
@@ -399,6 +405,9 @@ class TestInitialPlaceholders:
             ENTITY_LEARNED_BEDTIME_WORKDAY, ENTITY_LEARNED_BEDTIME_WEEKEND,
             ENTITY_LEARNED_ENVIRONMENT, ENTITY_RECOMMENDATION_EXPLAIN,
             ENTITY_PER_STAGE_DELTAS, ENTITY_APNEA_INDEX,
+            ENTITY_HEALTH,
+            ENTITY_QUALITY_ARCHITECTURE, ENTITY_QUALITY_EFFICIENCY,
+            ENTITY_QUALITY_FRAGMENTATION, ENTITY_QUALITY_ONSET,
         }
         assert called == expected
 
@@ -409,8 +418,8 @@ class TestInitialPlaceholders:
         publisher = SleepStatePublisher(ha_client)
         # Must not raise, even though every single update fails.
         await publisher.publish_initial_placeholders()
-        # v1.7.0: 15 entities seeded → 15 failures recorded.
-        assert publisher.stats.failures == 15
+        # v1.8.0: 20 entities seeded → 20 failures recorded.
+        assert publisher.stats.failures == 20
 
 
 # ---------------------------------------------------------------------------

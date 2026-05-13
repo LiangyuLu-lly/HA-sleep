@@ -279,14 +279,46 @@ class PreferenceLearner:
         if self._sessions is not None:
             return self._sessions
         if not self._history_path.exists():
+            # v1.8.0 — try the .bak file if the main file is missing.
+            bak = self._history_path.with_suffix(
+                self._history_path.suffix + ".bak",
+            )
+            if bak.exists():
+                logger.warning(
+                    "Main file %s missing; falling back to %s",
+                    self._history_path, bak,
+                )
+                try:
+                    with open(bak, "r", encoding="utf-8") as fh:
+                        raw = json.load(fh)
+                    items = raw.get("sessions", []) if isinstance(raw, dict) else raw
+                    self._sessions = [SleepSession.from_dict(item) for item in items]
+                    return self._sessions
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning("Backup also unreadable: %s — starting fresh", exc)
             self._sessions = []
             return self._sessions
         try:
             with open(self._history_path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to read %s: %s — starting fresh",
+            logger.warning("Failed to read %s: %s — trying backup",
                            self._history_path, exc)
+            # v1.8.0 — fall back to .bak on read failure.
+            bak = self._history_path.with_suffix(
+                self._history_path.suffix + ".bak",
+            )
+            if bak.exists():
+                try:
+                    with open(bak, "r", encoding="utf-8") as fh:
+                        raw = json.load(fh)
+                    items = raw.get("sessions", []) if isinstance(raw, dict) else raw
+                    self._sessions = [SleepSession.from_dict(item) for item in items]
+                    logger.info("Recovered %d sessions from backup %s",
+                                len(self._sessions), bak)
+                    return self._sessions
+                except (OSError, json.JSONDecodeError) as exc2:
+                    logger.warning("Backup also unreadable: %s — starting fresh", exc2)
             self._sessions = []
             return self._sessions
         items = raw.get("sessions", []) if isinstance(raw, dict) else raw
@@ -300,6 +332,19 @@ class PreferenceLearner:
         self._sessions = kept
 
         self._history_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # v1.8.0 — rolling backup: copy current file to .bak before
+        # overwriting.  Only one backup is kept.
+        if self._history_path.exists():
+            import shutil
+            bak = self._history_path.with_suffix(
+                self._history_path.suffix + ".bak",
+            )
+            try:
+                shutil.copy2(self._history_path, bak)
+            except OSError as exc:
+                logger.warning("Failed to create backup %s: %s", bak, exc)
+
         payload = {
             "version": 1,
             "updated_at": time.time(),

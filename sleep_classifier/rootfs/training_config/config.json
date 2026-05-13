@@ -36,6 +36,11 @@
     "natural_sleep": {
       "user_id": "default",
       "chronotype": "neutral"
+    },
+    "session_lifecycle": {
+      "onset_dwell_seconds": 300,
+      "wake_dwell_seconds": 600,
+      "min_session_minutes": 60
     }
   }
 }

@@ -12,6 +12,40 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [1.8.0] — 2026-05-14
+
+**商业化落地 pass** — 面向生产环境的可观测性、质量细分、
+数据保护和集成测试补全。
+
+### Added
+
+- **聚合健康状态 sensor** (`sensor.sleep_classifier_health`)。
+  状态枚举 `healthy` / `degraded` / `error`，属性暴露
+  `stage_source_stale`、`env_stale_fields`、`publisher_failures`、
+  `learner_sessions`、`capability_skipped`。每个 tick 由
+  orchestrator 调用 `publish_health()` 刷新。
+
+- **质量子分 sensor × 4**：
+  `sensor.sleep_classifier_quality_architecture` /
+  `_efficiency` / `_fragmentation` / `_onset`。
+  每个 0-100，`state_class=measurement`，在 `_persist_session`
+  中当 `metrics` 可用时自动 publish。
+
+- **午睡过滤（C1）**：`session_lifecycle.min_session_minutes`
+  （默认 60）。`_persist_session(partial=False)` 中若 session
+  总时长不足则跳过 `learner.record_session`，防止短午睡
+  污染夜间推荐模型。
+
+- **user_preferences.json 滚动备份（C6）**：
+  `PreferenceLearner._save()` 每次写入前 copy 当前文件到
+  `.bak`；`_load()` 读主文件失败时自动尝试 `.bak`。
+
+- **端到端 8 小时夜晚集成测试（F1）**：
+  `tests/test_e2e_full_night.py`，合成 490 分钟 hypnogram
+  驱动完整 inference loop + session lifecycle，验证 session
+  开始/结束、quality_score 范围、learner 收录、stage_counts
+  非零、env_by_stage ≥ 2 个 stage。
+
 ## [1.7.1] — 2026-05-13
 
 The **真·落地** release — the minimum set of fixes that separate

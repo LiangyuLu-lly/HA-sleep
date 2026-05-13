@@ -195,6 +195,14 @@ class SmartSleepService:
         self._session_wake_dwell_seconds: float = float(
             lifecycle_cfg.get("wake_dwell_seconds", 600.0),
         )
+        # v1.8.0 — minimum session duration (minutes) to feed the
+        # learner.  Sessions shorter than this (e.g. naps) are still
+        # scored and published but NOT recorded into the preference
+        # learner, preventing short naps from polluting the overnight
+        # recommendation model.
+        self._min_session_minutes: float = float(
+            lifecycle_cfg.get("min_session_minutes", 60.0),
+        )
 
         # v1.7.0 — apnea trend detector.  Disabled by default; when a
         # breathing-rate source is bound via Configuration the wiring
@@ -826,7 +834,19 @@ class SmartSleepService:
             env_by_stage=dict(self.env_by_stage),
         )
         try:
-            self.learner.record_session(session)
+            # v1.8.0 — nap filter: skip learner recording for sessions
+            # shorter than min_session_minutes (default 60) when this
+            # is a final persist (partial=False).
+            session_duration_min = (
+                session.ended_at - session.started_at
+            ) / 60.0
+            if not partial and session_duration_min < self._min_session_minutes:
+                logger.warning(
+                    "Session too short (%.0f min), not feeding to learner",
+                    session_duration_min,
+                )
+            else:
+                self.learner.record_session(session)
             controller.feedback_score(score)
             logger.info(
                 "Session %s checkpoint — quality=%.1f (history: %s)",
@@ -854,6 +874,11 @@ class SmartSleepService:
                 try:
                     loop = asyncio.get_event_loop()
                     loop.create_task(self.publisher.publish_quality(score))
+                    # v1.8.0 — publish quality sub-scores when available.
+                    if metrics is not None:
+                        loop.create_task(
+                            self.publisher.publish_quality_sub_scores(sub_scores),
+                        )
                     # Also refresh debt + bedtime entities because the
                     # new session just became history.
                     loop.create_task(self._publish_debt_and_bedtime())

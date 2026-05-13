@@ -291,6 +291,8 @@ class TestPersistSession:
         svc = service_cls(_args(cfg))
         svc.stage_sequence = [stage_enum.LIGHT] * 50 + [stage_enum.DEEP] * 10
         svc.stage_counts = {"LIGHT": 50, "DEEP": 10, "REM": 0, "AWAKE": 0}
+        # Back-date session start so the nap filter doesn't reject it.
+        svc.session_started_at = _time.time() - 7200.0
         # Inject a fresh perfect-score subjective rating.
         svc.feedback._latest = FeedbackSnapshot(   # type: ignore[union-attr]
             score=5.0, received_at=_time.time(),
@@ -484,6 +486,9 @@ class TestSessionLifecycle:
         svc._in_session = True
         svc.stage_counts = {"AWAKE": 1, "LIGHT": 50, "DEEP": 10, "REM": 5}
         svc.stage_sequence = [stage_enum.LIGHT] * 50
+        # Back-date session start so the nap filter doesn't reject it.
+        import time as _time
+        svc.session_started_at = _time.time() - 7200.0
         controller = MagicMock()
         controller.feedback_score = MagicMock()
         original_id = svc.session_id

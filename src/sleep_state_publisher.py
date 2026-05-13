@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from src.data_structures import SleepStage
 from src.ha_api_client import HomeAssistantClient
@@ -74,6 +74,16 @@ ENTITY_PER_STAGE_DELTAS = "sensor.sleep_classifier_per_stage_deltas"
 # See docs/BACKLOG.md "Sleep apnea detector" section for the
 # medical-disclaimer rationale.
 ENTITY_APNEA_INDEX = "sensor.sleep_classifier_apnea_index"
+
+# v1.8.0 — aggregated health status sensor.
+ENTITY_HEALTH = "sensor.sleep_classifier_health"
+
+# v1.8.0 — quality sub-score sensors (architecture / efficiency /
+# fragmentation / onset).  Each is 0-100, state_class=measurement.
+ENTITY_QUALITY_ARCHITECTURE = "sensor.sleep_classifier_quality_architecture"
+ENTITY_QUALITY_EFFICIENCY = "sensor.sleep_classifier_quality_efficiency"
+ENTITY_QUALITY_FRAGMENTATION = "sensor.sleep_classifier_quality_fragmentation"
+ENTITY_QUALITY_ONSET = "sensor.sleep_classifier_quality_onset"
 
 # ``icon: mdi:...`` strings render in Lovelace.  ``state_class`` and
 # ``device_class`` enable HA's long-term statistics (so the user gets a
@@ -184,6 +194,40 @@ _STATIC_ATTRS_APNEA_INDEX = {
         "This is a TREND indicator, not a medical diagnosis. "
         "Consult a sleep clinician for a real AHI."
     ),
+}
+
+# v1.8.0 — health status sensor attributes.
+_STATIC_ATTRS_HEALTH = {
+    "friendly_name": "Sleep classifier health",
+    "icon": "mdi:heart-pulse",
+    "device_class": "enum",
+    "options": ["healthy", "degraded", "error"],
+}
+
+# v1.8.0 — quality sub-score sensor attributes.
+_STATIC_ATTRS_QUALITY_ARCHITECTURE = {
+    "friendly_name": "Quality: architecture",
+    "icon": "mdi:chart-bar",
+    "unit_of_measurement": "score",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_QUALITY_EFFICIENCY = {
+    "friendly_name": "Quality: efficiency",
+    "icon": "mdi:speedometer",
+    "unit_of_measurement": "score",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_QUALITY_FRAGMENTATION = {
+    "friendly_name": "Quality: fragmentation",
+    "icon": "mdi:chart-scatter-plot",
+    "unit_of_measurement": "score",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_QUALITY_ONSET = {
+    "friendly_name": "Quality: onset",
+    "icon": "mdi:clock-start",
+    "unit_of_measurement": "score",
+    "state_class": "measurement",
 }
 
 
@@ -619,6 +663,71 @@ class SleepStatePublisher:
         truncated = (summary or "—")[:255]
         await self._safe_update(ENTITY_LAST_ACTION, truncated, attrs)
 
+    # ------------------------------------------------------------------ #
+    # v1.8.0 — health status sensor                                       #
+    # ------------------------------------------------------------------ #
+
+    async def publish_health(
+        self,
+        *,
+        stage_source_stale: bool = False,
+        env_stale_fields: Optional[List[str]] = None,
+        publisher_failures: int = 0,
+        learner_sessions: int = 0,
+        capability_skipped: int = 0,
+    ) -> None:
+        """Publish the aggregated health status sensor.
+
+        Logic:
+        - ``error``: stage source stale OR publisher consecutive failures > 5
+        - ``degraded``: any env sensor stale OR capability skipped > 0
+          OR learner history < 3 sessions
+        - ``healthy``: none of the above
+        """
+        if stage_source_stale or publisher_failures > 5:
+            state = "error"
+        elif (env_stale_fields and len(env_stale_fields) > 0) or \
+                capability_skipped > 0 or learner_sessions < 3:
+            state = "degraded"
+        else:
+            state = "healthy"
+
+        attrs = dict(_STATIC_ATTRS_HEALTH)
+        attrs["stage_source_stale"] = stage_source_stale
+        attrs["env_stale_fields"] = list(env_stale_fields or [])
+        attrs["publisher_failures"] = publisher_failures
+        attrs["learner_sessions"] = learner_sessions
+        attrs["capability_skipped"] = capability_skipped
+        await self._safe_update(ENTITY_HEALTH, state, attrs)
+
+    # ------------------------------------------------------------------ #
+    # v1.8.0 — quality sub-score sensors                                  #
+    # ------------------------------------------------------------------ #
+
+    async def publish_quality_sub_scores(
+        self,
+        sub_scores: Dict[str, float],
+    ) -> None:
+        """Publish the 4 quality sub-score sensors.
+
+        ``sub_scores`` is the dict returned by
+        :func:`src.sleep_quality_score.compute_objective_quality` with
+        keys ``architecture``, ``efficiency``, ``fragmentation``,
+        ``onset``.
+        """
+        mapping = {
+            "architecture": (ENTITY_QUALITY_ARCHITECTURE, _STATIC_ATTRS_QUALITY_ARCHITECTURE),
+            "efficiency": (ENTITY_QUALITY_EFFICIENCY, _STATIC_ATTRS_QUALITY_EFFICIENCY),
+            "fragmentation": (ENTITY_QUALITY_FRAGMENTATION, _STATIC_ATTRS_QUALITY_FRAGMENTATION),
+            "onset": (ENTITY_QUALITY_ONSET, _STATIC_ATTRS_QUALITY_ONSET),
+        }
+        for key, (entity_id, static_attrs) in mapping.items():
+            value = sub_scores.get(key)
+            if value is not None:
+                await self._safe_update(
+                    entity_id, round(float(value), 1), static_attrs,
+                )
+
     async def publish_initial_placeholders(self) -> None:
         """Write a sentinel value for every owned entity at boot time.
 
@@ -681,6 +790,22 @@ class SleepStatePublisher:
         await self._safe_update(
             ENTITY_APNEA_INDEX, "pending_consent",
             _STATIC_ATTRS_APNEA_INDEX,
+        )
+        # v1.8.0 — health status + quality sub-scores.
+        await self._safe_update(
+            ENTITY_HEALTH, "healthy", _STATIC_ATTRS_HEALTH,
+        )
+        await self._safe_update(
+            ENTITY_QUALITY_ARCHITECTURE, 0, _STATIC_ATTRS_QUALITY_ARCHITECTURE,
+        )
+        await self._safe_update(
+            ENTITY_QUALITY_EFFICIENCY, 0, _STATIC_ATTRS_QUALITY_EFFICIENCY,
+        )
+        await self._safe_update(
+            ENTITY_QUALITY_FRAGMENTATION, 0, _STATIC_ATTRS_QUALITY_FRAGMENTATION,
+        )
+        await self._safe_update(
+            ENTITY_QUALITY_ONSET, 0, _STATIC_ATTRS_QUALITY_ONSET,
         )
 
     async def _safe_update(
