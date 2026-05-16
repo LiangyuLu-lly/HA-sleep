@@ -28,7 +28,7 @@
 
 # --- Build args injected by HA Supervisor ------------------------------------
 # Supervisor 构建 add-on 时会自动注入下列 ARG：
-#   BUILD_FROM          - build.yaml 里每个 arch 对应的 base image
+#   BUILD_FROM          - base image (默认从 Dockerfile ARG 取)
 #   BUILD_ARCH          - 当前构建 arch (amd64 / aarch64)
 #   BUILD_VERSION       - config.yaml 里的 version 字段
 #   BUILD_NAME          - config.yaml 里的 name
@@ -36,12 +36,22 @@
 #   BUILD_REPOSITORY    - "owner/repo" 形式的 GitHub 仓库名
 #   BUILD_REF           - 构建对应的 git SHA
 #   BUILD_DATE          - RFC3339 构建时间戳
-# 本地 docker build 不经过 Supervisor 时用默认值兜底，不让 build 失败。
-ARG BUILD_FROM=docker.io/library/python:3.11-alpine
+#
+# v2.1.0 修复：删除 build.yaml（已被新版 Supervisor 标 deprecated）。
+# 当 build.yaml 解析失败时 Supervisor silently fall back 到自带的
+# HA base image（``m.haospeed.com/home-assistant/base:latest`` 在国内
+# 加速源场景下），那个 image 没装 pip，会让构建在 ``pip: not found``
+# 处挂掉。删除 build.yaml 后 Supervisor 会用 Dockerfile 里的 ARG 默认
+# 值 ``library/python:3.11-alpine``，docker daemon 自动展开成
+# ``docker.io/library/python:3.11-alpine``。
+#
+# 镜像 OCI labels 之前由 build.yaml 提供，现在内嵌到 Dockerfile 的
+# LABEL 块（见下方）。
+ARG BUILD_FROM=library/python:3.11-alpine
 
 FROM ${BUILD_FROM}
 
-ARG BUILD_FROM=docker.io/library/python:3.11-alpine
+ARG BUILD_FROM=library/python:3.11-alpine
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=dev
 ARG BUILD_NAME="Sleep Classifier"

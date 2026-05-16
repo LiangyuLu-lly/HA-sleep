@@ -1,0 +1,29 @@
+# v2.0.3: build_from 指向 Docker Hub 官方 python:3.11-alpine。
+# v2.1.0 修复历程：
+#
+# 第一次尝试 (失败)：``python:3.11-alpine`` 裸名 → 新版 Supervisor +
+# buildx 不再隐式 fall back 到 ``docker.io/library/``。
+#
+# 第二次尝试 (失败)：``docker.io/library/python:3.11-alpine`` 完整路径
+# → Supervisor 的 build_from 校验正则
+# ``^([a-zA-Z\-\.:\d{}]+/)*?([\-\w{}]+)/([\-\w{}]+)(:[\.\-\w{}]+)?$``
+# 要求**正好两级**（registry/owner/repo 中间那个不能用 ``library``，
+# 因为 ``library/`` 段会被当成 registry 而不是 namespace）。这条正则
+# 本质上对镜像名有限制：要么 ``owner/repo[:tag]``，要么
+# ``registry/owner/repo[:tag]``，``docker.io/library/python:3.11-alpine``
+# 三段路径反而被拒绝。Supervisor 一旦解析失败就 silently fall back
+# 到 HA 自带 base image (``m.haospeed.com/home-assistant/base:latest``)，
+# 那个镜像没装 pip，构建直接挂在 ``pip: not found``。
+#
+# 第三次（当前）：用 ``library/python:3.11-alpine``，正好命中正则的
+# ``owner/repo:tag`` 形式；docker daemon 自动把 ``library/`` 解析成
+# ``docker.io/library/``，结果与第二次尝试等价但能通过 Supervisor 校验。
+build_from:
+  aarch64: library/python:3.11-alpine
+  amd64: library/python:3.11-alpine
+
+labels:
+  org.opencontainers.image.title: "Sleep Classifier"
+  org.opencontainers.image.description: "Closed-loop smart-home sleep automation: learns your ideal bedtime + bedroom environment from HA sleep-stage data"
+  org.opencontainers.image.source: "https://github.com/LiangyuLu-lly/HA-sleep"
+  org.opencontainers.image.licenses: "MIT"
