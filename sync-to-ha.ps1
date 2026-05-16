@@ -19,7 +19,8 @@ param(
     [string]$HAHost = "192.168.31.71",
     [switch]$SkipPull,
     [switch]$SkipRebuild,
-    [string]$HAToken = ""
+    [string]$HAToken = "",
+    [switch]$DumpLogs
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,6 +134,46 @@ function Invoke-HAApi {
     }
 }
 
+# Diagnostic helper: dump Supervisor logs so we can see WHY install fails.
+# Usage: .\sync-to-ha.ps1 -DumpLogs
+if ($DumpLogs) {
+    if (-not $HAToken) {
+        Write-Host "==> -DumpLogs requires -HAToken or HA_TOKEN env var" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ""
+    Write-Host "==> Pulling Supervisor logs..." -ForegroundColor Yellow
+    try {
+        $supLogs = Invoke-RestMethod -Uri "${supervisorBase}/supervisor/logs" -Headers $headers -TimeoutSec 30
+        $supLogFile = Join-Path $repoRoot "supervisor.log"
+        $supLogs | Out-File -FilePath $supLogFile -Encoding utf8
+        Write-Host "    wrote $supLogFile" -ForegroundColor Green
+    } catch {
+        Write-Warning "supervisor log fetch failed: $($_.Exception.Message)"
+    }
+
+    Write-Host ""
+    Write-Host "==> Pulling add-on build logs (if exists)..." -ForegroundColor Yellow
+    try {
+        $addonLogs = Invoke-RestMethod -Uri "${supervisorBase}/addons/$addonSlug/logs" -Headers $headers -TimeoutSec 30
+        $addonLogFile = Join-Path $repoRoot "addon.log"
+        $addonLogs | Out-File -FilePath $addonLogFile -Encoding utf8
+        Write-Host "    wrote $addonLogFile" -ForegroundColor Green
+    } catch {
+        Write-Host "    no add-on logs (probably not yet installed)" -ForegroundColor DarkYellow
+    }
+
+    Write-Host ""
+    Write-Host "==> Add-on info (state / version / image):" -ForegroundColor Yellow
+    try {
+        $info = Invoke-RestMethod -Uri "${supervisorBase}/addons/$addonSlug/info" -Headers $headers -TimeoutSec 30
+        $info | ConvertTo-Json -Depth 6 | Out-Host
+    } catch {
+        Write-Host "    add-on not registered with Supervisor" -ForegroundColor DarkYellow
+    }
+    exit 0
+}
+
 # Step 5: Stop the add-on (ignore error if already stopped)
 Write-Host ""
 Write-Host "==> [5/7] Stopping add-on..." -ForegroundColor Yellow
@@ -167,5 +208,10 @@ if ($startResult) {
 }
 
 Write-Host ""
-Write-Host "==> All done! Add-on v2.0.3 is running on $HAHost" -ForegroundColor Green
+$remoteVersion = "unknown"
+if (Test-Path $configYaml) {
+    $vline = Get-Content $configYaml | Where-Object { $_ -match "^version:" } | Select-Object -First 1
+    if ($vline -match 'version:\s*["'']?([^"''\s]+)') { $remoteVersion = $Matches[1] }
+}
+Write-Host "==> All done! Add-on v$remoteVersion is running on $HAHost" -ForegroundColor Green
 Write-Host "    Open Web UI: http://${HAHost}:8123/hassio/ingress/local_sleep_classifier" -ForegroundColor Cyan

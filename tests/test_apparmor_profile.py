@@ -25,8 +25,10 @@ def test_apparmor_txt_exists_and_well_formed():
     # 2. 内容包含必要的策略声明
     content = apparmor_path.read_text(encoding="utf-8")
 
-    assert "profile sleep_classifier" in content, (
-        "apparmor.txt must contain 'profile sleep_classifier'"
+    assert "profile addon_local_sleep_classifier" in content, (
+        "apparmor.txt must contain 'profile addon_local_sleep_classifier' "
+        "(HA Supervisor expects profile name = addon_<repo>_<slug>; "
+        "for local add-ons that's addon_local_sleep_classifier)"
     )
     assert "/app/** r," in content, (
         "apparmor.txt must contain '/app/** r,'"

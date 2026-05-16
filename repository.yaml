@@ -3,7 +3,12 @@
 # This file lives at the *root* of the Git repository so that when a user
 # adds the repository URL in HA → Settings → Add-ons → Add-on Store → ⋮ →
 # Repositories, the supervisor recognises it and surfaces every sub-folder
-# of ./addons/ as an installable add-on.
+# at the repo root that contains a ``config.yaml`` as an installable add-on.
+#
+# Layout note (v2.1.0): historically the comment said Supervisor scans
+# ``./addons/``, but Supervisor actually scans the repository root for any
+# subdirectory containing ``config.yaml``. The single add-on shipped here
+# lives at ``./sleep_classifier/`` (root level), which is fully supported.
 #
 # Reference: https://developers.home-assistant.io/docs/add-ons/repository
 name: Sleep Classifier Add-ons

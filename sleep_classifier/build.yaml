@@ -1,10 +1,13 @@
 # v2.0.3: build_from 指向 Docker Hub 官方 python:3.11-alpine。
-# v2.0.1 因 ghcr.io 在中国大陆不可达切到 Docker Hub，build_from 的值
-# 同步修正到 docker.io/library/python:3.11-alpine，消除与 Dockerfile
-# 的漂移。Dockerfile 通过 ARG BUILD_FROM 消费此值，新老 builder 都 OK。
+# v2.1.0 修复：新版 Supervisor (>=2024.10) 要求 build_from 必须包含完整
+# registry 域名，否则构建时 ``unable to find image ... locally`` 阶段会
+# 直接 fail，且错误信息只在 supervisor.log 里能看到。bare image name
+# (``python:3.11-alpine``) 在旧 Supervisor 上能跑只是因为 docker daemon
+# 默认会 fall back 到 docker.io/library/，但 buildx 模式下不再这样。
+# 改成完整路径之后新老 builder 都接受。
 build_from:
-  aarch64: python:3.11-alpine
-  amd64: python:3.11-alpine
+  aarch64: docker.io/library/python:3.11-alpine
+  amd64: docker.io/library/python:3.11-alpine
 
 labels:
   org.opencontainers.image.title: "Sleep Classifier"

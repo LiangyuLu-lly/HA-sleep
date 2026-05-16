@@ -37,11 +37,11 @@
 #   BUILD_REF           - 构建对应的 git SHA
 #   BUILD_DATE          - RFC3339 构建时间戳
 # 本地 docker build 不经过 Supervisor 时用默认值兜底，不让 build 失败。
-ARG BUILD_FROM=python:3.11-alpine
+ARG BUILD_FROM=docker.io/library/python:3.11-alpine
 
 FROM ${BUILD_FROM}
 
-ARG BUILD_FROM=python:3.11-alpine
+ARG BUILD_FROM=docker.io/library/python:3.11-alpine
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=dev
 ARG BUILD_NAME="Sleep Classifier"

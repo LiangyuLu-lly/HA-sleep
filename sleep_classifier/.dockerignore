@@ -1,5 +1,13 @@
 # Files that should NEVER end up inside the add-on image.
 # Keeps the on-Pi rebuild fast and the image small (~200 MB instead of ~3 GB).
+#
+# v2.1.0 修复：之前 ``!addons/sleep_classifier/DOCS.md`` 这条 re-include
+# 规则的路径写错（带了 ``addons/`` 前缀），但 docker build context 实
+# 际是 ``sleep_classifier/`` 这个目录本身（Supervisor 把 add-on 子目
+# 录作为 build context），所以相对路径只是 ``DOCS.md``。错误的路径
+# 让 ``*.md`` 全量排除生效，导致 DOCS.md 没进镜像 —— Supervisor 在 UI
+# 上读 DOCS.md 渲染 "Documentation" 标签时拿不到内容，进而影响 add-on
+# 的安装显示。改回从 add-on 根目录视角的相对路径。
 data/sleep-edf-telemetry/
 **/__pycache__/
 **/*.pyc
@@ -13,5 +21,7 @@ env/
 notebooks/
 tests/
 docs/
+# 排除大多数 .md（README / CHANGELOG 等不需要进镜像），但保留 DOCS.md
+# 因为 Supervisor 要在 UI 渲染它。
 *.md
-!addons/sleep_classifier/DOCS.md
+!DOCS.md

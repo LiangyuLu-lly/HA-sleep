@@ -1,11 +1,13 @@
-"""Bug 1.4 探索测试 — build.yaml 仍指向 ghcr.io
+"""Bug 1.4 探索测试 — build.yaml 必须用 docker.io 完整路径
 
-这是一个 exploration test（探索性测试）。在修复前，此测试 **预期失败**，
-因为 sleep_classifier/build.yaml 的 build_from.aarch64 仍然指向
-ghcr.io/home-assistant/aarch64-base:3.19（v2.0.0 遗留），而 Dockerfile
-已经硬编码 FROM python:3.11-alpine（v2.0.1 国内网络决策）。
+v2.0.1 把 build_from 切到 ``python:3.11-alpine`` 解决 ghcr.io 国内不可达问题。
+v2.1.0 进一步切到完整 ``docker.io/library/python:3.11-alpine``：新版 Supervisor
+（>=2024.10）+ buildx 模式不再隐式 fall back 到 ``docker.io/library/`` 命名
+空间，bare image name 会触发 "image not found" 装不上错误。
 
-测试失败即证明 Bug 1.4 存在：build.yaml 与 Dockerfile 的基础镜像配置不一致。
+测试守护两件事：
+1. build_from 不能含 ghcr.io（v2.0.1 决策）
+2. build_from 必须含完整 registry 域名（v2.1.0 决策）
 """
 
 from pathlib import Path
@@ -13,21 +15,24 @@ from pathlib import Path
 import yaml
 
 
+_EXPECTED_IMAGE = "docker.io/library/python:3.11-alpine"
+
+
 def test_build_from_not_ghcr():
-    """build_from 应指向 python:3.11-alpine，不含 ghcr.io。"""
+    """build_from 应指向 docker.io/library/python:3.11-alpine。"""
     build_yaml_path = Path(__file__).resolve().parent.parent / "sleep_classifier" / "build.yaml"
     data = yaml.safe_load(build_yaml_path.read_text(encoding="utf-8"))
 
     build_from = data["build_from"]
 
-    # aarch64 应为 python:3.11-alpine
-    assert build_from["aarch64"] == "python:3.11-alpine", (
-        f"Expected 'python:3.11-alpine', got '{build_from['aarch64']}'"
+    # aarch64 应为完整 docker.io/library/ 路径
+    assert build_from["aarch64"] == _EXPECTED_IMAGE, (
+        f"Expected '{_EXPECTED_IMAGE}', got '{build_from['aarch64']}'"
     )
 
-    # amd64 应为 python:3.11-alpine
-    assert build_from["amd64"] == "python:3.11-alpine", (
-        f"Expected 'python:3.11-alpine', got '{build_from['amd64']}'"
+    # amd64 同样
+    assert build_from["amd64"] == _EXPECTED_IMAGE, (
+        f"Expected '{_EXPECTED_IMAGE}', got '{build_from['amd64']}'"
     )
 
     # 两者都不应包含 ghcr.io
@@ -36,6 +41,16 @@ def test_build_from_not_ghcr():
     )
     assert "ghcr.io" not in build_from["amd64"], (
         f"amd64 value should not contain 'ghcr.io': {build_from['amd64']}"
+    )
+
+    # v2.1.0 守护：必须含完整 registry 域名
+    assert "docker.io" in build_from["aarch64"], (
+        f"aarch64 must use full registry path 'docker.io/library/...': "
+        f"{build_from['aarch64']}"
+    )
+    assert "docker.io" in build_from["amd64"], (
+        f"amd64 must use full registry path 'docker.io/library/...': "
+        f"{build_from['amd64']}"
     )
 
 
