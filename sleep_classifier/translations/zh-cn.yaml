@@ -1,0 +1,175 @@
+# Home Assistant add-on 翻译 —— 简体中文。
+#
+# 本文件由 HA Supervisor 在渲染 add-on 详情页「Configuration」标签时读取。
+# `configuration:` 下每个 key 必须与 ``sleep_classifier/config.yaml`` 中
+# ``options:`` 一一对应（key 集合严格相等），CI 会用
+# ``scripts/check_translations.py`` 检查任何 drift。
+#
+# 参考: https://developers.home-assistant.io/docs/add-ons/configuration#translating-your-add-on
+#
+# 命名规范：entity_id、服务名、Python 标识符、CLI 命令一律保持原文，
+# 不做翻译；正文中以反引号 ` ` 包住。
+configuration:
+  # ---- 通用 ------------------------------------------------------------
+  area:
+    name: "目标区域"
+    description: "留空表示扫描全部房间；否则填写 Home Assistant 中已注册的 area 名称。"
+  infer_interval:
+    name: "推理间隔（秒）"
+    description: "每隔多少秒读取一次 HA 状态并运行分阶段控制器。默认 30 秒即可。"
+  session_interval:
+    name: "会话汇总间隔（秒）"
+    description: "每隔多少秒把一段完整的睡眠会话汇总并送进偏好学习器。默认 1800 秒（30 分钟）。"
+  dry_run:
+    name: "演练模式（dry_run）"
+    description: "开启时，所有设定点命令只写日志、不会下发到真实设备。首次安装后建议保留 7 天再关闭。"
+  exploration_rate:
+    name: "探索率"
+    description: "概率（0..1），偶尔尝试偏离已学习中点的设定点。值越大学习越快、波动越大。"
+  min_seconds_between_actions:
+    name: "动作之间最小间隔（秒）"
+    description: "对同一设备连续两次服务调用之间的冷却时间，防止抖动。"
+  deadband_temperature_c:
+    name: "温度死区（°C）"
+    description: "当前室温已位于目标的此偏差范围内时，跳过一次空调下发。"
+  deadband_humidity_pct:
+    name: "湿度死区（%）"
+    description: "当前湿度已位于目标的此偏差范围内时，跳过一次加湿器下发。"
+  deadband_brightness_pct:
+    name: "亮度死区（%）"
+    description: "当前亮度已位于目标的此偏差范围内时，跳过一次灯光下发。"
+  min_stage_dwell_seconds:
+    name: "阶段最小驻留（秒）"
+    description: "过滤可穿戴设备的瞬时抖动：新睡眠阶段必须持续这么长时间，控制器才会响应。"
+  wind_down_minutes:
+    name: "wind-down 提前量（分钟）"
+    description: "在已学习的入睡时间之前提前预冷与调暗的分钟数。设为 0 关闭。"
+  log_level:
+    name: "日志级别"
+    description: "可选 debug / info / warning / error。访问令牌与 entity_id 不会写入日志。"
+
+  # ---- 槽位绑定：传感器 -----------------------------------------------
+  sleep_stage_source:
+    name: "睡眠分期源实体"
+    description: "指定单个 entity_id（sensor / binary_sensor / input_select），用于发布当前睡眠阶段。留空表示禁用。"
+  temperature_source:
+    name: "温度源实体"
+    description: "卧室温度传感器。留空时在配置的 area 内自动发现。"
+  humidity_source:
+    name: "湿度源实体"
+    description: "卧室湿度传感器。留空时在配置的 area 内自动发现。"
+  illuminance_source:
+    name: "照度源实体"
+    description: "卧室照度传感器。留空时在配置的 area 内自动发现。"
+
+  # ---- 槽位绑定：可执行设备 -------------------------------------------
+  light_targets:
+    name: "灯具目标"
+    description: "Add-on 可以控制的 light entity_id 列表（主灯、床头灯等）。留空表示不下发灯光指令。"
+  climate_target:
+    name: "空调 / 暖通目标"
+    description: "Add-on 可以控制的单个 climate entity_id。留空表示不下发空调指令。"
+  humidifier_target:
+    name: "加湿器目标"
+    description: "Add-on 可以控制的单个 humidifier entity_id。留空表示不下发加湿器指令。"
+  fan_target:
+    name: "风扇目标"
+    description: "Add-on 可以控制的单个 fan entity_id。留空表示不下发风扇指令。"
+  switch_targets:
+    name: "开关目标"
+    description: "Add-on 可以切换的通用 switch（如空气净化器）列表。留空表示不下发开关指令。"
+
+  # ---- 自动发现可调参数 -----------------------------------------------
+  controllable_domains:
+    name: "可控 domain 白名单"
+    description: "Add-on 允许调用服务的 domain 集合。默认 light、climate、fan、humidifier。"
+  explicit_includes:
+    name: "强制包含的 entity_id"
+    description: "无论是否在配置的 area 内，都必须纳入考虑的 entity_id 列表。"
+  explicit_excludes:
+    name: "强制排除的 entity_id"
+    description: "即便自动发现命中也绝不触碰的 entity_id 列表。"
+
+  # ---- 用户画像 --------------------------------------------------------
+  birth_year:
+    name: "出生年份"
+    description: "用于推导 NSF / AAP 推荐睡眠时长。填 0 表示未知，按成年人默认值处理。"
+  chronotype:
+    name: "Chronotype（昼夜偏好）"
+    description: "可选 morning / evening / neutral。影响 wind-down 时长与工作日 / 周末入睡时间曲线。"
+
+  # ---- 智能唤醒 --------------------------------------------------------
+  wake_window_start:
+    name: "唤醒窗口起点（HH:MM）"
+    description: "可接受的最早唤醒时刻。留空表示禁用智能唤醒。"
+  wake_window_end:
+    name: "唤醒窗口终点（HH:MM）"
+    description: "可接受的最晚唤醒时刻。Add-on 会在窗口内挑选最佳的阶段切换点。"
+  wake_light_targets:
+    name: "唤醒灯具列表"
+    description: "在唤醒前 30 分钟逐渐变亮的灯具（dawn-light 效果）。"
+
+  # ---- 白噪声 / 景观音 -------------------------------------------------
+  whitenoise_target:
+    name: "白噪声媒体播放器"
+    description: "用于按阶段播放音频的单个 media_player entity_id。留空表示禁用。"
+  whitenoise_volume_scale:
+    name: "白噪声音量倍率"
+    description: "对每个阶段默认音量的全局倍率，取值 0..2。"
+  whitenoise_track_overrides:
+    name: "白噪声音轨覆写"
+    description: "可选的按阶段媒体 URI 覆写，形如 key=value（例：pink_noise=media-source://...）。"
+  whitenoise_volume_feedback_entity:
+    name: "白噪声音量反馈按钮"
+    description: "input_button 助手。按下后将当前白噪声音量倍率下调 30%。"
+
+  # ---- 主观反馈 --------------------------------------------------------
+  feedback_entity:
+    name: "主观反馈实体"
+    description: "保存用户晨起评分的 input_number 助手。留空表示不接收主观反馈。"
+  feedback_scale:
+    name: "评分上限"
+    description: "input_number 评分的最大值（常见为 5 或 10）。"
+
+  # ---- 呼吸暂停 / 低通气趋势 ------------------------------------------
+  apnea_breathing_rate_source:
+    name: "呼吸频率源实体"
+    description: "可选的呼吸频率传感器（如毫米波雷达）。启用呼吸暂停趋势功能必须填写。"
+  apnea_chest_amplitude_source:
+    name: "胸廓振幅源实体"
+    description: "可选的胸廓振幅传感器。与呼吸频率联合用于识别低通气类事件。"
+  apnea_consent_entity:
+    name: "呼吸暂停功能同意开关"
+    description: "input_boolean 助手。在该开关打开之前，检测器始终处于 pending_consent 状态。"
+  apnea_calibration_nights:
+    name: "呼吸暂停校准夜数"
+    description: "在发布 green / amber / red 趋势之前，用于建立个人基线的夜数。"
+
+  # ---- v2.1.0 商用化新增 ----------------------------------------------
+  telemetry_enabled:
+    name: "匿名遥测"
+    description: "默认关闭。开启后只上报版本号、HA 版本、架构、locale 与最近 24 小时是否活跃，不会上报任何 entity_id。"
+  upgrade_notifications_enabled:
+    name: "新版本通知"
+    description: "默认关闭。开启后每 24 小时匿名 GET 一次 GitHub Releases，不携带任何用户信息。"
+
+# 仅 wizard 使用的文案 —— 由 web_ui.py 根据 Accept-Language 渲染。
+# entity_id、服务名、CLI 命令保持英文原文，正文中以反引号包住。
+onboarding:
+  step1_title: "欢迎使用 Sleep Classifier"
+  step1_disclaimer: "本 Add-on 不是医疗设备，不用于诊断或治疗任何疾病。完整说明请参阅医疗免责声明。"
+  step1_disclaimer_link: "查看完整的医疗免责声明"
+  step1_continue: "我已了解，继续"
+  step2_title: "扫描候选睡眠分期实体"
+  step2_subtitle: "正在查找发布睡眠阶段的传感器（例如 Apple Watch、小米手环、Fitbit、sleep_as_android、毫米波雷达）。"
+  step2_pick_cta: "使用此实体"
+  step2_empty_state: "没有找到候选实体。你目前可能还没有睡眠分期设备。"
+  no_hardware_cta: "我没有睡眠分期硬件 → 查看推荐"
+  step3_title: "确认环境传感器与执行设备"
+  step3_subtitle: "请选择卧室的温度、湿度、照度传感器，以及希望本 Add-on 控制的灯、空调、加湿器或风扇。"
+  step4_title: "安全确认"
+  step4_dry_run_warning: "强烈建议保留 dry_run=true 至少 7 天。Add-on 仅会在日志中记录指令，不会真正下发到你的设备。"
+  step4_keep_dry_run: "保持 dry_run 开启（推荐）"
+  step4_disable_dry_run: "关闭 dry_run"
+  step4_finish: "完成设置"
+  resume_notice: "回到第 1 步。由于 wizard 上一次未完成，之前的选择没有保存。"

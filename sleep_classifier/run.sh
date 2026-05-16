@@ -132,6 +132,15 @@ export SC_APNEA_AMPLITUDE="$APNEA_AMPLITUDE"
 export SC_APNEA_CONSENT="$APNEA_CONSENT"
 export SC_APNEA_CALIBRATION_NIGHTS="$APNEA_CALIBRATION_NIGHTS"
 
+# ── Publish placeholder sensors (Bug 1.1 fix) ──────────────────────────────
+# Best-effort: even if stage is not bound yet, Lovelace will show
+# "configuring" entities instead of "Entity not available".
+echo "[run.sh] Publishing placeholder sensors"
+python3 /app/bootstrap_placeholders.py || echo "[run.sh] placeholder publish failed — continuing"
+
+# ── Clean up stale atomic-write temp files (Bug 1.7 prevention) ─────────────
+find /data -maxdepth 2 -type f -name '*.tmp.*' -mmin +60 -delete 2>/dev/null || true
+
 # ── Generate an effective config.json that merges user options on top of
 # ── the bundled defaults.  Done in Python (in a separate file, not a
 # ── heredoc) because jq + nested merge is awkward AND heredoc-embedded
@@ -152,16 +161,10 @@ echo "[run.sh] Starting Sleep Classifier add-on (area=$AREA_LABEL, infer_interva
 echo "[run.sh] Using SUPERVISOR_TOKEN to authenticate against http://supervisor/core"
 
 # ── Web UI (entity picker via Supervisor Ingress) ──────────────────────────
-# The Web UI is the FOREGROUND process of this container.  It runs under
-# ``exec`` at the very end so its PID is 1 (after tini) — meaning:
-#
-#   * Docker SIGTERM reaches it immediately for clean shutdown.
-#   * Even if the smart service crashes repeatedly, the container keeps
-#     running and Ingress sees a stable :8099 listener.
-#
-# The smart service is supervised in the BACKGROUND by a tiny bash loop
-# below; it restarts with exponential back-off on crash and skips
-# startup entirely when the user hasn't bound a sleep-stage entity yet.
+# The Web UI runs as a background process alongside the smart-service
+# supervisor.  Both are managed by bash with job control (set -m) and a
+# _shutdown() trap that forwards SIGTERM and waits up to 8 seconds for
+# graceful exit before SIGKILL.
 export WEB_UI_PORT=8099
 
 # ── Smart-service supervisor (background) ──────────────────────────────────
@@ -216,19 +219,40 @@ supervise_smart_service() {
     done
 }
 
-# Launch the supervisor as a background job so this shell can exec into
-# the Web UI below.  Capture its PID so we can kill it on container stop.
+# ── Process supervision (Bug 1.3 fix) ──────────────────────────────────────
+# Enable job control so background processes get their own process groups.
+set -m
+
+# Start Web UI as a background process (no longer exec'd).
+python3 /app/web_ui.py &
+PID_WEB=$!
+echo "[run.sh] Web UI PID $PID_WEB on :$WEB_UI_PORT"
+
+# Start smart-service supervisor as a background process.
 supervise_smart_service &
-SUPERVISOR_PID=$!
-echo "[run.sh] Smart-service supervisor PID $SUPERVISOR_PID"
+PID_SMART_SUP=$!
+echo "[run.sh] Smart-service supervisor PID $PID_SMART_SUP"
 
-# Forward container-level SIGTERM/SIGINT to the background supervisor so
-# the Python service gets a chance to flush preferences before exit.
-trap 'kill $SUPERVISOR_PID 2>/dev/null || true' INT TERM EXIT
+# Graceful shutdown handler: forward SIGTERM to children, wait up to 8s,
+# then SIGKILL any stragglers.
+_shutdown() {
+    echo "[run.sh] Received shutdown signal — forwarding to children"
+    kill "$PID_WEB" "$PID_SMART_SUP" 2>/dev/null || true
+    local deadline=8
+    local elapsed=0
+    while (( elapsed < deadline )); do
+        # If both are gone, we're done.
+        kill -0 "$PID_WEB" 2>/dev/null || kill -0 "$PID_SMART_SUP" 2>/dev/null || break
+        sleep 1
+        elapsed=$(( elapsed + 1 ))
+    done
+    # Force-kill anything still alive.
+    kill -9 "$PID_WEB" "$PID_SMART_SUP" 2>/dev/null || true
+    exit 0
+}
 
-# ── Hand off PID 1 to the Web UI ───────────────────────────────────────────
-# Last line of the script uses exec so the Web UI inherits PID 1 (after
-# tini).  This is what keeps Ingress working through smart-service
-# crashes: the container never dies just because the Python service died.
-echo "[run.sh] Starting Web UI on :$WEB_UI_PORT (foreground)"
-exec python3 /app/web_ui.py
+trap _shutdown INT TERM
+
+# Block until one of the children exits, then trigger shutdown.
+wait -n "$PID_WEB" "$PID_SMART_SUP"
+_shutdown

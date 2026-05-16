@@ -12,6 +12,115 @@ file is the engineering log — what landed, in what order, and why.
 
 Tracked items live in `docs/BACKLOG.md`.
 
+## [2.1.0] — 2026-05-16
+
+**Commercial readiness — 让项目从「能跑」跨到「拿得到用户 / 留得住 / 可变现」。**
+
+本版本覆盖 15 条 commercial readiness requirements，实现 55 个子任务，测试从
+537 增长到 1388，覆盖率 ≥ 92%。所有改动严格遵守 PR1–PR6 不变量（sensor 契约 /
+持久化向后兼容 / 运行时零新硬依赖 / SIGTERM 链路 / config schema optional）。
+
+### Added
+
+- **Branding assets**：`sleep_classifier/icon.png` (128×128) + `logo.png` (250×100)
+  + `assets/screenshots/` 占位截图；GitHub topics 登记在 ROADMAP checklist。
+- **Internationalization**：`sleep_classifier/translations/{en,zh-cn}.yaml`，
+  41 个配置项 + onboarding wizard 文案全覆盖；CI `check_translations.py` 守护。
+- **Hardware recommendation page**：`docs/HARDWARE.md`，3 类 ≥ 5 款硬件 + affiliate disclosure。
+- **Release engineering**：
+  - `scripts/sync_version.py`（版本号四处一致）
+  - `.github/workflows/addon-build.yml`（多架构 buildx + 镜像体积守护）
+  - `.github/workflows/release.yml`（tag → GitHub Release + CHANGELOG 段落抽取）
+  - `test.yml` 扩展 Python 3.10/3.11/3.12 矩阵 + 5 个守护脚本 + lychee link check
+- **Legal document set**：`PRIVACY.md` / `SECURITY.md` / `CONTRIBUTING.md` /
+  `CODE_OF_CONDUCT.md` / `MEDICAL_DISCLAIMER.md`，中文为主 + 英文摘要。
+- **Opt-in anonymous telemetry**：`src/telemetry_reporter.py`，默认关闭，24h 周期，
+  payload self-check 不泄露 entity_id，`disable()` 幂等撤回 + 删 install_id。
+- **Onboarding wizard**：Web UI 首启 4 步引导（欢迎 → 自动扫描候选实体 →
+  确认槽位 → dry_run 安全确认）；`src/onboarding_scanner.py` 纯函数评分。
+- **One-click Lovelace dashboard importer**：`POST /api/dashboard/import`，
+  覆盖检测 + 回滚补偿；`sleep_classifier/lovelace_template.py` 4-view 模板。
+- **Upgrade notifier**：`src/upgrade_notifier.py`，24h 匿名 GET GitHub Releases，
+  `persistent_notification.create` + Web UI banner。
+- **Monetization path**：README sponsor badges + `.github/FUNDING.yml` +
+  `docs/ROADMAP.md` Commercial roadmap section + MIT 功能不付费承诺。
+- **User evidence**：README Real-world results + Beta tester program +
+  `docs/CASE_STUDIES.md` ≥ 1500 字 30 天案例研究。
+- **Medical advisors placeholder**：README 招募段 + MEDICAL_DISCLAIMER 互链。
+- **Deferred roadmap**：`docs/ROADMAP.md` Device ecosystem / Multi-resident 技术起点。
+- **11 条 correctness properties**：Property 1–11 全部有对应 pytest 参数化测试。
+- **PR3 守护**：`tests/test_no_direct_write_text.py` AST 扫描禁止 `Path.write_text /data`。
+- **PR2 守护**：`tests/test_sensor_contract.py` 20 实体 snapshot 冻结测试。
+
+### Changed
+
+- `sleep_classifier/web_ui.py`：重构为支持 onboarding redirect、telemetry toggle、
+  upgrade banner、dashboard import 等新路由；`make_app()` 接受 DI 注入。
+- `scripts/run_ha_smart_service.py`：启动序列注册 `telemetry_reporter` +
+  `upgrade_notifier` 两个 asyncio.Task；shutdown 路径 ≤ 10 秒 cancel + gather。
+- `sleep_classifier/config.yaml`：新增 `telemetry_enabled: false` 与
+  `upgrade_notifications_enabled: true`（schema 标 `bool?`，PR6 兼容）。
+- `.github/workflows/test.yml`：矩阵扩展 3.10/3.11/3.12 + 5 个守护脚本 step +
+  `--cov-fail-under=92` + `lycheeverse/lychee-action` 链接检查。
+
+### Fixed
+
+- **Dockerfile `pip3: not found`**：HA base image 升级后不再预装 `pip3`，
+  改为 `python3 -m pip install`。
+
+### Security
+
+- `SECURITY.md`：漏洞披露邮箱 + ≤ 7 天首响 + CVE 流程 + 禁止公开 issue。
+
+## [2.0.3] — 2026-05-14
+
+**全流程审计修复 + 商业化元数据补完。** v2.0.2 修复了首次安装的两条明显
+失败路径后，本轮对 Dockerfile → run.sh → config.yaml → web_ui.py 全链路
+做了第二轮系统审计，对照 HA 开发者文档（2025–2026）与 `hassio-addons/app-example`
+做横向核验，修复 9 条 bug 并补齐 3 项商业级元数据/安全分。
+
+### Fixed
+
+- **首次安装占位 sensor 缺失（Bug 1.1）**：新增 `bootstrap_placeholders.py`，
+  在 `sleep_stage_source` 未绑定时抢发 5 个占位 `sensor.sleep_classifier_*`
+  （`state="configuring"`），Lovelace 60 秒内可见 add-on 存活信号。
+- **Ingress 前端路径契约测试（Bug 1.2）**：补充契约测试 + docstring 防回归，
+  确保前端 fetch 统一使用相对路径，不因 Ingress session 前缀变化而 404。
+- **SIGTERM 不转发导致丢数据（Bug 1.3）**：`run.sh` 移除末尾 `exec`，改用
+  `tini -g` + `wait -n` 架构，SIGTERM 同时转发给 Web UI 和 smart service，
+  8 秒内完成 preferences flush 并正常退出。
+- **build.yaml 配置漂移（Bug 1.4）**：`build_from` 从 `ghcr.io/home-assistant/
+  aarch64-base:3.19` 改为 `python:3.11-alpine`，消除与 Dockerfile 的矛盾，
+  兼容 Supervisor 2026.04.0+ 的 BuildKit 迁移。
+- **startup 语义错误（Bug 1.6）**：`config.yaml` 的 `startup` 从 `services`
+  改为 `application`，确保 add-on 在 HA Core 就绪后才启动，消除头 30 秒的
+  ping 失败噪声。
+- **effective_config 非原子写（Bug 1.7）**：新增 `src/_io_utils.py`，所有
+  `/data` 下 JSON 写入改用 `atomic_write_json`（tmp + fsync + os.replace），
+  防止写入中断导致文件损坏。
+- **Ingress IP 白名单缺失（Bug 1.8）**：Web UI 新增 middleware，仅允许
+  `172.30.32.2`（Supervisor）连接，其他 IP 返回 403。
+- **WS 错误分类过于激进（Bug 1.9）**：`_task_ws_listener` 区分可恢复错误
+  （Core 重启 401/503）与真正的 auth 失效，引入 `MAX_AUTH_FAILURES` 计数
+  （默认 10），不再单次触发 stop。
+
+### Added
+
+- **AppArmor profile（Bug 1.10）**：新增 `sleep_classifier/apparmor.txt`，
+  `config.yaml` 声明 `apparmor: true`，安全分从 5 分提升到 6 分（满分）。
+- **完整 OCI labels × 15（Bug 1.5 / 1.12）**：Dockerfile 声明 15 条 LABEL
+  （5 条 `io.hass.*` + 10 条 `org.opencontainers.image.*`），对齐
+  `hassio-addons/app-example` 工业级元数据基线。
+- **config.yaml `url` 字段（Bug 1.12）**：Supervisor UI 详情页显示可点击的
+  "Project homepage" 链接指向 GitHub 仓库。
+
+### Changed
+
+- `build.yaml` 的 `build_from` 指向 Docker Hub `python:3.11-alpine`。
+- `config.yaml` 的 `startup` 改为 `application`。
+- `run.sh` 从 `exec` 替换 bash 改为 `tini -g` + `wait -n` 架构，保留
+  trap + job control。
+
 ## [2.0.2] — 2026-05-14
 
 **First-install bring-up hardening.** v2.0.1 made the container build on
@@ -613,7 +722,10 @@ misbehave on its first deployed night.
 For pre-v1.3 history (the CNN-BiLSTM era), see `git log v1.0.0..v1.2.3`.
 The `v1.2.3` tag is the last release that bundled the local model.
 
-[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v2.0.2...v2.0.3
+[2.0.2]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.9.0...v2.0.0
 [1.7.1]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/LiangyuLu-lly/HA-sleep/compare/v1.6.4...v1.7.0

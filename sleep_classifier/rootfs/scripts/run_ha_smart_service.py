@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import random
@@ -102,6 +103,9 @@ from src.smart_wake import (
 from src.external_stage_subscriber import ExternalStageSubscriber
 from src.apnea_wiring import ApneaWiring, ApneaWiringConfig
 from src.live_state_cache import LiveStateCache
+from src.telemetry_reporter import TelemetryReporter
+from src.upgrade_notifier import UpgradeNotifier
+from src._overrides_schema import apply_v2_1_0_defaults
 from src.user_profile import UserProfile, UserProfileStore
 from src.whitenoise_matcher import Soundscape, WhiteNoiseMatcher
 
@@ -124,6 +128,11 @@ _PROFILE_PATH = _BUFFER_DIR / "user_profile.json"
 _Engine = ExternalStageSubscriber
 
 logger = logging.getLogger("smart_service")
+
+# Maximum consecutive HAAuthError before we consider the token permanently
+# invalid and stop the service.  HA Core restarts typically produce 1–3
+# transient 401s; 10 gives ample headroom.
+MAX_AUTH_FAILURES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -584,22 +593,21 @@ class SmartSleepService:
     ) -> None:
         """Stream state-changed events; reconnect with exponential backoff.
 
-        Previously a single WS error tore down the whole service, which on
-        a flaky home network meant the add-on "randomly stopped" every
-        few hours.  We now treat the WS as a best-effort transport: any
-        recoverable error retries after a sleep that doubles up to 5
-        minutes, with a small uniform jitter to avoid synchronised
-        reconnect storms after a HA restart.
+        v2.0.3 — Error classification refinement:
+            HAAuthError 连续 MAX_AUTH_FAILURES 次才视为 token 永久失效；
+            HAAPIError (非 auth 子类) 与未分类异常都走重连路径。
         """
         backoff = 1.0
         max_backoff = 300.0
+        auth_failures = 0
         while not self.stop_event.is_set():
             try:
                 async for event in ha.iter_state_changes():
                     self._route_state_change(event, discovery, engine)
                     if self.stop_event.is_set():
                         break
-                    backoff = 1.0   # any successful event resets backoff
+                    backoff = 1.0
+                    auth_failures = 0    # any successful event resets counter
                 if self.stop_event.is_set():
                     return
                 # iter_state_changes returned cleanly but stop_event isn't
@@ -608,20 +616,34 @@ class SmartSleepService:
             except asyncio.CancelledError:
                 logger.info("WebSocket task cancelled")
                 raise
-            except (HAAuthError, HAAPIError) as exc:
-                # Auth errors won't fix themselves; give up loudly.
-                logger.error("WebSocket auth/API error: %s — stopping service", exc)
-                self.stop_event.set()
-                return
+            except HAAuthError as exc:
+                # Subclass caught first: accumulate counter
+                auth_failures += 1
+                logger.warning(
+                    "WebSocket auth error (%d/%d): %s",
+                    auth_failures, MAX_AUTH_FAILURES, exc,
+                )
+                if auth_failures >= MAX_AUTH_FAILURES:
+                    logger.error(
+                        "Auth failed %d times consecutively — stopping service; "
+                        "check SUPERVISOR_TOKEN / HA Core auth state",
+                        MAX_AUTH_FAILURES,
+                    )
+                    self.stop_event.set()
+                    return
+                # Below threshold: fall through to reconnect path
+            except HAAPIError as exc:
+                # Parent class: HTTP 4xx/5xx, timeout, connection failures
+                logger.warning(
+                    "WebSocket API error (%s); reconnecting in %.1fs",
+                    exc, backoff,
+                )
             except Exception as exc:    # noqa: BLE001
                 logger.warning(
                     "WebSocket transport error (%s); reconnecting in %.1fs",
                     exc, backoff,
                 )
-            # Sleep with jitter, but bail out fast if a shutdown signal lands.
-            # ``random.uniform(-j, +j)`` is the textbook 1-line way to
-            # spread reconnects across the cluster; dropping numpy from
-            # this module means one less heavyweight import at startup.
+            # ----- Backoff sleep (shared by all recoverable branches) -----
             jitter = backoff * 0.2
             try:
                 await asyncio.wait_for(
@@ -635,6 +657,21 @@ class SmartSleepService:
             try:
                 await ha.connect_websocket()
                 await ha.subscribe_state_changes()
+            except HAAuthError as exc:
+                # Reconnect handshake failure also counts toward auth_failures
+                auth_failures += 1
+                logger.warning(
+                    "Reconnect auth failed (%d/%d): %s",
+                    auth_failures, MAX_AUTH_FAILURES, exc,
+                )
+                if auth_failures >= MAX_AUTH_FAILURES:
+                    logger.error(
+                        "Auth failed %d times consecutively — stopping service; "
+                        "check SUPERVISOR_TOKEN / HA Core auth state",
+                        MAX_AUTH_FAILURES,
+                    )
+                    self.stop_event.set()
+                    return
             except Exception as exc:    # noqa: BLE001
                 logger.warning("Reconnect attempt failed: %s", exc)
 
@@ -1115,6 +1152,76 @@ class SmartSleepService:
                 ),
             ]
 
+            # v2.1.0 — register telemetry + upgrade notifier tasks.
+            # Read enabled flags from web_ui_overrides.json (with safe defaults).
+            _overrides_path = _BUFFER_DIR / "web_ui_overrides.json"
+            _overrides_data: dict[str, Any] = {}
+            if _overrides_path.exists():
+                try:
+                    _overrides_data = json.loads(
+                        _overrides_path.read_text(encoding="utf-8")
+                    )
+                except (json.JSONDecodeError, OSError):
+                    pass
+            _overrides_data = apply_v2_1_0_defaults(_overrides_data)
+
+            _telemetry_enabled = bool(_overrides_data.get("telemetry_enabled", False))
+            _upgrade_enabled = bool(
+                _overrides_data.get("upgrade_notifications_enabled", True)
+            )
+
+            # Determine version / arch / locale for reporters.
+            _version = self.full_cfg.get("version", "0.0.0")
+            try:
+                import sys as _sys
+                if _sys.version_info >= (3, 11):
+                    import tomllib
+                else:
+                    import tomli as tomllib  # type: ignore[no-redef]
+                _pyproject = PROJECT_ROOT / "pyproject.toml"
+                if _pyproject.exists():
+                    with open(_pyproject, "rb") as _f:
+                        _version = tomllib.load(_f).get(
+                            "project", {}
+                        ).get("version", _version)
+            except Exception:  # noqa: BLE001
+                pass
+
+            _ha_version = os.environ.get("HA_VERSION", "")
+
+            _arch = os.environ.get("BUILD_ARCH", "amd64")
+            _locale = os.environ.get("LANG", "en")[:5].lower().replace("_", "-")
+
+            telemetry_reporter = TelemetryReporter(
+                enabled=_telemetry_enabled,
+                endpoint=os.environ.get(
+                    "TELEMETRY_ENDPOINT",
+                    "https://telemetry.sleep-classifier.dev/v1/report",
+                ),
+                version=_version,
+                ha_version=_ha_version,
+                arch=_arch,
+                locale=_locale,
+                data_dir=_BUFFER_DIR,
+            )
+            telemetry_task = asyncio.create_task(
+                telemetry_reporter.run(), name="telemetry_reporter"
+            )
+            tasks.append(telemetry_task)
+
+            upgrade_notifier = UpgradeNotifier(
+                enabled=_upgrade_enabled,
+                current_version=_version,
+                owner="your-github-owner",
+                repo="sleep-classifier",
+                ha_client=ha,
+                data_dir=_BUFFER_DIR,
+            )
+            upgrade_task = asyncio.create_task(
+                upgrade_notifier.run(), name="upgrade_notifier"
+            )
+            tasks.append(upgrade_task)
+
             if self.args.duration is not None:
                 async def _stop_after(seconds: float) -> None:
                     await asyncio.sleep(seconds)
@@ -1129,11 +1236,16 @@ class SmartSleepService:
             finally:
                 for t in tasks:
                     t.cancel()
-                for t in tasks:
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                # PR5.2: await all tasks within ≤10 seconds.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=10.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Some tasks did not finish within 10s shutdown window"
+                    )
                 self._persist_session(controller, partial=False)
         return 0
 

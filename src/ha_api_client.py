@@ -402,6 +402,183 @@ class HomeAssistantClient:
             raise HAAPIError(f"subscribe_events failed: {result}")
         return sub_id
 
+    async def _ws_request(self, message: Dict[str, Any]) -> Any:
+        """Send a JSON command on the WS and await the matching ``result``.
+
+        Helper for **command-style** WS calls (anything that has request /
+        response semantics rather than a long-lived event stream — e.g.
+        ``lovelace/dashboards/list``).  Re-uses the existing auth handshake
+        from :meth:`connect_websocket` and the per-connection id counter
+        from :meth:`_next_msg_id`, so callers don't need to know anything
+        about HA's framing.
+
+        Behaviour:
+
+        * Auto-(re)connects when ``self._ws`` is ``None`` or closed.
+        * Allocates a fresh msg id via ``_next_msg_id`` (under
+          ``_ws_lock``) and merges it into the outgoing payload.
+        * Reads frames in a loop, skipping anything whose ``id`` does
+          not match ours (HA may interleave ``event`` frames from a
+          previous ``subscribe_events`` subscription).
+        * On ``{"success": false, ...}`` raises :class:`HAAPIError` with
+          the HA-reported error code and message.
+
+        :raises HAAuthError: if the (re)connect handshake is rejected.
+        :raises HAAPIError: for transport errors and HA-side failures.
+
+        .. note::
+           This helper is **not** safe to call while
+           :meth:`iter_state_changes` is the active WS consumer — that
+           coroutine owns the receive loop and will swallow our result
+           frame.  Lovelace command methods are therefore intended to be
+           called from web-UI request handlers that do not share the
+           same WS consumer with the main event loop, or before the
+           ``state_changed`` subscription is started.
+        """
+        if aiohttp is None:  # pragma: no cover - aiohttp is in requirements.txt
+            raise RuntimeError("aiohttp is not installed")
+        if self._ws is None or self._ws.closed:
+            await self.connect_websocket()
+        assert self._ws is not None
+        msg_id = await self._next_msg_id()
+        payload = {**message, "id": msg_id}
+        try:
+            await self._ws.send_json(payload)
+            while True:
+                reply = await self._ws.receive_json()
+                if reply.get("id") != msg_id:
+                    # Frame for a different request / subscription.  HA
+                    # is allowed to interleave; just keep reading.
+                    continue
+                if reply.get("type") != "result":
+                    continue
+                if not reply.get("success", False):
+                    err = reply.get("error") or {}
+                    raise HAAPIError(
+                        f"HA WS command {message.get('type')!r} failed: "
+                        f"{err.get('code', 'unknown')} "
+                        f"{err.get('message', reply)}"
+                    )
+                return reply.get("result")
+        except aiohttp.ClientError as exc:
+            raise HAAPIError(
+                f"HA WS command {message.get('type')!r} transport error: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------ #
+    # Lovelace WebSocket commands (v2.1.0 onboarding dashboard importer) #
+    # ------------------------------------------------------------------ #
+
+    async def lovelace_dashboards(self) -> List[Dict[str, Any]]:
+        """List every storage-mode Lovelace dashboard known to HA.
+
+        Sends ``lovelace/dashboards/list`` and returns HA's ``result``
+        array.  Each entry is a dict containing at least ``url_path``,
+        ``title``, ``icon``, ``mode``, ``require_admin`` and
+        ``show_in_sidebar``.  YAML-mode dashboards are *not* returned by
+        HA — only user-managed (Storage) ones.
+
+        Used by the v2.1.0 dashboard importer (``web_ui.py``) to detect
+        the existing-but-overwrite case before calling
+        :meth:`lovelace_create_dashboard`.
+
+        :raises HAAuthError: if the access token is rejected on
+                             (re)connect.
+        :raises HAAPIError: for transport / protocol errors.
+        """
+        result = await self._ws_request(
+            {"type": "lovelace/dashboards/list"}
+        )
+        if not isinstance(result, list):
+            raise HAAPIError(
+                "lovelace/dashboards/list returned a non-list payload: "
+                f"{type(result).__name__}"
+            )
+        return [dict(item) for item in result]
+
+    async def lovelace_create_dashboard(
+        self,
+        *,
+        url_path: str,
+        title: str,
+        icon: str,
+        require_admin: bool = False,
+        show_in_sidebar: bool = True,
+    ) -> Dict[str, Any]:
+        """Create a new storage-mode Lovelace dashboard.
+
+        Sends ``lovelace/dashboards/create`` with ``mode="storage"`` so
+        that a subsequent :meth:`lovelace_save_config` call can write
+        the actual view layout produced by
+        :func:`sleep_classifier.lovelace_template.build_dashboard_config`.
+
+        :param url_path: dashboard slug (appears in the HA URL —
+                         ``/lovelace-<url_path>``).
+        :param title: human-readable title shown in the sidebar.
+        :param icon: ``mdi:`` icon to render in the sidebar.
+        :param require_admin: when true, only HA admins can view it.
+        :param show_in_sidebar: when true, HA renders a sidebar entry.
+        :returns: the dashboard dict echoed back by HA (same shape as
+                  :meth:`lovelace_dashboards` entries).
+        :raises HAAuthError: if the access token is rejected on
+                             (re)connect.
+        :raises HAAPIError: when HA reports the create failed (e.g. a
+                            duplicate ``url_path``) or returns an
+                            unexpected payload — in which case the
+                            caller is responsible for any rollback.
+        """
+        result = await self._ws_request(
+            {
+                "type": "lovelace/dashboards/create",
+                "url_path": url_path,
+                "title": title,
+                "icon": icon,
+                "require_admin": require_admin,
+                "show_in_sidebar": show_in_sidebar,
+                "mode": "storage",
+            }
+        )
+        if not isinstance(result, dict):
+            raise HAAPIError(
+                "lovelace/dashboards/create returned a non-dict payload: "
+                f"{type(result).__name__}"
+            )
+        return dict(result)
+
+    async def lovelace_save_config(
+        self,
+        *,
+        url_path: str,
+        config: Dict[str, Any],
+    ) -> None:
+        """Persist the full view config for a storage-mode dashboard.
+
+        Sends ``lovelace/config/save`` with the dashboard body produced
+        by :func:`sleep_classifier.lovelace_template.build_dashboard_config`.
+        HA returns no payload on success; on failure (invalid
+        ``url_path``, schema rejection, transport error)
+        :class:`HAAPIError` is raised so the caller can compensate —
+        the v2.1.0 importer reacts by calling HA's
+        ``lovelace/dashboards/delete`` to roll back the half-created
+        dashboard before surfacing 502 to the user.
+
+        :param url_path: dashboard slug previously created via
+                         :meth:`lovelace_create_dashboard`.
+        :param config: dashboard body (``{"views": [...], "title": ...,
+                       ...}``).
+        :raises HAAuthError: if the access token is rejected on
+                             (re)connect.
+        :raises HAAPIError: when HA rejects the save or the transport
+                            errors out.
+        """
+        await self._ws_request(
+            {
+                "type": "lovelace/config/save",
+                "url_path": url_path,
+                "config": config,
+            }
+        )
+
     async def iter_state_changes(
         self, sub_id: Optional[int] = None,
     ) -> AsyncIterator[StateChangeEvent]:

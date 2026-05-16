@@ -43,6 +43,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src._io_utils import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -325,12 +327,7 @@ class UserProfileStore:
         existing["updated_at"] = time.time()
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(existing, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        tmp.replace(self._path)
+        atomic_write_json(self._path, existing)
 
     def list_users(self) -> List[str]:
         if not self._path.exists():

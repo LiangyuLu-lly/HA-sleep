@@ -17,11 +17,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sleep-classifier"
-version = "2.0.0"
+version = "2.1.0"
 description = "Home Assistant Add-on: learns your ideal sleep environment from HA sleep-stage history and adapts the bedroom across the night"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+
+# ---------------------------------------------------------------------------
+# Optional extras
+# ---------------------------------------------------------------------------
+# 仅在用户显式 ``pip install sleep-classifier[telemetry]`` 时才会拉取，
+# 默认安装路径（含 Add-on 镜像 / `requirements-runtime.txt`）保持
+# **零额外依赖**：v2.1.0 PR4.1/PR4.2 要求 telemetry 经 opt-in extra 提供，
+# 不得污染运行时镜像。`telemetry_reporter.py` 通过
+# ``try: import sentry_sdk`` 软依赖检测，不强制要求该包存在。
+[project.optional-dependencies]
+telemetry = ["sentry-sdk>=2.0.0"]
 
 # ---------------------------------------------------------------------------
 # pytest
@@ -61,6 +72,10 @@ source = ["src", "scripts"]
 omit = ["src/__init__.py"]
 
 [tool.coverage.report]
+# v2.1.0 PR1.2: 总覆盖率门槛固定 ≥ 92%（v2.0.3 当前值），CI 在
+# `pytest --cov=src --cov=scripts` 时由本字段直接拦截。本地跑
+# `pytest` 不带 `--cov` 时此字段不会触发，不影响日常开发节奏。
+fail_under = 92
 exclude_lines = [
     "pragma: no cover",
     "raise NotImplementedError",

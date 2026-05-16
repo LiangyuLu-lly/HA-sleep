@@ -1,27 +1,11 @@
-# Explicit base image per architecture.
-#
-# Why this file exists
-# --------------------
-# Modern HA Supervisor (>= 2024.x) refuses to substitute `${BUILD_FROM}`
-# in the Dockerfile's `FROM` line unless an add-on ships a build.yaml
-# (or build.json) telling it which base image to use for each arch.
-# Without this file the build fails with:
-#     base name (${BUILD_FROM}) should not be blank
-#
-# We deliberately pick the Alpine-flavoured HA base images:
-#   * smaller layer count → faster pull on Pi 4B
-#   * already include bashio + s6-overlay we don't actually need, but
-#     the size cost is < 10 MB compared to a generic alpine:3.19.
-#
-# Bump these tags only after re-running the full pytest suite locally
-# against the matching Python version (currently 3.11 on Alpine 3.19).
-# armhf / armv7 / i386 dropped — HA 2025.12 (2025-12-03) drops support
-# and the addon-linter rejects them.  Pi 4B is aarch64.
+# v2.0.3: build_from 指向 Docker Hub 官方 python:3.11-alpine。
+# v2.0.1 因 ghcr.io 在中国大陆不可达切到 Docker Hub，build_from 的值
+# 同步修正到 docker.io/library/python:3.11-alpine，消除与 Dockerfile
+# 的漂移。Dockerfile 通过 ARG BUILD_FROM 消费此值，新老 builder 都 OK。
 build_from:
-  aarch64: ghcr.io/home-assistant/aarch64-base:3.19
-  amd64: ghcr.io/home-assistant/amd64-base:3.19
+  aarch64: python:3.11-alpine
+  amd64: python:3.11-alpine
 
-# Image labels — picked up by HA Supervisor's UI badges.
 labels:
   org.opencontainers.image.title: "Sleep Classifier"
   org.opencontainers.image.description: "Closed-loop smart-home sleep automation: learns your ideal bedtime + bedroom environment from HA sleep-stage data"

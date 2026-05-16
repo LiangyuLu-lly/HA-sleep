@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.data_structures import SleepStage
 from src._time_utils import now_local
+from src._io_utils import atomic_write_json
 
 # ---------------------------------------------------------------------------
 # Tunables that don't belong in the per-user config (engineering defaults)
@@ -350,11 +351,7 @@ class PreferenceLearner:
             "updated_at": time.time(),
             "sessions": [s.to_dict() for s in kept],
         }
-        # Atomic write: dump to a temp file then rename.
-        tmp = self._history_path.with_suffix(self._history_path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp, self._history_path)
+        atomic_write_json(self._history_path, payload)
 
     # ------------------------------------------------------------------ #
     # Recording                                                          #

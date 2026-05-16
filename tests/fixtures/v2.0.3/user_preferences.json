@@ -1,0 +1,44 @@
+{
+  "sessions": [
+    {
+      "timestamp": "2024-11-15T23:30:00Z",
+      "duration_minutes": 420,
+      "quality_score": 78,
+      "environment": {
+        "temperature_c": 22.5,
+        "humidity_pct": 55,
+        "brightness_pct": 0
+      },
+      "stages": {
+        "AWAKE": 30,
+        "LIGHT": 180,
+        "DEEP": 120,
+        "REM": 90
+      },
+      "weekday": true
+    },
+    {
+      "timestamp": "2024-11-16T00:15:00Z",
+      "duration_minutes": 390,
+      "quality_score": 65,
+      "environment": {
+        "temperature_c": 23.0,
+        "humidity_pct": 50,
+        "brightness_pct": 5
+      },
+      "stages": {
+        "AWAKE": 45,
+        "LIGHT": 160,
+        "DEEP": 100,
+        "REM": 85
+      },
+      "weekday": false
+    }
+  ],
+  "midpoints": {
+    "temperature_c": 22.8,
+    "humidity_pct": 52,
+    "brightness_pct": 2
+  },
+  "last_updated": "2024-11-16T08:00:00Z"
+}

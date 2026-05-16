@@ -1,10 +1,36 @@
 # Sleep Classifier — Home Assistant 智能睡眠 Add-on
 
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/LiangyuLu-lly?style=flat-square&logo=githubsponsors&label=Sponsor)](https://github.com/sponsors/LiangyuLu-lly)
+
 **一句话介绍**：从你自己的睡眠历史中学习最佳卧室环境，然后在整夜、整周、整季中持续自动调节温度/湿度/灯光/风扇，让你每晚都睡在"最好的那几晚"的环境里。
 
 ---
 
+## 硬件需求 / Hardware Required
+
+> **还没有睡眠分期传感器？从这里开始。**
+> **No sleep-stage sensor? Start here.**
+
+本 Add-on 需要一个能输出睡眠分期（AWAKE / LIGHT / DEEP / REM）的硬件设备才能运行。
+详细的推荐硬件清单、价格区间与 HA 接入路径请参阅 👉 [`docs/HARDWARE.md`](docs/HARDWARE.md)
+
+---
+
+## 演示 / Demo
+
+> 下面是 Sleep Classifier 运行 30 天后的 Lovelace 4-view 仪表板概览。
+
+![Lovelace 4-view Dashboard](assets/screenshots/dashboard-tonight.png)
+
+> 🎬 视频演示：请参见 [`assets/screenshots/`](assets/screenshots/) 目录中的 demo 录屏或外链视频。
+
+> ⚠️ 本 Add-on 不是医疗产品，不提供临床诊断或医疗建议。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
+
+---
+
 ## 30 天你会看到什么
+
+> ℹ️ 以下数据描述的是系统行为，非医疗诊断。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
 
 | 时间节点 | 系统状态 | 你会感受到 |
 |---|---|---|
@@ -16,7 +42,35 @@
 
 ---
 
+## 真实使用效果 / Real-world Results
+
+> 以下数据来自项目维护者本人 30 天真实使用记录（已匿名化）。
+
+![30 天 Lovelace 数据趋势](assets/screenshots/30-day-results.png)
+
+- 推荐入睡时间在第 7 天稳定，工作日与周末差异约 45 分钟。
+- 学习到的环境参数（温度 / 湿度 / 灯光）在第 14 天达到 `personalised` 阶段。
+- 睡眠质量分在第 3 周明显上升（碎片化惩罚降低）。
+
+更多案例研究请参阅 [`docs/CASE_STUDIES.md`](docs/CASE_STUDIES.md)。
+
+> ⚠️ 以上数据仅为个人体验，不构成医疗建议或临床证据。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
+
+### Beta Tester Program
+
+我们正在寻找早期用户参与 Beta 测试计划：
+
+- 📸 提交你的 30 天使用截图（匿名化），换取在 README 与 [`docs/CASE_STUDIES.md`](docs/CASE_STUDIES.md) 的署名展示（完全 opt-in）。
+- 🔒 隐私保障：我们不会展示任何具体 entity_id、HA 实例 URL、家庭住址或生物识别信息。
+- ✍️ 所有展示需取得你的书面同意（GitHub issue / PR comment 留痕即可），你可以随时要求撤回。
+
+有兴趣？请提交一个 GitHub Issue 并标注 `beta-tester` 标签。
+
+---
+
 ## 功能列表 — 20 个 Sensor 一览
+
+> ℹ️ 以下 sensor 仅供参考与自动化使用，不构成医学诊断。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
 
 | # | Entity ID | 说明 | 示例值 |
 |---|---|---|---|
@@ -131,11 +185,25 @@ v1.8.0+ 有午睡过滤：`session_lifecycle.min_session_minutes`（默认 60）
 通过 SSH Add-on 删除 `/data/user_preferences.json`，然后重启 Sleep Classifier。系统会从零开始学习。
 </details>
 
+<details>
+<summary><strong>9. Why HA only?（为什么只支持 Home Assistant？）</strong></summary>
+
+本 Add-on 的核心学习器（preference_learner、sleep_quality_score）是纯 Python 模块，理论上可以从 HA Add-on 中抽出复用。v2.2.0+ 路线图中已规划 Matter sleep tracker integration、SmartThings webhook bridge、Apple Health export 等扩展方向。详见 [`docs/ROADMAP.md` §Device ecosystem expansion](docs/ROADMAP.md#device-ecosystem-expansion)。
+</details>
+
+<details>
+<summary><strong>10. Two people sharing a bed?（两人共睡一床怎么办？）</strong></summary>
+
+v2.1.0 仍假设「单户 + 单房间」。夫妻对体感温度需求不同的场景将在 v2.2.0+ 支持（每用户独立偏好文件、per-room 设备分组、不同唤醒窗口协同）。详见 [`docs/ROADMAP.md` §Multi-resident / multi-room](docs/ROADMAP.md#multi-resident--multi-room)。
+</details>
+
 > 更多问题请参阅 [docs/FAQ.md](docs/FAQ.md)（15 条完整 FAQ）
 
 ---
 
 ## 版本历史摘要
+
+> ℹ️ 所有涉及睡眠与健康数据的功能均为非医疗用途。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
 
 | 版本 | 日期 | 主要变更 |
 |---|---|---|
@@ -155,12 +223,14 @@ v1.8.0+ 有午睡过滤：`session_lifecycle.min_session_minutes`（默认 60）
 
 以下是从安装到完全个性化的详细时间线，帮助你了解每个阶段系统在做什么、你应该关注什么。
 
+> ℹ️ 本指南描述的是系统自动化行为，不构成医学建议。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
+
 ### 第 1 天：观察模式
 
 - 保持 `dry_run=true`，系统只观察不动作
 - 确认 `sensor.sleep_classifier_stage` 有数据（应显示 AWAKE / LIGHT / DEEP / REM）
 - 查看 Add-on 日志，确认 WebSocket 连接成功、首晚诊断报告出现
-- Lovelace 上应能看到实时阶段、置信度、session 时长
+- Lovelace 上应能看到实时阶段、置信度、session 时长（[非医疗诊断](MEDICAL_DISCLAIMER.md)）
 
 ### 第 2 天：验证控制链路
 
@@ -200,9 +270,52 @@ v1.8.0+ 有午睡过滤：`session_lifecycle.min_session_minutes`（默认 60）
 
 ---
 
+## Medical Advisors / 医学顾问
+
+> ℹ️ 详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
+
+项目目前由开源社区维护，**正在寻找**具有以下背景的志愿顾问加入（详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)）：
+
+- Sleep Medicine（睡眠医学）
+- Polysomnography（多导睡眠监测）
+- Smart-home Health（智能家居健康应用）
+
+如果你有相关专业背景并愿意贡献，请联系：`liangyulu781+security@gmail.com`（与 [SECURITY.md](SECURITY.md) 使用相同邮箱）。
+
+> ⚠️ **重要声明**：目前所有医学性陈述均为非临床、非诊断、非医疗建议。在医学顾问正式加入项目之前，本 Add-on 的任何输出都不应被解读为医疗指导。详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)。
+
+---
+
+## Support the Project / 支持本项目
+
+如果 Sleep Classifier 对你有帮助，欢迎通过以下方式支持项目持续开发：
+
+| 平台 | 链接 |
+|---|---|
+| **GitHub Sponsors** | [github.com/sponsors/LiangyuLu-lly](https://github.com/sponsors/LiangyuLu-lly) |
+| **爱发电** | [afdian.com/a/LiangyuLu-lly](https://afdian.com/a/LiangyuLu-lly) |
+| **Buy Me a Coffee** | [buymeacoffee.com/LiangyuLu-lly](https://www.buymeacoffee.com/LiangyuLu-lly) |
+
+> 💡 **MIT 功能永不付费承诺**：现有 MIT License 下交付的全部功能（包括 preference learner、smart environment controller、smart wake、sleep quality score、sleep debt、Lovelace dashboard、Web UI、telemetry / upgrade notifier 等），**永远不会**被移除或迁移到付费版本。未来的付费方向仅针对增量服务（托管服务、付费技术支持、推荐硬件套件），不会对现有功能做「专业版」「企业版」分层。这一承诺与 [`docs/ROADMAP.md`](docs/ROADMAP.md) 的 Commercial roadmap 章节一致。
+
+---
+
+<!-- ## In the press / community -->
+<!-- R15.3：首次外部社区发布（Reddit / HN / HA Community Forum / 知乎 / 少数派）后 -->
+<!-- 在此取消注释并列出对应链接。首次外部发布前此 section 不强制展示，避免空 -->
+<!-- placeholder 损害可信度。 -->
+<!-- 未来格式示例：                                                               -->
+<!-- | 平台 | 标题 | 链接 |                                                       -->
+<!-- |---|---|---|                                                                  -->
+<!-- | Reddit r/homeautomation | 30-day case study... | [link](...) |              -->
+
+---
+
 ## 许可证
 
 MIT License
+
+> 💡 现有 MIT License 功能永远不会被移到付费版（详见上方「Support the Project」段与 [`docs/ROADMAP.md`](docs/ROADMAP.md)）。
 
 ## 项目地址
 

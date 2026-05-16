@@ -1,0 +1,13 @@
+{
+  "generated_at": "2025-05-15T18:21:00+08:00",
+  "healthy": true,
+  "active_workstream": null,
+  "recent_files": [],
+  "recent_sessions": [],
+  "open_threads": [],
+  "next_actions": [],
+  "token_budget_status": "pass",
+  "semantic_coverage_status": "pass",
+  "inferred_workstream": {"value": null, "source": "unknown", "confidence": "low"},
+  "staleness_seconds": 0
+}

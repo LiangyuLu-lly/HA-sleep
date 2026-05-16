@@ -115,6 +115,10 @@ git add . && git commit -m "..." && git push
   - `/data/user_preferences.json` —— 偏好历史（Add-on 私有）
   - `/data/web_ui_overrides.json` —— Web UI 选中的实体 ID（优先级高于 config.yaml）
   - `/share/*` —— 可供其他 Add-on 读取的调试导出
+- **Add-on entrypoint 禁止 `exec` 替换 bash**：`run.sh` 末尾必须用 `tini -g` + `wait -n` 保留 trap + job control，确保 SIGTERM 能被正确转发给子进程。
+- **`/data` 下 JSON 必须走 `src._io_utils.atomic_write_json`**：禁止直接 `Path.write_text`，防止写入中断导致文件损坏。
+- **HA 异常 catch 顺序**：`HAAuthError` 子类在前、`HAAPIError` 父类在后；auth 错误须用 `MAX_AUTH_FAILURES` 计数（默认 10），不可单次触发 stop。
+- **配置读取走 `jq + bash`，不用 bashio**：本项目基于 `python:3.11-alpine` 而非 HA 官方 base image，因此 `run.sh` 中用 `jq` 解析 `/data/options.json`。未来若迁移 bashio 须先评估是否切回 HA 官方 base image（见 design §4.9）。
 
 ## 日志
 - 使用标准 `logging`，按模块名分 logger。

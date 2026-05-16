@@ -22,6 +22,7 @@ sleep_state_publisher、sleep_quality_score）共用的类型。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -39,4 +40,27 @@ class SleepStage(Enum):
     REM = 3     # 快速眼动
 
 
-__all__ = ["SleepStage"]
+@dataclass(frozen=True, slots=True)
+class CandidateEntity:
+    """Onboarding wizard 扫描出的候选睡眠分期实体。
+
+    由 :mod:`src.onboarding_scanner` 在「首次安装向导」第 2 步生成，
+    用于把 HA `/api/states` 里命中关键字的实体按相关性排序后展示给
+    用户挑选。`frozen=True` + `slots=True` 保证：
+
+    * 实例不可变 → 可放进集合 / 用作 dict key（评分稳定排序时方便）；
+    * 不分配 ``__dict__`` → 在「全屋 ≥ 数百实体」场景下内存占用更友好。
+
+    :param entity_id: HA 实体 ID，例如 ``sensor.bedroom_sleep_stage``。
+    :param friendly_name: HA 上的显示名称；扫描器读 attributes 里的
+        ``friendly_name``，缺省时退化成 ``entity_id``。
+    :param score: 0–100 的相关性评分，由
+        :func:`src.onboarding_scanner.score_candidate` 计算。
+    """
+
+    entity_id: str
+    friendly_name: str
+    score: int
+
+
+__all__ = ["SleepStage", "CandidateEntity"]

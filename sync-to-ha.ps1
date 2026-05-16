@@ -1,18 +1,25 @@
-# sync-to-ha.ps1 -- One-shot sync of sleep_classifier/ to an HA Samba share.
+# sync-to-ha.ps1 -- One-shot sync of sleep_classifier/ to an HA Samba share,
+# then automatically REBUILD + RESTART the add-on via Supervisor API.
 #
 # Usage:
-#   .\sync-to-ha.ps1                  # pull latest from origin/main, then sync
+#   .\sync-to-ha.ps1                  # pull latest from origin/main, then sync + rebuild
 #   .\sync-to-ha.ps1 -SkipPull        # sync current working copy without git pull
 #   .\sync-to-ha.ps1 -HAHost 10.0.0.5 # non-default HA IP
+#   .\sync-to-ha.ps1 -SkipRebuild     # only sync files, don't trigger rebuild
+#   .\sync-to-ha.ps1 -HAToken "xxx"   # provide HA Long-Lived Access Token inline
 #
 # Prereqs:
 #   1. HA has the official Samba share add-on running
 #   2. HA's addons share is reachable at \\$HAHost\addons
 #   3. You run this from the repo root (where sleep_classifier/ lives)
+#   4. For auto-rebuild: set env var HA_TOKEN or pass -HAToken with a
+#      Long-Lived Access Token (Settings > People > Security > Create Token)
 
 param(
     [string]$HAHost = "192.168.31.71",
-    [switch]$SkipPull
+    [switch]$SkipPull,
+    [switch]$SkipRebuild,
+    [string]$HAToken = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +29,7 @@ Set-Location $repoRoot
 Write-Host "==> Sleep Classifier sync" -ForegroundColor Cyan
 Write-Host "    target: \\$HAHost\addons\sleep_classifier"
 Write-Host "    source: $repoRoot\sleep_classifier"
+Write-Host "    auto-rebuild: $(-not $SkipRebuild)"
 Write-Host ""
 
 # 1. git pull
@@ -71,9 +79,93 @@ if (Test-Path $configYaml) {
     Write-Host "    remote config.yaml: $versionLine"
 }
 
+# ── Auto-rebuild via Supervisor API ─────────────────────────────────────────
+# The Supervisor API lets us stop/rebuild/start the add-on without touching
+# the HA Web UI.  We need a Long-Lived Access Token for authentication.
+# The add-on slug is "local_sleep_classifier" (local add-ons get "local_" prefix).
+
+$addonSlug = "local_sleep_classifier"
+$supervisorBase = "http://${HAHost}:8123/api/hassio"
+
+# Resolve token: param > env var > skip
+if (-not $HAToken) {
+    $HAToken = $env:HA_TOKEN
+}
+
+if ($SkipRebuild) {
+    Write-Host ""
+    Write-Host "==> Skipping rebuild (--SkipRebuild)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Manual steps in HA Web UI:" -ForegroundColor Cyan
+    Write-Host "  1. Settings > Add-ons > Sleep Classifier"
+    Write-Host "  2. STOP -> REBUILD -> START"
+    exit 0
+}
+
+if (-not $HAToken) {
+    Write-Host ""
+    Write-Host "==> No HA_TOKEN found — skipping auto-rebuild" -ForegroundColor Yellow
+    Write-Host "    To enable auto-rebuild, set env var HA_TOKEN or pass -HAToken" -ForegroundColor Yellow
+    Write-Host "    (Create one at: Settings > People > Security > Long-Lived Access Tokens)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Manual steps in HA Web UI:" -ForegroundColor Cyan
+    Write-Host "  1. Settings > Add-ons > Sleep Classifier"
+    Write-Host "  2. STOP -> REBUILD -> START"
+    exit 0
+}
+
+$headers = @{
+    "Authorization" = "Bearer $HAToken"
+    "Content-Type"  = "application/json"
+}
+
+function Invoke-HAApi {
+    param([string]$Method, [string]$Endpoint, [int]$TimeoutSec = 300)
+    $url = "${supervisorBase}${Endpoint}"
+    try {
+        $resp = Invoke-RestMethod -Uri $url -Method $Method -Headers $headers -TimeoutSec $TimeoutSec
+        return $resp
+    } catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        Write-Warning "API call failed: $Method $url -> HTTP $status"
+        Write-Warning $_.Exception.Message
+        return $null
+    }
+}
+
+# Step 5: Stop the add-on (ignore error if already stopped)
 Write-Host ""
-Write-Host "Next steps in HA Web UI:" -ForegroundColor Cyan
-Write-Host "  1. Settings > Add-ons > Add-on Store > triple-dot menu > Check for updates"
-Write-Host "  2. Scroll to the Local add-ons section"
-Write-Host "  3. If installed: STOP -> REBUILD -> START"
-Write-Host "  4. If not yet installed: click INSTALL"
+Write-Host "==> [5/7] Stopping add-on..." -ForegroundColor Yellow
+$stopResult = Invoke-HAApi -Method "POST" -Endpoint "/addons/$addonSlug/stop"
+if ($stopResult) {
+    Write-Host "    Stopped" -ForegroundColor Green
+} else {
+    Write-Host "    (may already be stopped, continuing)" -ForegroundColor DarkYellow
+}
+Start-Sleep -Seconds 2
+
+# Step 6: Rebuild the add-on (this triggers a docker build, can take 2-5 min)
+Write-Host ""
+Write-Host "==> [6/7] Rebuilding add-on (this may take 2-5 minutes)..." -ForegroundColor Yellow
+$rebuildResult = Invoke-HAApi -Method "POST" -Endpoint "/addons/$addonSlug/rebuild" -TimeoutSec 600
+if ($rebuildResult) {
+    Write-Host "    Rebuild complete" -ForegroundColor Green
+} else {
+    Write-Error "Rebuild failed! Check HA logs for details."
+    exit 1
+}
+
+# Step 7: Start the add-on
+Write-Host ""
+Write-Host "==> [7/7] Starting add-on..." -ForegroundColor Yellow
+$startResult = Invoke-HAApi -Method "POST" -Endpoint "/addons/$addonSlug/start"
+if ($startResult) {
+    Write-Host "    Started" -ForegroundColor Green
+} else {
+    Write-Error "Start failed! Check HA logs for details."
+    exit 1
+}
+
+Write-Host ""
+Write-Host "==> All done! Add-on v2.0.3 is running on $HAHost" -ForegroundColor Green
+Write-Host "    Open Web UI: http://${HAHost}:8123/hassio/ingress/local_sleep_classifier" -ForegroundColor Cyan

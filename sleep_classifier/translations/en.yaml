@@ -1,0 +1,176 @@
+# Home Assistant add-on translations — English (default).
+#
+# This file is consumed by HA Supervisor to render the "Configuration" tab
+# of the add-on detail page. Every key under ``configuration:`` MUST exist
+# under ``options:`` in ``sleep_classifier/config.yaml`` (and vice versa).
+# Drift is rejected by ``scripts/check_translations.py`` in CI.
+#
+# Reference: https://developers.home-assistant.io/docs/add-ons/configuration#translating-your-add-on
+#
+# Naming rule: do NOT translate entity_id values, service names, Python
+# identifiers, or CLI commands — they remain in code style.
+configuration:
+  # ---- General -----------------------------------------------------------
+  area:
+    name: "Target area"
+    description: "Leave blank to scan every room. Otherwise the area name as registered in Home Assistant."
+  infer_interval:
+    name: "Inference interval (seconds)"
+    description: "How often the add-on polls HA state and runs the per-stage controller. 30 s is a good default."
+  session_interval:
+    name: "Session aggregation interval (seconds)"
+    description: "How often a complete sleep session is summarised and passed to the preference learner. Default 1800 s (30 min)."
+  dry_run:
+    name: "Dry-run mode"
+    description: "When enabled, all setpoint commands are logged but never sent to your devices. Strongly recommended for the first 7 days after install."
+  exploration_rate:
+    name: "Exploration rate"
+    description: "Probability (0..1) of trying a slightly different setpoint instead of the learned midpoint. Higher = faster learning, more variance."
+  min_seconds_between_actions:
+    name: "Minimum seconds between actions"
+    description: "Cool-down between two consecutive service calls to the same actuator. Prevents thrashing."
+  deadband_temperature_c:
+    name: "Temperature deadband (°C)"
+    description: "Skip a climate update when the room temperature is already within this band of the target."
+  deadband_humidity_pct:
+    name: "Humidity deadband (%)"
+    description: "Skip a humidifier update when the current humidity is already within this band of the target."
+  deadband_brightness_pct:
+    name: "Brightness deadband (%)"
+    description: "Skip a light update when the current brightness is already within this band of the target."
+  min_stage_dwell_seconds:
+    name: "Minimum stage dwell (seconds)"
+    description: "Filters brief wearable blips. A new sleep stage must persist this long before the controller reacts."
+  wind_down_minutes:
+    name: "Wind-down minutes"
+    description: "Start pre-cooling and dimming this many minutes before the learned bedtime. Set to 0 to disable."
+  log_level:
+    name: "Log level"
+    description: "One of debug, info, warning, error. Tokens and entity_ids are never logged."
+
+  # ---- Slot bindings: sensors -------------------------------------------
+  sleep_stage_source:
+    name: "Sleep stage source entity"
+    description: "Pin a single entity_id (sensor, binary_sensor, or input_select) that publishes the current sleep stage. Empty = disabled."
+  temperature_source:
+    name: "Temperature source entity"
+    description: "Bedroom temperature sensor. Leave blank to auto-discover within the configured area."
+  humidity_source:
+    name: "Humidity source entity"
+    description: "Bedroom humidity sensor. Leave blank to auto-discover within the configured area."
+  illuminance_source:
+    name: "Illuminance source entity"
+    description: "Bedroom illuminance sensor. Leave blank to auto-discover within the configured area."
+
+  # ---- Slot bindings: actionable devices --------------------------------
+  light_targets:
+    name: "Light targets"
+    description: "List of light entity_ids the add-on may control (main, bedside, etc.). Leave empty to disable lighting actions."
+  climate_target:
+    name: "Climate target"
+    description: "Single climate entity_id (AC or heat-pump) the add-on may control. Leave empty to disable HVAC actions."
+  humidifier_target:
+    name: "Humidifier target"
+    description: "Single humidifier entity_id the add-on may control. Leave empty to disable humidity actions."
+  fan_target:
+    name: "Fan target"
+    description: "Single fan entity_id the add-on may control. Leave empty to disable fan actions."
+  switch_targets:
+    name: "Switch targets"
+    description: "Generic switches the add-on may toggle (e.g. air purifier). Leave empty to disable."
+
+  # ---- Auto-discovery tunables ------------------------------------------
+  controllable_domains:
+    name: "Controllable domains"
+    description: "Domains the add-on is allowed to call services on. Defaults to light, climate, fan, humidifier."
+  explicit_includes:
+    name: "Explicit includes"
+    description: "List of entity_ids that must always be considered, even if they fall outside the configured area."
+  explicit_excludes:
+    name: "Explicit excludes"
+    description: "List of entity_ids that must never be touched, even when they match auto-discovery."
+
+  # ---- User profile -----------------------------------------------------
+  birth_year:
+    name: "Birth year"
+    description: "Used to derive NSF / AAP recommended sleep hours. 0 means unknown — recommendations fall back to adult defaults."
+  chronotype:
+    name: "Chronotype"
+    description: "One of morning, evening, neutral. Influences the wind-down window and weekday vs weekend bedtime curve."
+
+  # ---- Smart wake -------------------------------------------------------
+  wake_window_start:
+    name: "Wake window start (HH:MM)"
+    description: "Earliest acceptable wake moment. Leave empty to disable smart-wake."
+  wake_window_end:
+    name: "Wake window end (HH:MM)"
+    description: "Latest acceptable wake moment. The add-on picks the best stage transition inside the window."
+  wake_light_targets:
+    name: "Wake light targets"
+    description: "Lights to ramp up over 30 minutes before the wake moment (dawn-light effect)."
+
+  # ---- White noise / soundscape ----------------------------------------
+  whitenoise_target:
+    name: "White-noise media player"
+    description: "Single media_player entity_id that receives stage-appropriate audio. Leave empty to disable."
+  whitenoise_volume_scale:
+    name: "White-noise volume scale"
+    description: "Global multiplier on per-stage default volumes. Range 0..2."
+  whitenoise_track_overrides:
+    name: "White-noise track overrides"
+    description: "Optional per-stage media URI overrides in key=value form (e.g. pink_noise=media-source://...)."
+  whitenoise_volume_feedback_entity:
+    name: "White-noise volume feedback button"
+    description: "An input_button helper. Pressing it reduces the current white-noise volume scale by 30 %."
+
+  # ---- Subjective feedback ---------------------------------------------
+  feedback_entity:
+    name: "Subjective feedback entity"
+    description: "An input_number helper holding the user's morning sleep rating. Leave empty to disable subjective feedback."
+  feedback_scale:
+    name: "Feedback scale"
+    description: "Maximum value of the input_number rating (typically 5 or 10)."
+
+  # ---- Apnea / hypopnea trend ------------------------------------------
+  apnea_breathing_rate_source:
+    name: "Breathing rate source entity"
+    description: "Optional respiratory-rate sensor (e.g. mmWave radar). Required to enable apnea trend detection."
+  apnea_chest_amplitude_source:
+    name: "Chest amplitude source entity"
+    description: "Optional chest-amplitude sensor. Combined with breathing rate to flag hypopnea-like events."
+  apnea_consent_entity:
+    name: "Apnea consent toggle"
+    description: "An input_boolean helper. The detector stays in pending_consent until this toggle is on."
+  apnea_calibration_nights:
+    name: "Apnea calibration nights"
+    description: "Number of nights spent collecting a personal baseline before the green/amber/red trend is published."
+
+  # ---- v2.1.0 commercial-readiness additions ---------------------------
+  telemetry_enabled:
+    name: "Anonymous telemetry"
+    description: "Off by default. When enabled, only version, HA version, architecture, locale, and active-last-24h flag are sent. No entity_id is ever transmitted."
+  upgrade_notifications_enabled:
+    name: "Upgrade notifications"
+    description: "Off by default. When enabled, the add-on checks GitHub Releases once every 24 hours via an anonymous GET request."
+
+# Wizard-only strings — referenced from web_ui.py via Accept-Language.
+# Do NOT translate entity_id values, service names, or CLI commands; keep
+# them rendered verbatim inside backticks where they appear in copy.
+onboarding:
+  step1_title: "Welcome to Sleep Classifier"
+  step1_disclaimer: "This add-on is not a medical device and does not diagnose or treat any condition. See the Medical Disclaimer for details."
+  step1_disclaimer_link: "Read the full Medical Disclaimer"
+  step1_continue: "I understand, continue"
+  step2_title: "Scanning for sleep-stage entities"
+  step2_subtitle: "We are looking for sensors that publish a sleep stage (e.g. Apple Watch, Mi Band, Fitbit, sleep_as_android, mmWave radar)."
+  step2_pick_cta: "Use this entity"
+  step2_empty_state: "No candidate found. You probably do not have a sleep-stage device yet."
+  no_hardware_cta: "I have no sleep-stage hardware — show me recommendations"
+  step3_title: "Confirm environment sensors and actuators"
+  step3_subtitle: "Pick the bedroom temperature, humidity, illuminance sensors, and the lights, climate, humidifier or fan you want the add-on to control."
+  step4_title: "Safety confirmation"
+  step4_dry_run_warning: "Strongly recommended: keep dry_run=true for at least 7 days. The add-on will log every command but never send it to your devices."
+  step4_keep_dry_run: "Keep dry_run on (recommended)"
+  step4_disable_dry_run: "Turn dry_run off"
+  step4_finish: "Finish setup"
+  resume_notice: "Returning to step 1. Your previous picks were not saved because the wizard had not been completed."

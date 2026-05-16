@@ -1,0 +1,14 @@
+{
+  "sleep_stage_source": "sensor.bedroom_sleep_stage",
+  "temperature_source": "sensor.bedroom_temperature",
+  "humidity_source": "sensor.bedroom_humidity",
+  "illuminance_source": "",
+  "light_targets": ["light.bedroom_main", "light.bedside_lamp"],
+  "switch_targets": [],
+  "climate_target": "climate.bedroom_ac",
+  "fan_target": "",
+  "humidifier_target": "",
+  "wake_light_targets": ["light.bedside_lamp"],
+  "whitenoise_target": "media_player.bedroom_speaker",
+  "feedback_entity": "input_number.sleep_rating"
+}

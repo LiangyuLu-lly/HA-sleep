@@ -1,0 +1,82 @@
+name: Add-on Build Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build multi-arch add-on image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run prepare.sh
+        run: |
+          chmod +x sleep_classifier/prepare.sh
+          bash sleep_classifier/prepare.sh
+
+      - name: Verify rootfs is clean (no uncommitted diff)
+        run: git diff --exit-code sleep_classifier/rootfs/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build multi-arch image (no push)
+        run: |
+          docker buildx build \
+            --platform linux/arm64,linux/amd64 \
+            --tag sleep_classifier:test \
+            sleep_classifier/
+
+      - name: Image size guard
+        run: |
+          # Build a single-platform image to measure size locally
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag sleep_classifier:size-check \
+            sleep_classifier/
+          ACTUAL_SIZE=$(docker images sleep_classifier:size-check --format '{{.Size}}')
+          echo "Image size: $ACTUAL_SIZE"
+
+          BASELINE_FILE=".github/baseline_image_size.txt"
+          if [ ! -f "$BASELINE_FILE" ]; then
+            echo "No baseline file found. Creating baseline: $ACTUAL_SIZE"
+            echo "$ACTUAL_SIZE" > "$BASELINE_FILE"
+            exit 0
+          fi
+
+          BASELINE=$(cat "$BASELINE_FILE")
+          echo "Baseline: $BASELINE"
+          echo "Actual:   $ACTUAL_SIZE"
+
+          # Convert size strings to bytes for comparison
+          parse_size() {
+            local size_str="$1"
+            local num=$(echo "$size_str" | grep -oP '[\d.]+')
+            local unit=$(echo "$size_str" | grep -oP '[A-Za-z]+')
+            case "$unit" in
+              B)  echo "$num" | awk '{printf "%.0f", $1}' ;;
+              kB|KB) echo "$num" | awk '{printf "%.0f", $1 * 1000}' ;;
+              MB) echo "$num" | awk '{printf "%.0f", $1 * 1000000}' ;;
+              GB) echo "$num" | awk '{printf "%.0f", $1 * 1000000000}' ;;
+              *)  echo "$num" | awk '{printf "%.0f", $1}' ;;
+            esac
+          }
+
+          ACTUAL_BYTES=$(parse_size "$ACTUAL_SIZE")
+          BASELINE_BYTES=$(parse_size "$BASELINE")
+
+          # Fail if actual > baseline * 1.10
+          THRESHOLD=$(echo "$BASELINE_BYTES" | awk '{printf "%.0f", $1 * 1.10}')
+          echo "Threshold (110%): $THRESHOLD bytes"
+          echo "Actual: $ACTUAL_BYTES bytes"
+
+          if [ "$ACTUAL_BYTES" -gt "$THRESHOLD" ]; then
+            echo "::error::Image size $ACTUAL_SIZE exceeds 110% of baseline $BASELINE"
+            exit 1
+          fi
+          echo "Image size within acceptable range."

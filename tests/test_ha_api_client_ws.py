@@ -67,6 +67,20 @@ class _FakeHA:
         # that want to actively close / abort it (drop-and-reconnect).
         self.live_ws: web.WebSocketResponse | None = None
         self.subscribed_ids: List[int] = []
+        # ----- Lovelace state (v2.1.0 dashboard importer) ----- #
+        # Tests can pre-populate ``lovelace_dashboards`` to simulate
+        # the "dashboard already exists" branch, and inspect
+        # ``lovelace_create_calls`` / ``lovelace_save_calls`` /
+        # ``lovelace_saved_configs`` to assert what the client wrote.
+        self.lovelace_dashboards: List[dict] = []
+        self.lovelace_create_calls: List[dict] = []
+        self.lovelace_save_calls: List[dict] = []
+        self.lovelace_saved_configs: dict[str, dict] = {}
+        # Set to a (code, message) tuple to force HA to reply with
+        # ``{"success": False, "error": {...}}`` for the matching
+        # message ``type``.  Lets tests exercise the HAAPIError path
+        # without restarting the server.
+        self.lovelace_force_error: dict[str, tuple[str, str]] = {}
         self.app = web.Application()
         self.app.router.add_get("/api/", self._rest_root)
         self.app.router.add_get("/api/states", self._rest_states)
@@ -174,6 +188,63 @@ class _FakeHA:
                     for ev in list(self.queued_events):
                         await ws.send_json({
                             "id": msg_id, "type": "event", "event": ev,
+                        })
+                elif payload.get("type") in (
+                    "lovelace/dashboards/list",
+                    "lovelace/dashboards/create",
+                    "lovelace/config/save",
+                ):
+                    msg_type = payload["type"]
+                    forced = self.lovelace_force_error.get(msg_type)
+                    if forced is not None:
+                        code, message = forced
+                        await ws.send_json({
+                            "id": msg_id, "type": "result", "success": False,
+                            "error": {"code": code, "message": message},
+                        })
+                        continue
+                    if msg_type == "lovelace/dashboards/list":
+                        await ws.send_json({
+                            "id": msg_id, "type": "result", "success": True,
+                            "result": list(self.lovelace_dashboards),
+                        })
+                    elif msg_type == "lovelace/dashboards/create":
+                        record = {
+                            k: v for k, v in payload.items()
+                            if k not in ("id", "type")
+                        }
+                        self.lovelace_create_calls.append(record)
+                        created = {
+                            "url_path": record.get("url_path"),
+                            "title": record.get("title"),
+                            "icon": record.get("icon"),
+                            "mode": record.get("mode", "storage"),
+                            "require_admin": record.get("require_admin", False),
+                            "show_in_sidebar": record.get(
+                                "show_in_sidebar", True
+                            ),
+                        }
+                        # Reflect into the listing so a follow-up call
+                        # to lovelace_dashboards() sees the dashboard.
+                        self.lovelace_dashboards.append(dict(created))
+                        await ws.send_json({
+                            "id": msg_id, "type": "result", "success": True,
+                            "result": created,
+                        })
+                    elif msg_type == "lovelace/config/save":
+                        record = {
+                            k: v for k, v in payload.items()
+                            if k not in ("id", "type")
+                        }
+                        self.lovelace_save_calls.append(record)
+                        url_path = record.get("url_path")
+                        if isinstance(url_path, str):
+                            self.lovelace_saved_configs[url_path] = (
+                                record.get("config") or {}
+                            )
+                        await ws.send_json({
+                            "id": msg_id, "type": "result", "success": True,
+                            "result": None,
                         })
         except (asyncio.CancelledError, ConnectionResetError):
             pass

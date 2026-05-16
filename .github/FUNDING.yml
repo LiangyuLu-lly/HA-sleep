@@ -1,0 +1,21 @@
+# GitHub 仓库右上角 "Sponsor" 按钮配置。
+#
+# 字段语义（GitHub 官方规范）：
+#   - github: 列出 GitHub Sponsors 受赠者用户名（必须是已开通 Sponsors 的账号
+#     或将来开通；未开通时按钮仍会展示，但点击会跳到 404，可暂时容忍）。
+#   - custom: 自定义赞助链接列表（爱发电 / Buy Me a Coffee / Patreon 备链 等）。
+#
+# 维护者如 fork 本仓库或使用了不同的第三方账号名，请同步更新：
+#   1. 下方 `github:` 中的用户名；
+#   2. `custom:` 中的爱发电 / Buy Me a Coffee URL；
+#   3. README.md 顶部 GitHub Sponsors 徽章链接（task 2.9）；
+#   4. README.md 底部 "Support the project" section 的赞助按钮列表；
+# 否则 `scripts/check_funding.py` 会在 CI 报错（owner 与 README badge 不一致）。
+#
+# 关联需求：commercial-readiness-v2.1.0 / Requirement 10.3。
+
+github: [LiangyuLu-lly]
+
+custom:
+  - 'https://afdian.com/a/LiangyuLu-lly'
+  - 'https://www.buymeacoffee.com/LiangyuLu-lly'

@@ -20,8 +20,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
+
+# Ensure /app is on sys.path so ``from src._io_utils import ...`` works
+# when this script is executed directly inside the container.
+if "/app" not in sys.path:
+    sys.path.insert(0, "/app")
+
+from src._io_utils import atomic_write_text
 
 
 _DEFAULTS_PATH = Path("/app/training_config/config.json")
@@ -232,9 +240,7 @@ def main() -> None:
     }
 
     # --- Write the effective config ---------------------------------
-    _OUT_PATH.write_text(
-        json.dumps(base, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
+    atomic_write_text(_OUT_PATH, json.dumps(base, indent=2, ensure_ascii=False))
     bound = sum(1 for v in api["slot_bindings"].values() if v)
     print(f"[run.sh] effective config written to {_OUT_PATH}")
     print(f"[run.sh] slot bindings active: {bound} role(s)")

@@ -36,11 +36,20 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
+
+# Ensure /app is on sys.path so ``from src._io_utils import ...`` works
+# when this script is executed directly inside the container.
+if "/app" not in sys.path:  # pragma: no cover
+    sys.path.insert(0, "/app")
+
+from src._io_utils import atomic_write_json, atomic_write_text
+from src._overrides_schema import V2_1_0_DEFAULTS, apply_v2_1_0_defaults
 
 logger = logging.getLogger("web_ui")
 logging.basicConfig(
@@ -104,6 +113,7 @@ _SLOTS: List[Dict[str, Any]] = [
     {"key": "feedback_entity",     "label": "主观评分输入 / Subjective rating",
      "domains": _INPUT_NUMBER_DOMAINS, "multi": False},
 ]
+
 
 
 # ---------------------------------------------------------------------------
@@ -192,14 +202,29 @@ def _load_existing() -> Dict[str, Any]:
       1. ``/data/web_ui_overrides.json`` if present (user already used the
          picker once).
       2. ``/data/options.json`` (Configuration form values).
+
+    The returned dict is always passed through
+    :func:`src._overrides_schema.apply_v2_1_0_defaults` so the v2.1.0
+    feature flags (``onboarding_skipped``, ``telemetry_enabled``,
+    ``upgrade_notifications_enabled``) are present even when reading a
+    legacy v2.0.3 file.  Missing fields fall back to the privacy-safest
+    defaults (PR3.2 / PR6.1).
     """
     for path in (_OVERRIDES_PATH, _OPTIONS_PATH):
         if path.is_file():
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 logger.warning("Could not read %s: %s", path, exc)
-    return {}
+                continue
+            if not isinstance(raw, dict):
+                logger.warning(
+                    "Ignoring non-object content in %s (got %s)",
+                    path, type(raw).__name__,
+                )
+                continue
+            return apply_v2_1_0_defaults(raw)
+    return apply_v2_1_0_defaults(None)
 
 
 def _normalise(value: Any) -> Any:
@@ -213,7 +238,55 @@ def _normalise(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Ingress IP allowlist middleware
+# ---------------------------------------------------------------------------
+
+# HA Supervisor 的 docker network (``hassio``) 在 HA OS 上是固定的：
+# IPv4 172.30.32.2，见 HA Supervisor docs → Networking。
+# 如果未来 HA 把 Supervisor 放到 IPv6 网段，我们通过 env 兜底：
+# SUPERVISOR_IP_WHITELIST 可填 "172.30.32.2,fd00::2,::1"。
+# 多值以逗号分隔；空白容错。
+_DEFAULT_ALLOWED_IPS: set = {"172.30.32.2"}
+
+
+def _parse_allowed_ips(raw: str) -> set:
+    return {ip.strip() for ip in raw.split(",") if ip.strip()}
+
+
+_ALLOWED_IPS = (
+    _parse_allowed_ips(os.environ.get("SUPERVISOR_IP_WHITELIST", ""))
+    or _DEFAULT_ALLOWED_IPS
+)
+_DISABLE_GUARD = os.environ.get("WEB_UI_DISABLE_INGRESS_GUARD", "") == "1"
+
+
+@web.middleware
+async def ingress_ip_guard(request: web.Request, handler):
+    """仅允许 Supervisor ingress 源 IP 的请求通过。
+
+    aiohttp 的 request.remote 在 run_app(host='0.0.0.0') 下是 TCP 对端
+    IP (Docker 容器网络里就是 Supervisor IP)，不经 nginx 反代所以不需要
+    去解析 X-Forwarded-For。若未来 HA 换网络栈，SUPERVISOR_IP_WHITELIST
+    环境变量提供向前兼容。
+    """
+    if _DISABLE_GUARD:
+        return await handler(request)
+    remote = request.remote or ""
+    # IPv6 的 ::ffff:172.30.32.2 映射地址也接受
+    normalized = remote.removeprefix("::ffff:")
+    if normalized not in _ALLOWED_IPS:
+        logger.warning("Rejected Web UI request from non-Supervisor IP: %s", remote)
+        return web.Response(status=403, text="Forbidden")
+    return await handler(request)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handlers
+# --------------------------------------------------------------------
+# IMPORTANT: 前端 fetch() 必须使用不以 '/' 开头的相对路径。Supervisor
+# Ingress 会透明注入 `/api/hassio_ingress/<token>/` 前缀；绝对路径
+# 脱离 Ingress 命名空间，会 404 (Supervisor 拦截) 或 500 (打到真 HA
+# Core)。有回归测试在 tests/test_web_ui_ingress_paths.py 守护。
 # ---------------------------------------------------------------------------
 
 
@@ -296,13 +369,19 @@ async def api_save(request: web.Request) -> web.Response:
             cleaned[key] = value
 
     # Atomic write — if Python dies mid-write the user keeps their old
-    # config rather than a half-truncated JSON.
-    tmp = _OVERRIDES_PATH.with_suffix(".tmp")
+    # config rather than a half-truncated JSON.  We also carry over any
+    # v2.1.0 feature flags (``onboarding_skipped`` /
+    # ``telemetry_enabled`` / ``upgrade_notifications_enabled``) that may
+    # already be set on disk so saving the slot picker doesn't wipe an
+    # opt-in toggled by a separate telemetry / upgrade route — task 6.6
+    # in this spec.  ``_load_existing`` already runs
+    # ``apply_v2_1_0_defaults`` so missing keys back-fill to the
+    # privacy-safest defaults.
+    existing = _load_existing()
+    preserved_flags = {k: existing[k] for k in V2_1_0_DEFAULTS if k in existing}
+    merged: Dict[str, Any] = {**preserved_flags, **cleaned}
     try:
-        tmp.write_text(
-            json.dumps(cleaned, indent=2, ensure_ascii=False), encoding="utf-8",
-        )
-        tmp.replace(_OVERRIDES_PATH)
+        atomic_write_json(_OVERRIDES_PATH, merged)
     except OSError as exc:
         return web.json_response(
             {"error": f"Could not persist overrides: {exc}"}, status=500,
@@ -313,12 +392,17 @@ async def api_save(request: web.Request) -> web.Response:
         len(cleaned), _OVERRIDES_PATH, len(rejected),
     )
     return web.json_response({
-        "saved": cleaned,
+        "saved": merged,
         "rejected": rejected,
         "message": (
             "Saved.  Click Restart in the add-on detail page to apply."
         ),
     })
+
+
+# ---------------------------------------------------------------------------
+# Onboarding wizard routes
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -504,12 +588,460 @@ loadEntities();
 # ---------------------------------------------------------------------------
 
 
-def make_app() -> web.Application:
+# ---------------------------------------------------------------------------
+# Telemetry toggle routes (Task 6.6)
+# ---------------------------------------------------------------------------
+
+# Injected by ``make_app(telemetry_reporter=...)``; may be None when the
+# module is loaded standalone (tests, dry-run) or before the task is wired.
+_telemetry_reporter: Any = None
+
+_LAST_UPGRADE_CHECK_PATH = _DATA_DIR / "last_upgrade_check.json"
+
+
+async def api_telemetry_status(_: web.Request) -> web.Response:
+    """GET /api/telemetry/status — read current telemetry_enabled flag."""
+    data = _load_existing()
+    return web.json_response({"enabled": data.get("telemetry_enabled", False)})
+
+
+async def api_telemetry_toggle(request: web.Request) -> web.Response:
+    """POST /api/telemetry/toggle — switch telemetry on/off.
+
+    Body: ``{"enabled": true|false}``
+
+    When switching to false, calls the injected TelemetryReporter.disable()
+    to stop the background task and delete install_id within ≤ 30 s.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, Exception):
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    enabled = bool(body.get("enabled", False))
+    data = _load_existing()
+    data["telemetry_enabled"] = enabled
+    try:
+        atomic_write_json(_OVERRIDES_PATH, data)
+    except OSError as exc:
+        return web.json_response(
+            {"error": f"Could not persist setting: {exc}"}, status=500,
+        )
+
+    # If switching to false, call disable on the reporter
+    if not enabled and _telemetry_reporter is not None:
+        try:
+            await _telemetry_reporter.disable()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("TelemetryReporter.disable() failed: %s", exc)
+
+    return web.json_response({"enabled": enabled})
+
+
+async def api_upgrade_status(_: web.Request) -> web.Response:
+    """GET /api/upgrade/status — read last upgrade check result."""
+    if not _LAST_UPGRADE_CHECK_PATH.is_file():
+        return web.json_response({"available": False})
+    try:
+        raw = json.loads(
+            _LAST_UPGRADE_CHECK_PATH.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return web.json_response({"available": False})
+
+    latest = raw.get("latest", "")
+    # We consider upgrade available if the file has a "latest" field set
+    available = bool(latest)
+    return web.json_response({
+        "available": available,
+        "latest": latest,
+        "url": raw.get("url", f"https://github.com/pzq123456/sleep-classifier/releases/tag/{latest}"),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Onboarding wizard routes (Task 6.1)
+# ---------------------------------------------------------------------------
+
+# Cache for candidate scan (avoid hammering HA on every wizard step render)
+_candidates_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_CANDIDATE_CACHE_TTL = 60.0  # seconds
+
+
+def _get_locale(request: web.Request) -> str:
+    """Extract locale from Accept-Language header; default to 'en'."""
+    accept = request.headers.get("Accept-Language", "")
+    # Simple parse: look for zh-cn or zh first
+    lower = accept.lower()
+    if "zh-cn" in lower or "zh" in lower:
+        return "zh-cn"
+    return "en"
+
+
+def _load_translations(locale: str) -> dict[str, Any]:
+    """Load translation YAML for the given locale, fallback to en."""
+    import importlib.resources
+    translations_dir = Path(__file__).parent / "translations"
+    target = translations_dir / f"{locale}.yaml"
+    if not target.is_file():
+        target = translations_dir / "en.yaml"
+    if not target.is_file():
+        return {}
+    try:
+        import yaml  # type: ignore[import-untyped]
+        with open(target, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except ImportError:
+        # Fallback: no yaml available — return empty (tests may not have yaml)
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _onboarding_html(locale: str) -> str:
+    """Render the onboarding wizard HTML with i18n strings."""
+    tr = _load_translations(locale)
+    onb = tr.get("onboarding", {})
+    step1_title = onb.get("step1_title", "Welcome to Sleep Classifier")
+    step1_disclaimer = onb.get("step1_disclaimer",
+        "This add-on is not a medical device. See the Medical Disclaimer.")
+    step2_title = onb.get("step2_title", "Scanning for sleep-stage entities")
+    no_hardware_cta = onb.get("no_hardware_cta",
+        "I have no sleep-stage hardware — show me recommendations")
+    step3_title = onb.get("step3_title", "Confirm environment sensors and actuators")
+    step4_title = onb.get("step4_title", "Safety confirmation")
+    step4_dry_run_warning = onb.get("step4_dry_run_warning",
+        "Strongly recommended: keep dry_run=true for at least 7 days.")
+    step4_finish = onb.get("step4_finish", "Finish setup")
+
+    return f"""<!doctype html>
+<html lang="{locale}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sleep Classifier — Onboarding</title>
+<style>
+  body {{ font: 15px/1.5 sans-serif; margin: 0; padding: 24px;
+         max-width: 700px; margin-inline: auto; }}
+  .step {{ display: none; }}
+  .step.active {{ display: block; }}
+  button {{ padding: 9px 18px; border-radius: 6px; border: none;
+           cursor: pointer; font: inherit; background: #1a73e8; color: white; }}
+  .skip-btn {{ background: #888; }}
+  .privacy-link {{ font-size: 13px; color: #666; }}
+  .upgrade-banner {{ background: #fffbe6; border: 1px solid #ffe58f;
+                     padding: 8px 16px; border-radius: 4px;
+                     position: sticky; top: 0; z-index: 100; }}
+  .telemetry-toggle {{ position: sticky; top: 40px; z-index: 99;
+                       background: #f5f5f5; padding: 6px 12px;
+                       border-radius: 4px; font-size: 13px; }}
+</style>
+</head>
+<body>
+<div id="upgrade-banner" class="upgrade-banner" style="display:none;">
+  <span id="upgrade-text"></span>
+</div>
+<div class="telemetry-toggle">
+  <label><input type="checkbox" id="telemetry-cb"> Anonymous telemetry</label>
+  <a class="privacy-link" href="../PRIVACY.md">Privacy policy</a>
+</div>
+
+<div id="step1" class="step active">
+  <h2>{step1_title}</h2>
+  <p>{step1_disclaimer}</p>
+  <button onclick="showStep(2)">Next</button>
+</div>
+
+<div id="step2" class="step">
+  <h2>{step2_title}</h2>
+  <div id="candidates">Loading...</div>
+  <p id="no-hw" style="display:none;">
+    <a href="../docs/HARDWARE.md">{no_hardware_cta}</a>
+  </p>
+  <div id="ha-degraded" style="display:none;">
+    <p>HA is not reachable. You can skip the wizard and configure manually.</p>
+    <button class="skip-btn" onclick="skipWizard()">Skip</button>
+  </div>
+  <button onclick="showStep(3)">Next</button>
+</div>
+
+<div id="step3" class="step">
+  <h2>{step3_title}</h2>
+  <p>Select your environment sensors and actuators below.</p>
+  <button onclick="showStep(4)">Next</button>
+</div>
+
+<div id="step4" class="step">
+  <h2>{step4_title}</h2>
+  <p>{step4_dry_run_warning}</p>
+  <button onclick="finishWizard(false)">{step4_finish}</button>
+  <button onclick="finishWizard(true)" style="background:#c62828;">Disable dry_run</button>
+</div>
+
+<script>
+function showStep(n) {{
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+  document.getElementById('step'+n).classList.add('active');
+  if (n === 2) loadCandidates();
+}}
+async function loadCandidates() {{
+  try {{
+    const r = await fetch('api/onboarding/candidates');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    if (data.error) {{
+      document.getElementById('ha-degraded').style.display = 'block';
+      document.getElementById('candidates').textContent = '';
+      return;
+    }}
+    if (!data.candidates || data.candidates.length === 0) {{
+      document.getElementById('no-hw').style.display = 'block';
+      document.getElementById('candidates').textContent = 'No candidates found.';
+      return;
+    }}
+    let html = '<ul>';
+    data.candidates.forEach(c => {{
+      html += '<li>' + c.entity_id + ' (' + c.friendly_name + ', score: ' + c.score + ')</li>';
+    }});
+    html += '</ul>';
+    document.getElementById('candidates').innerHTML = html;
+  }} catch(e) {{
+    document.getElementById('ha-degraded').style.display = 'block';
+    document.getElementById('candidates').textContent = 'Error: ' + e.message;
+  }}
+}}
+function skipWizard() {{
+  fetch('api/onboarding/save', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{skip: true}})
+  }}).then(() => window.location = '.');
+}}
+async function finishWizard(disableDryRun) {{
+  const body = {{sleep_stage_source: 'user_selected'}};
+  if (disableDryRun) body.confirm_disable_dry_run = true;
+  await fetch('api/onboarding/save', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body)
+  }});
+  window.location = '.';
+}}
+// Upgrade banner
+fetch('api/upgrade/status').then(r=>r.json()).then(d => {{
+  if (d.available) {{
+    document.getElementById('upgrade-banner').style.display = 'block';
+    document.getElementById('upgrade-text').textContent =
+      'v' + d.latest + ' is available. Release notes: ' + d.url;
+  }}
+}}).catch(()=>{{}});
+// Telemetry toggle
+fetch('api/telemetry/status').then(r=>r.json()).then(d => {{
+  document.getElementById('telemetry-cb').checked = d.enabled;
+}}).catch(()=>{{}});
+document.getElementById('telemetry-cb').addEventListener('change', (ev) => {{
+  fetch('api/telemetry/toggle', {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{enabled: ev.target.checked}})
+  }});
+}});
+</script>
+</body>
+</html>"""
+
+
+async def onboarding(request: web.Request) -> web.Response:
+    """GET /onboarding — render the wizard SPA."""
+    locale = _get_locale(request)
+    return web.Response(text=_onboarding_html(locale), content_type="text/html")
+
+
+async def api_onboarding_candidates(request: web.Request) -> web.Response:
+    """GET /api/onboarding/candidates — scan HA for sleep-stage entities."""
+    import time
+    now = time.time()
+    if (
+        _candidates_cache["data"] is not None
+        and (now - _candidates_cache["ts"]) < _CANDIDATE_CACHE_TTL
+    ):
+        return web.json_response(_candidates_cache["data"])
+
+    try:
+        states = await _fetch_states()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HA unreachable during onboarding scan: %s", exc)
+        return web.json_response({"error": str(exc), "candidates": []})
+
+    from src.onboarding_scanner import filter_candidates
+    candidates = filter_candidates(states)
+    result = {
+        "candidates": [
+            {"entity_id": c.entity_id, "friendly_name": c.friendly_name, "score": c.score}
+            for c in candidates
+        ]
+    }
+    _candidates_cache["data"] = result
+    _candidates_cache["ts"] = now
+    return web.json_response(result)
+
+
+async def api_onboarding_save(request: web.Request) -> web.Response:
+    """POST /api/onboarding/save — persist wizard results."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, Exception):
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    data = _load_existing()
+    # Merge slot picks from body
+    for key in ("sleep_stage_source", "temperature_source", "humidity_source",
+                "illuminance_source", "light_targets", "climate_target",
+                "fan_target", "humidifier_target"):
+        if key in body:
+            data[key] = body[key]
+
+    data["onboarding_skipped"] = True
+
+    # dry_run safety: only set to false if explicitly confirmed
+    if body.get("confirm_disable_dry_run") is True:
+        data["dry_run"] = False
+    else:
+        data.setdefault("dry_run", True)
+
+    try:
+        atomic_write_json(_OVERRIDES_PATH, data)
+    except OSError as exc:
+        return web.json_response(
+            {"error": f"Could not persist: {exc}"}, status=500,
+        )
+    return web.json_response({"saved": True})
+
+
+# ---------------------------------------------------------------------------
+# Dashboard importer route (Task 6.4)
+# ---------------------------------------------------------------------------
+
+# Injected HAAPIClient instance; set by make_app() or tests
+_ha_client: Any = None
+
+
+async def api_dashboard_import(request: web.Request) -> web.Response:
+    """POST /api/dashboard/import — one-click Lovelace dashboard creation."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, Exception):
+        body = {}
+
+    confirm_overwrite = body.get("confirm_overwrite", False)
+
+    # Import here to avoid circular deps at module load time
+    sys.path.insert(0, str(Path(__file__).parent))
+    from lovelace_template import (
+        DASHBOARD_URL_PATH, DASHBOARD_TITLE, DASHBOARD_ICON,
+        build_dashboard_config,
+    )
+
+    if _ha_client is None:
+        return web.json_response(
+            {"error": "HA client not available"}, status=502,
+        )
+
+    try:
+        existing = await _ha_client.lovelace_dashboards()
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response(
+            {"error": f"Could not list dashboards: {exc}"}, status=502,
+        )
+
+    already_exists = any(
+        d.get("url_path") == DASHBOARD_URL_PATH for d in existing
+    )
+
+    if already_exists and not confirm_overwrite:
+        return web.json_response({"existing": True}, status=409)
+
+    # Create or overwrite
+    created_new = False
+    try:
+        if not already_exists:
+            await _ha_client.lovelace_create_dashboard(
+                url_path=DASHBOARD_URL_PATH,
+                title=DASHBOARD_TITLE,
+                icon=DASHBOARD_ICON,
+            )
+            created_new = True
+        await _ha_client.lovelace_save_config(
+            url_path=DASHBOARD_URL_PATH,
+            config=build_dashboard_config(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Rollback: if we created a new dashboard but save_config failed,
+        # try to delete it
+        if created_new:
+            try:
+                await _ha_client._ws_request(
+                    {"type": "lovelace/dashboards/delete",
+                     "dashboard_id": DASHBOARD_URL_PATH}
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return web.json_response(
+            {"error": f"Dashboard import failed: {exc}",
+             "hint": "You can manually copy the YAML from examples/lovelace_dashboard.yaml"},
+            status=502,
+        )
+
+    return web.json_response(
+        {"created": True,
+         "link": f"lovelace-{DASHBOARD_URL_PATH}"},
+        status=201,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patched index handler with onboarding redirect
+# ---------------------------------------------------------------------------
+
+async def index_with_onboarding(request: web.Request) -> web.Response:
+    """Render picker UI, but redirect to wizard if onboarding needed."""
+    if not _OVERRIDES_PATH.exists():
+        raise web.HTTPFound("onboarding")
+    try:
+        raw = json.loads(_OVERRIDES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise web.HTTPFound("onboarding")
+    if not raw.get("sleep_stage_source"):
+        raise web.HTTPFound("onboarding")
+    return web.Response(text=_INDEX_HTML, content_type="text/html")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def make_app(
+    *,
+    telemetry_reporter: Any = None,
+    ha_client: Any = None,
+) -> web.Application:
     """Wire up the routes; exported separately so tests can drive a TestClient."""
-    app = web.Application()
-    app.router.add_get("/", index)
+    global _telemetry_reporter, _ha_client
+    _telemetry_reporter = telemetry_reporter
+    _ha_client = ha_client
+
+    app = web.Application(middlewares=[ingress_ip_guard])
+    app.router.add_get("/", index_with_onboarding)
+    app.router.add_get("/onboarding", onboarding)
     app.router.add_get("/api/entities", api_entities)
     app.router.add_post("/api/options", api_save)
+    app.router.add_get("/api/onboarding/candidates", api_onboarding_candidates)
+    app.router.add_post("/api/onboarding/save", api_onboarding_save)
+    app.router.add_get("/api/telemetry/status", api_telemetry_status)
+    app.router.add_post("/api/telemetry/toggle", api_telemetry_toggle)
+    app.router.add_get("/api/upgrade/status", api_upgrade_status)
+    app.router.add_post("/api/dashboard/import", api_dashboard_import)
     return app
 
 

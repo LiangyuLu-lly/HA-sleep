@@ -21,12 +21,56 @@
 # * We don't actually use bashio or s6-overlay anywhere — ``run.sh`` is
 #   a plain bash script.
 #
-# Side effect: ``build.yaml`` is no longer strictly required because we
-# don't reference ``${BUILD_FROM}``.  Supervisor will still warn about
-# it being "deprecated"; that warning is harmless and ``build.yaml``
-# stays for backwards compatibility (users on older HA versions).
+# Side effect: ``build.yaml`` is no longer strictly required because
+# Supervisor can infer the base image from the Dockerfile ARG default.
+# ``build.yaml`` stays for backwards compatibility (users on older HA
+# versions) and to let Supervisor inject per-arch BUILD_FROM values.
 
-FROM python:3.11-alpine
+# --- Build args injected by HA Supervisor ------------------------------------
+# Supervisor 构建 add-on 时会自动注入下列 ARG：
+#   BUILD_FROM          - build.yaml 里每个 arch 对应的 base image
+#   BUILD_ARCH          - 当前构建 arch (amd64 / aarch64)
+#   BUILD_VERSION       - config.yaml 里的 version 字段
+#   BUILD_NAME          - config.yaml 里的 name
+#   BUILD_DESCRIPTION   - config.yaml 里的 description
+#   BUILD_REPOSITORY    - "owner/repo" 形式的 GitHub 仓库名
+#   BUILD_REF           - 构建对应的 git SHA
+#   BUILD_DATE          - RFC3339 构建时间戳
+# 本地 docker build 不经过 Supervisor 时用默认值兜底，不让 build 失败。
+ARG BUILD_FROM=python:3.11-alpine
+
+FROM ${BUILD_FROM}
+
+ARG BUILD_FROM=python:3.11-alpine
+ARG BUILD_ARCH=amd64
+ARG BUILD_VERSION=dev
+ARG BUILD_NAME="Sleep Classifier"
+ARG BUILD_DESCRIPTION="Closed-loop smart-home sleep automation"
+ARG BUILD_REPOSITORY=LiangyuLu-lly/HA-sleep
+ARG BUILD_REF=unknown
+ARG BUILD_DATE=1970-01-01T00:00:00Z
+
+# --- Labels (15 industrial-grade) --------------------------------------------
+# 对标 hassio-addons/app-example：5 条 io.hass.* + 1 条 maintainer + 10 条 OCI 镜像标准。
+# Supervisor UI / HA Dashboard 会读取这些标签来显示 add-on 元数据。
+LABEL \
+    io.hass.name="${BUILD_NAME}" \
+    io.hass.description="${BUILD_DESCRIPTION}" \
+    io.hass.arch="${BUILD_ARCH}" \
+    io.hass.type="addon" \
+    io.hass.version="${BUILD_VERSION}" \
+    maintainer="LiangyuLu <https://github.com/LiangyuLu-lly>" \
+    org.opencontainers.image.title="${BUILD_NAME}" \
+    org.opencontainers.image.description="${BUILD_DESCRIPTION}" \
+    org.opencontainers.image.vendor="LiangyuLu" \
+    org.opencontainers.image.authors="LiangyuLu <https://github.com/LiangyuLu-lly>" \
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.url="https://github.com/${BUILD_REPOSITORY}" \
+    org.opencontainers.image.source="https://github.com/${BUILD_REPOSITORY}" \
+    org.opencontainers.image.documentation="https://github.com/${BUILD_REPOSITORY}/blob/main/sleep_classifier/DOCS.md" \
+    org.opencontainers.image.created="${BUILD_DATE}" \
+    org.opencontainers.image.revision="${BUILD_REF}" \
+    org.opencontainers.image.version="${BUILD_VERSION}"
 
 ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
@@ -61,8 +105,8 @@ RUN set -eux; \
         build-base linux-headers; \
     apk add --no-cache \
         bash jq tini; \
-    pip3 install --upgrade pip wheel; \
-    pip3 install -r /app/requirements-runtime.txt; \
+    python3 -m pip install --no-cache-dir --upgrade pip wheel; \
+    python3 -m pip install --no-cache-dir -r /app/requirements-runtime.txt; \
     apk del --purge .build-deps; \
     find /usr/local/lib/python3.11 -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
@@ -76,6 +120,10 @@ COPY web_ui.py /app/web_ui.py
 # v2.0.2: effective-config generator extracted out of run.sh so user-
 # supplied Chinese / quoted option values can't break a shell heredoc.
 COPY render_effective_config.py /app/render_effective_config.py
+
+# v2.0.3: bootstrap placeholder sensors script — publishes 5 "configuring"
+# entities before smart service starts, so Lovelace never shows "not available".
+COPY bootstrap_placeholders.py /app/bootstrap_placeholders.py
 
 # Belt-and-braces: strip any __pycache__ / .pyc that might have slipped
 # into rootfs/ during local development so the image layer stays slim
@@ -96,7 +144,10 @@ RUN mkdir -p /data /share && \
 
 # Forward SIGTERM cleanly so the service can flush user_preferences.json
 # during an HA shutdown.
+# -g: tini 把 SIGTERM / SIGINT 转发到整个进程组而不是仅 PID 1 的子进程。
+# 这样 bash 启动的 supervise_smart_service 子 shell 也能收到信号，
+# python smart service 的 asyncio signal handler 能跑到 _persist_session。
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/sbin/tini", "-g", "--"]
 CMD ["/run.sh"]

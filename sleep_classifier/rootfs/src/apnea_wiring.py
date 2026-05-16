@@ -68,6 +68,7 @@ from src.apnea_detector import (
     summarise_night,
     trend_for,
 )
+from src._io_utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +162,7 @@ class _BaselineStore:
             "nights_observed": baseline.nights_observed,
             "updated_at": time.time(),
         }
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(payload, indent=2), encoding="utf-8",
-        )
-        tmp.replace(self._path)
+        atomic_write_json(self._path, payload)
 
     def clear(self) -> None:
         """Called on consent revocation — delete the baseline on disk."""

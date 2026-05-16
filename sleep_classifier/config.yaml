@@ -1,13 +1,17 @@
 # Home Assistant add-on manifest for the Sleep Classifier.
 #
+# v2.0.3 决策: 本 add-on 通过 homeassistant_api: true 调用 HA Core，必须等 Core 就绪
+#
 # Reference: https://developers.home-assistant.io/docs/add-ons/configuration/
 #
 # After publishing this repository to GitHub, the user adds the repo URL in
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "2.0.2"
+version: "2.1.0"
 slug: sleep_classifier
+# v2.0.3: 补充 url 字段，Supervisor UI 的"Project homepage"链接指向 GitHub 仓库。
+url: "https://github.com/LiangyuLu-lly/HA-sleep"
 description: >-
   Closed-loop smart-home sleep automation.  Subscribes to any HA
   sleep-stage sensor (Apple Watch, Mi Band, Fitbit, sleep_as_android, …),
@@ -28,8 +32,9 @@ arch:
   - amd64
 
 # Auto-start when HA boots; restart if the process dies.
-# (``boot: auto`` is the schema default so the linter wants it omitted.)
-startup: services
+# v2.0.3: 从 services 改为 application — 本 add-on 依赖 HA Core API，
+# 必须等 Core 就绪后再启动。
+startup: application
 init: false
 
 # We talk to the HA Core API via the Supervisor proxy.  This grants us a
@@ -45,6 +50,10 @@ homeassistant_api: true
 #   /data         — private add-on data (preference history JSON lives here)
 map:
   - share:rw
+
+# v2.0.3: 声明自定义 apparmor profile（sleep_classifier/apparmor.txt）
+# Supervisor 检测到同目录下的 apparmor.txt 后自动加载，安全评分 +1。
+apparmor: true
 
 # Embedded Web UI for picking entity_ids out of a dropdown instead of
 # typing them by hand into the Configuration form.  The aiohttp server
@@ -190,6 +199,10 @@ options:
   apnea_consent_entity: "input_boolean.sleep_classifier_apnea_consent"
   apnea_calibration_nights: 7
 
+  # ---- v2.1.0 commercial-readiness additions ----------------------------
+  telemetry_enabled: false
+  upgrade_notifications_enabled: true
+
 # Schema validates user input in the UI.
 #
 # The trailing ``?`` in ``match(...)?`` makes a field optional (allows the
@@ -258,3 +271,7 @@ schema:
   apnea_chest_amplitude_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
   apnea_consent_entity: 'match(^$|^""$|^input_boolean\.[a-zA-Z0-9_]+$)?'
   apnea_calibration_nights: "int(1,30)?"
+
+  # v2.1.0 commercial-readiness additions
+  telemetry_enabled: "bool?"
+  upgrade_notifications_enabled: "bool?"

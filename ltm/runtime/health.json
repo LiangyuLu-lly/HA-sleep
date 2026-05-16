@@ -1,0 +1,12 @@
+{
+  "checked_at": "2025-05-15T18:21:00+08:00",
+  "store_freshness_hours": 0,
+  "ledger_integrity": "pass",
+  "runtime_freshness_hours": 0,
+  "budget_status": "pass",
+  "capture_coverage": "pass",
+  "semantic_coverage": {"last_checkpoint_age_hours": 0, "structural_sessions_without_checkpoint": 0, "status": "pass"},
+  "hook_status": "freshly_installed",
+  "overall": "healthy",
+  "state": "healthy-active"
+}

@@ -3,6 +3,27 @@
 > 这个文件会显示在 HA 的 Add-on 更新提示对话框里。
 > 完整工程日志见 GitHub 上的 [`CHANGELOG.md`](https://github.com/LiangyuLu-lly/HA-sleep/blob/main/CHANGELOG.md)。
 
+## v2.0.3 (2026-05-14) — 全流程审计 + 安全加固
+
+- 🆕 **首次安装即可见**：未绑定睡眠阶段实体时，Lovelace 60 秒内自动出现
+  5 个占位 sensor（`state="configuring"`），告诉你 add-on 活着、在等你选实体。
+- 🛡️ **SIGTERM 信号正确转发**：容器重启/更新时 smart service 能在 8 秒内
+  完成偏好数据落盘，不再被 SIGKILL 强杀丢数据。
+- 🔒 **Web UI 仅允许 Supervisor 访问**：新增 IP 白名单 middleware，
+  非 `172.30.32.2` 来源的请求返回 403，防止意外暴露实体列表。
+- 🔒 **AppArmor 自定义 profile**：安全评分从 5 分提升到 6 分（满分）。
+- 🩹 **HA Core 重启不再触发 add-on 退出**：WebSocket 断连时自动重连，
+  仅连续 10 次 auth 失败才判定 token 失效。
+- 🩹 **startup 改为 application**：add-on 等 HA Core 就绪后才启动，
+  消除首 30 秒的 ping 失败噪声。
+- 🩹 **数据文件原子写入**：所有 `/data` 下 JSON 改用 tmp + fsync +
+  rename 模式，掉电/OOM 不再损坏配置文件。
+- 🩹 **build.yaml 对齐 Docker Hub**：消除与 Dockerfile 的 base image 矛盾，
+  兼容 Supervisor 2026.04+ BuildKit 迁移。
+- 🏷️ **完整 OCI 元数据**：Dockerfile 15 条 LABEL，Supervisor UI 详情页
+  显示可点击的"项目主页"链接。
+- 🧪 537 个测试全绿（含 38 条新增契约/结构测试）。
+
 ## v2.0.2 (2026-05-14) — 首次安装体验修复
 
 - 🩹 **修复 Web UI 点「重新加载实体列表」偶发 502**：容器架构重构 —

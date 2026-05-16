@@ -43,6 +43,7 @@
 | `data_structures.py` | `SleepStage` 枚举 + `SleepSession` dataclass 等核心数据类型。 |
 | `apnea_detector.py` | v1.6.0 PoC：纯函数式呼吸暂停/低通气检测（暂未接入主流程）。 |
 | `_time_utils.py` | 带下划线前缀的私有辅助：本地时区、时间桶化。 |
+| `_io_utils.py` | atomic write helpers (JSON / 文本)，I/O 相关纯函数辅助。 |
 
 ## `scripts/`
 | 文件 | 说明 |
@@ -72,6 +73,8 @@ sleep_classifier/
 ├── Dockerfile            # Alpine + Python 3.11，只装 requirements-runtime.txt
 ├── run.sh                # 容器启动脚本：生成 config → 执行 run_ha_smart_service.py
 ├── web_ui.py             # 内嵌 aiohttp UI（/data/web_ui_overrides.json）
+├── bootstrap_placeholders.py  # 启动期抢发占位 sensor
+├── apparmor.txt          # 自定义 AppArmor profile，+1 安全分
 ├── DOCS.md               # Add-on 用户手册（HA 会渲染到 UI）
 ├── prepare.sh / prepare.bat   # 镜像 src/ scripts/ training_config/ 到 rootfs/
 └── rootfs/               # ⚠️ prepare 生成的产物，不要手改；commit 前跑 prepare

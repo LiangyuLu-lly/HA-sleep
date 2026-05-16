@@ -73,6 +73,10 @@ def app(fake_states, monkeypatch):
     async def _fake_fetch():
         return fake_states
     monkeypatch.setattr(web_ui, "_fetch_states", _fake_fetch)
+    # Disable the ingress IP guard for handler-level tests — these tests
+    # exercise route logic, not the middleware.  The middleware has its own
+    # dedicated test file (test_web_ui_ip_guard.py).
+    monkeypatch.setattr(web_ui, "_DISABLE_GUARD", True)
     return web_ui.make_app()
 
 
@@ -90,7 +94,13 @@ async def client(app):
 
 
 class TestIndex:
-    async def test_returns_html_page(self, client) -> None:
+    async def test_returns_html_page(self, client, isolate_data_dir) -> None:
+        # v2.1.0: index now redirects to /onboarding when overrides missing.
+        # Write a minimal overrides to get the picker page.
+        (isolate_data_dir / "web_ui_overrides.json").write_text(
+            json.dumps({"sleep_stage_source": "sensor.bedroom_sleep_stage"}),
+            encoding="utf-8",
+        )
         resp = await client.get("/")
         assert resp.status == 200
         assert resp.headers["Content-Type"].startswith("text/html")
@@ -156,6 +166,7 @@ class TestApiEntities:
         async def _broken():
             raise aiohttp.ClientConnectionError("no route")
         monkeypatch.setattr(web_ui, "_fetch_states", _broken)
+        monkeypatch.setattr(web_ui, "_DISABLE_GUARD", True)
         app = web_ui.make_app()
         async with TestClient(TestServer(app)) as c:
             resp = await c.get("/api/entities")
