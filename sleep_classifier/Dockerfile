@@ -117,7 +117,7 @@ RUN set -eux; \
         bash jq tini; \
     python3 -m pip install --no-cache-dir --upgrade pip wheel; \
     python3 -m pip install --no-cache-dir -r /app/requirements-runtime.txt; \
-    apk del --purge .build-deps; \
+    apk del --no-network .build-deps; \
     find /usr/local/lib/python3.11 -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
     find /usr/local/lib/python3.11 -name '*.pyc' -delete 2>/dev/null || true; \
