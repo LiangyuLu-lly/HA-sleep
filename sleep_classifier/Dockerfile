@@ -47,11 +47,11 @@
 #
 # 镜像 OCI labels 之前由 build.yaml 提供，现在内嵌到 Dockerfile 的
 # LABEL 块（见下方）。
-ARG BUILD_FROM=library/python:3.11.10-alpine3.20
+ARG BUILD_FROM=library/alpine:3.20
 
 FROM ${BUILD_FROM}
 
-ARG BUILD_FROM=library/python:3.11.10-alpine3.20
+ARG BUILD_FROM=library/alpine:3.20
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=dev
 ARG BUILD_NAME="Sleep Classifier"
@@ -119,6 +119,9 @@ COPY rootfs/ /app/
 # off the image, and cuts build time by ~5 min on aarch64.
 #
 # Runtime deps retained:
+#   * python3 + py3-pip — apk 装的 python（arch 一定与 base image 匹配，避免
+#                        docker hub multi-arch manifest 解析错误导致的
+#                        libpython3.11.so 找不到 / Py_BytesMain symbol 缺失）
 #   * bash  — run.sh uses bash features (set -euo pipefail, etc.)
 #   * jq    — run.sh parses /data/options.json with jq
 #   * tini  — PID 1 signal forwarder, so SIGTERM reaches our Python service
@@ -127,21 +130,22 @@ COPY rootfs/ /app/
 # 把构建时间从 ~10min 压到 ~1min。失败时自动回退官方源（|| true）。
 #
 # CACHE_BUST: 改这行可以强制 buildx 重做整个 RUN（绕过 layer cache）。
-# 当 Supervisor 的 buildx cache 残留了 musl ABI 破坏的旧 layer 时，
-# 增加 v 后缀（v2、v3...）即可让所有缓存全部 miss。
-ARG CACHE_BUST=v2
+# 当 Supervisor 的 buildx cache 残留了旧 layer 时，
+# 增加 v 后缀（v3、v4...）即可让所有缓存全部 miss。
+ARG CACHE_BUST=v3
 RUN set -eux; \
     echo "cache-bust=${CACHE_BUST}"; \
     sed -i 's|https\?://dl-cdn.alpinelinux.org|https://mirrors.aliyun.com|g' /etc/apk/repositories || true; \
     apk add --no-cache \
+        python3 py3-pip \
         bash jq tini; \
-    python3 -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple || true; \
-    python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn || true; \
-    python3 -m pip install --no-cache-dir --upgrade pip wheel; \
-    python3 -m pip install --no-cache-dir --only-binary=:all: -r /app/requirements-runtime.txt; \
-    find /usr/local/lib/python3.11 -type d -name '__pycache__' -prune \
+    python3 -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages 2>/dev/null || true; \
+    python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn --break-system-packages 2>/dev/null || true; \
+    python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip wheel; \
+    python3 -m pip install --no-cache-dir --break-system-packages --only-binary=:all: -r /app/requirements-runtime.txt; \
+    find /usr -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
-    find /usr/local/lib/python3.11 -name '*.pyc' -delete 2>/dev/null || true; \
+    find /usr -name '*.pyc' -delete 2>/dev/null || true; \
     rm -rf /root/.cache /var/cache/apk/* /tmp/*
 
 # Web UI for picking entity_ids out of HA's live state.  Lives inside the
