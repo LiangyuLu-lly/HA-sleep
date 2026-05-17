@@ -47,11 +47,11 @@
 #
 # 镜像 OCI labels 之前由 build.yaml 提供，现在内嵌到 Dockerfile 的
 # LABEL 块（见下方）。
-ARG BUILD_FROM=library/python:3.11-alpine
+ARG BUILD_FROM=library/python:3.11.10-alpine3.20
 
 FROM ${BUILD_FROM}
 
-ARG BUILD_FROM=library/python:3.11-alpine
+ARG BUILD_FROM=library/python:3.11.10-alpine3.20
 ARG BUILD_ARCH=amd64
 ARG BUILD_VERSION=dev
 ARG BUILD_NAME="Sleep Classifier"

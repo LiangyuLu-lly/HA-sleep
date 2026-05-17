@@ -69,13 +69,18 @@ def test_dockerfile_arg_build_from_uses_two_segment_format():
     matches = re.findall(r"^ARG\s+BUILD_FROM=(\S+)$", text, re.MULTILINE)
     assert matches, "Dockerfile must declare ARG BUILD_FROM=<image>"
 
-    expected = "library/python:3.11-alpine"
+    # 接受 ``library/python:<tag>`` 任意 alpine 标签变体；具体 tag 是
+    # 实施细节，会被用来强制 buildkit cache miss（v2.1.0 修复 musl ABI
+    # 残留 layer 时换过几次 tag）。守护点是格式正确 + 通过 Supervisor
+    # 校验正则。
+    pinned_alpine_pattern = re.compile(
+        r"^library/python:3\.\d+(\.\d+)?-alpine(\d+\.\d+)?$"
+    )
     for value in matches:
-        assert value == expected, (
-            f"Dockerfile ARG BUILD_FROM default = {value!r}, "
-            f"expected {expected!r}. Other formats either fail "
-            "Supervisor's regex or the docker.io/library three-segment "
-            "form is rejected on some Supervisor versions."
+        assert pinned_alpine_pattern.match(value), (
+            f"Dockerfile ARG BUILD_FROM default = {value!r}; "
+            "expected ``library/python:3.<minor>[.<patch>]-alpine[<ver>]`` "
+            "(two-segment, alpine variant)."
         )
 
         assert _SUPERVISOR_BUILD_FROM_PATTERN.match(value), (
