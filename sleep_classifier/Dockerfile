@@ -139,6 +139,18 @@ RUN set -eux; \
     apk add --no-cache \
         python3 py3-pip \
         bash jq tini; \
+    # Supervisor 已加载的 AppArmor profile 缓存了旧版本，新 profile 文件
+    # 修改后必须完全 uninstall + reinstall 才会被内核重载——但 uninstall
+    # 会丢 /data。这里用兼容方案：
+    #   * 旧 profile allow 的是 /usr/local/bin/python3*
+    #   * alpine apk 装的 python 在 /usr/bin/python3
+    # 直接把真实 binary 复制到 /usr/local/bin/，让 AppArmor 看到 execve 的
+    # 路径在 allow 列表里。复制（不是 symlink）防止 AppArmor follow 到原
+    # 路径触发拒绝。
+    mkdir -p /usr/local/bin; \
+    cp -p /usr/bin/python3 /usr/local/bin/python3; \
+    cp -p /usr/bin/python3 /usr/local/bin/python; \
+    chmod +x /usr/local/bin/python3 /usr/local/bin/python; \
     python3 -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages 2>/dev/null || true; \
     python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn --break-system-packages 2>/dev/null || true; \
     python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip wheel; \

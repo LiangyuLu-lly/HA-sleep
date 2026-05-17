@@ -11,10 +11,13 @@ profile addon_local_sleep_classifier flags=(attach_disconnected,mediate_deleted)
   /bin/sh rmix,
 
   # --- Runtime binaries ---
-  # alpine 用 apk 装的 python 在 /usr/bin/，python:alpine base image 在 /usr/local/bin/。
-  # 两条都 allow 以兼容两种 base image。
+  # alpine 用 apk 装的 python 是 symlink：/usr/bin/python3 -> /usr/bin/python3.12
+  # AppArmor mediate 的是 dereferenced 后的真实路径，所以必须显式 allow
+  # /usr/bin/python3.1[0-9]*；同时 /usr/local/bin/python3* 兼容 python:alpine base image。
   /usr/local/bin/python3* rmix,
   /usr/bin/python3* rmix,
+  /usr/bin/python3.[0-9]* rmix,
+  /usr/bin/python3.[0-9][0-9]* rmix,
   /usr/bin/jq rmix,
   /usr/bin/find rmix,
   /bin/busybox rmix,
