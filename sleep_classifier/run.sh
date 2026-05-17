@@ -27,6 +27,17 @@
 # (http://supervisor/core) so the user never deals with a token.
 set -euo pipefail
 
+# ── v2.1.1 诊断块 ───────────────────────────────────────────────────────────
+# 安装老是失败时，先把容器内 Python / arch 状态打到日志，方便远程定位。
+echo "[run.sh] === diagnostics ==="
+echo "[run.sh] uname:    $(uname -a 2>&1 || true)"
+echo "[run.sh] which py: $(command -v python3 2>&1 || echo 'NOT_FOUND')"
+echo "[run.sh] py ver:   $(python3 --version 2>&1 || echo 'CANNOT_RUN')"
+echo "[run.sh] PATH:     ${PATH}"
+echo "[run.sh] ls /usr/local/bin/python*: $(ls /usr/local/bin/python* 2>&1 || true)"
+echo "[run.sh] ls /usr/bin/python*:       $(ls /usr/bin/python* 2>&1 || true)"
+echo "[run.sh] ===================="
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 opt() { jq -r "$1" /data/options.json; }
 opt_array_to_csv() { jq -r "$1 | join(\",\")" /data/options.json; }

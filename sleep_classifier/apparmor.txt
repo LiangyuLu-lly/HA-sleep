@@ -11,7 +11,10 @@ profile addon_local_sleep_classifier flags=(attach_disconnected,mediate_deleted)
   /bin/sh rmix,
 
   # --- Runtime binaries ---
+  # alpine 用 apk 装的 python 在 /usr/bin/，python:alpine base image 在 /usr/local/bin/。
+  # 两条都 allow 以兼容两种 base image。
   /usr/local/bin/python3* rmix,
+  /usr/bin/python3* rmix,
   /usr/bin/jq rmix,
   /usr/bin/find rmix,
   /bin/busybox rmix,
