@@ -125,7 +125,13 @@ COPY rootfs/ /app/
 #
 # 中国大陆构建加速：用阿里云 alpine mirror + 清华 pypi mirror 替代海外源，
 # 把构建时间从 ~10min 压到 ~1min。失败时自动回退官方源（|| true）。
+#
+# CACHE_BUST: 改这行可以强制 buildx 重做整个 RUN（绕过 layer cache）。
+# 当 Supervisor 的 buildx cache 残留了 musl ABI 破坏的旧 layer 时，
+# 增加 v 后缀（v2、v3...）即可让所有缓存全部 miss。
+ARG CACHE_BUST=v2
 RUN set -eux; \
+    echo "cache-bust=${CACHE_BUST}"; \
     sed -i 's|https\?://dl-cdn.alpinelinux.org|https://mirrors.aliyun.com|g' /etc/apk/repositories || true; \
     apk add --no-cache \
         bash jq tini; \
