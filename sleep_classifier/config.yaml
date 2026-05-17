@@ -1,20 +1,20 @@
 # Home Assistant add-on manifest for the Sleep Classifier.
 #
-# v2.0.3 决策: 本 add-on 通过 homeassistant_api: true 调用 HA Core，必须等 Core 就绪
+# v2.0.3 决策: �?add-on 通过 homeassistant_api: true 调用 HA Core，必须等 Core 就绪
 #
 # Reference: https://developers.home-assistant.io/docs/add-ons/configuration/
 #
 # After publishing this repository to GitHub, the user adds the repo URL in
-# Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
+# Home Assistant �?Settings �?Add-ons �?Add-on Store �?�?�?Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "2.1.4"
+version: "2.1.9"
 slug: sleep_classifier
-# v2.0.3: 补充 url 字段，Supervisor UI 的"Project homepage"链接指向 GitHub 仓库。
+# v2.0.3: 补充 url 字段，Supervisor UI �?Project homepage"链接指向 GitHub 仓库�?
 url: "https://github.com/LiangyuLu-lly/HA-sleep"
 description: >-
   Closed-loop smart-home sleep automation.  Subscribes to any HA
-  sleep-stage sensor (Apple Watch, Mi Band, Fitbit, sleep_as_android, …),
+  sleep-stage sensor (Apple Watch, Mi Band, Fitbit, sleep_as_android, �?,
   then learns your preferred bedtime and bedroom environment from
   history and writes back temperature / humidity / lighting / fan
   setpoints that match the nights you slept best in.
@@ -32,8 +32,8 @@ arch:
   - amd64
 
 # Auto-start when HA boots; restart if the process dies.
-# v2.0.3: 从 services 改为 application — 本 add-on 依赖 HA Core API，
-# 必须等 Core 就绪后再启动。
+# v2.0.3: �?services 改为 application �?�?add-on 依赖 HA Core API�?
+# 必须�?Core 就绪后再启动�?
 startup: application
 init: false
 
@@ -41,18 +41,18 @@ init: false
 # session token via the SUPERVISOR_TOKEN env var, so the user never has to
 # create a Long-Lived Access Token.
 # (``hassio_api``, ``host_network``, ``host_pid`` all default to false and
-# the addon-linter complains if we restate the defaults — omitted.)
+# the addon-linter complains if we restate the defaults �?omitted.)
 homeassistant_api: true
 
 # Persistent storage:
-#   /share        — public to other add-ons (v1.2 shipped a model file
+#   /share        �?public to other add-ons (v1.2 shipped a model file
 #                   drop here; kept mapped for ad-hoc debugging exports)
-#   /data         — private add-on data (preference history JSON lives here)
+#   /data         �?private add-on data (preference history JSON lives here)
 map:
   - share:rw
 
-# v2.0.3: 声明自定义 apparmor profile（sleep_classifier/apparmor.txt）
-# Supervisor 检测到同目录下的 apparmor.txt 后自动加载，安全评分 +1。
+# v2.0.3: 声明自定�?apparmor profile（sleep_classifier/apparmor.txt�?
+# Supervisor 检测到同目录下�?apparmor.txt 后自动加载，安全评分 +1�?
 apparmor: true
 
 # Embedded Web UI for picking entity_ids out of a dropdown instead of
@@ -60,7 +60,7 @@ apparmor: true
 # inside the add-on listens on :8099; HA Supervisor handles auth +
 # reverse-proxy via the Ingress feature, so the user clicks "Open Web
 # UI" in the add-on detail page and gets in without an extra login.
-# (``ingress_port`` defaults to 8099 — omitted to satisfy the linter.)
+# (``ingress_port`` defaults to 8099 �?omitted to satisfy the linter.)
 ingress: true
 panel_icon: mdi:bed-clock
 panel_title: Sleep Classifier
@@ -68,19 +68,19 @@ panel_title: Sleep Classifier
 # User-facing configuration form rendered in the add-on UI.
 #
 # Resolution order for entity selection (highest wins):
-#   1. Slot bindings  —  the *_source / *_target / *_targets fields below.
+#   1. Slot bindings  �? the *_source / *_target / *_targets fields below.
 #      Filling any of these pins that role to a specific HA entity_id and
 #      tells discovery to *skip* keyword scanning for that bucket.
-#   2. Keyword scan  —  bilingual (English + Chinese + pinyin) substring
+#   2. Keyword scan  �? bilingual (English + Chinese + pinyin) substring
 #      match against the entity_id and friendly_name of every entity in
 #      the configured area.
-#   3. Global fallback  —  if no critical sensor matched in step 2, the
+#   3. Global fallback  �? if no critical sensor matched in step 2, the
 #      add-on will rescan all HA entities (ignoring the area filter) and
 #      log the top candidates so you can copy them into the slot fields.
 #
 # Tips:
 #   * Leave a *_source field empty to use auto-discovery for that role.
-#   * Use Developer Tools → States in HA to find the exact entity_id of a
+#   * Use Developer Tools �?States in HA to find the exact entity_id of a
 #     sensor (e.g. ``sensor.xiaomi_smart_band_9_pro_heart_rate``).
 options:
   # ---- General -----------------------------------------------------------
@@ -93,11 +93,11 @@ options:
   deadband_temperature_c: 0.5
   deadband_humidity_pct: 5
   deadband_brightness_pct: 10
-  # v1.4.0 — robustness against real-world timing variability.
+  # v1.4.0 �?robustness against real-world timing variability.
   # min_stage_dwell_seconds: filter brief 30 s wearable blips
-  # (LIGHT → AWAKE → LIGHT) so the controller doesn't flap.
+  # (LIGHT �?AWAKE �?LIGHT) so the controller doesn't flap.
   # wind_down_minutes: start pre-cooling the bedroom this many
-  # minutes before the *learned* bedtime — addresses AC's 15 min
+  # minutes before the *learned* bedtime �?addresses AC's 15 min
   # response time so the room is at LIGHT setpoint when the user
   # actually lies down.  Set to 0 to disable.
   min_stage_dwell_seconds: 60
@@ -113,7 +113,7 @@ options:
   # v1.3.0: ``sleep_stage_source`` REPLACES the old heart-rate /
   # movement / breathing slots.  Mass-market wearables (Mi Band, Apple
   # Watch, Garmin, Withings) and bedside radars (R60ABD1, Eight Sleep)
-  # already publish a sleep-stage entity into HA — we read that
+  # already publish a sleep-stage entity into HA �?we read that
   # directly instead of running our own CNN-BiLSTM.
   sleep_stage_source: ""         # e.g. sensor.mi_band_8_pro_sleep_stage
   temperature_source: ""         # e.g. sensor.bedroom_temperature
@@ -178,14 +178,14 @@ options:
 
   # --- Subjective feedback (morning "how did you sleep?" rating) ---
   # Point this at an input_number helper you created in HA Settings
-  # → Devices & Services → Helpers.  The add-on picks up state changes
+  # �?Devices & Services �?Helpers.  The add-on picks up state changes
   # automatically; you nudge it from Lovelace or a voice routine.
   feedback_entity: ""             # e.g. input_number.sleep_rating
   feedback_scale: 5               # 1..scale, usually 5 or 10
 
   # ---- Apnea / hypopnea trend (v1.7.0) ----------------------------------
   # ALL fields OPT-IN.  Leave ``apnea_breathing_rate_source`` empty to
-  # disable the feature entirely — the sensor will stay at
+  # disable the feature entirely �?the sensor will stay at
   # ``pending_consent`` and no breathing signal gets processed.
   #
   # Even with all three fields filled, the detector will NOT publish
@@ -193,7 +193,7 @@ options:
   # the input_boolean in ``apnea_consent_entity``.  First 7 nights
   # after consent = ``calibrating`` (baseline collection); after that
   # the sensor reports ``green`` / ``amber`` / ``red``.  No numeric
-  # AHI is ever surfaced — see docs/BACKLOG.md for the rationale.
+  # AHI is ever surfaced �?see docs/BACKLOG.md for the rationale.
   apnea_breathing_rate_source: ""      # e.g. sensor.r60abd1_breathing_rate
   apnea_chest_amplitude_source: ""     # e.g. sensor.r60abd1_chest_amplitude
   apnea_consent_entity: "input_boolean.sleep_classifier_apnea_consent"
@@ -223,8 +223,8 @@ schema:
   log_level: list(debug|info|warning|error)
 
   # NOTE: each entity_id field accepts three forms:
-  #   1. an empty string (length 0) — auto-discovery kicks in
-  #   2. the literal two-character "" — same as empty (we tolerate this
+  #   1. an empty string (length 0) �?auto-discovery kicks in
+  #   2. the literal two-character "" �?same as empty (we tolerate this
   #      because users frequently copy the placeholder text verbatim)
   #   3. a real HA entity_id matching the domain regex below
   # v1.3.0: a single sleep-stage entity replaces hr/movement/breathing.
@@ -266,7 +266,7 @@ schema:
   feedback_entity: 'match(^$|^""$|^input_number\.[a-zA-Z0-9_]+$)?'
   feedback_scale: "int(2,10)?"
 
-  # Apnea wiring (v1.7.0) — all optional.
+  # Apnea wiring (v1.7.0) �?all optional.
   apnea_breathing_rate_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
   apnea_chest_amplitude_source: 'match(^$|^""$|^sensor\.[a-zA-Z0-9_]+$)?'
   apnea_consent_entity: 'match(^$|^""$|^input_boolean\.[a-zA-Z0-9_]+$)?'

@@ -98,6 +98,7 @@ ENV LANG=C.UTF-8 \
 # requirements-runtime.txt into ./rootfs/.
 WORKDIR /app
 COPY rootfs/ /app/
+RUN echo "=== /app contents (build-time) ===" && ls -la /app && echo "=== /app/src contents ===" && ls -la /app/src 2>&1 | head -30 && echo "=== END ===" 
 
 # --- System deps + Python deps in ONE layer ---------------------------------
 # The python:3.11-alpine image already has python + pip.  ``aiohttp`` ships
@@ -132,7 +133,7 @@ COPY rootfs/ /app/
 # CACHE_BUST: 改这行可以强制 buildx 重做整个 RUN（绕过 layer cache）。
 # 当 Supervisor 的 buildx cache 残留了旧 layer 时，
 # 增加 v 后缀（v3、v4...）即可让所有缓存全部 miss。
-ARG CACHE_BUST=v3
+ARG CACHE_BUST=v4
 RUN set -eux; \
     echo "cache-bust=${CACHE_BUST}"; \
     sed -i 's|https\?://dl-cdn.alpinelinux.org|https://mirrors.aliyun.com|g' /etc/apk/repositories || true; \
@@ -180,8 +181,12 @@ RUN find /app -type d -name '__pycache__' -prune \
     find /app -name '*.pyc' -delete 2>/dev/null || true
 
 # Add-on entrypoint sits at the image root.
+# COPY_BUST 用 build_version 间接打破 layer cache：每次 bump 版本时这一层
+# 一定 cache miss，避免 supervisor 重用旧 run.sh。
+ARG COPY_BUST=${BUILD_VERSION}
+RUN echo "copy-bust=${COPY_BUST}"
 COPY run.sh /run.sh
-RUN chmod +x /run.sh
+RUN chmod +x /run.sh; echo "=== run.sh head (build-time) ===" && head -40 /run.sh && echo "=== END run.sh head ==="
 
 # Persistent runtime state (preferences, effective config) lives under
 # /data which the supervisor maps to a persistent volume.  Symlink the

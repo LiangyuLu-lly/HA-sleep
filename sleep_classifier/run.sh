@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Entrypoint for the Sleep Classifier add-on.
+# Build marker: v2.1.6 — keeps Docker COPY layer hash unique per release.
 #
 # Reads user-supplied options from /data/options.json (populated by the HA
 # supervisor from the add-on Configuration UI), then generates an effective
@@ -26,6 +27,14 @@
 # The supervisor injects SUPERVISOR_TOKEN; we use the HA core proxy URL
 # (http://supervisor/core) so the user never deals with a token.
 set -euo pipefail
+
+echo "[run.sh] sleep_classifier add-on start (v2.1.8 — PYTHONPATH guard, AppArmor py3 fix)"
+
+# /app 是 add-on 的 PYTHONPATH 根：``from src._io_utils import ...``、
+# ``from training_config.config_loader import ...`` 这类绝对导入都需要
+# /app 在 sys.path[0]。WORKDIR 是 /app 但 python3 用绝对路径调时 cwd 不是 /app，
+# 所以这里全局 export 一份。
+export PYTHONPATH="/app${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ── v2.1.1 诊断块 ───────────────────────────────────────────────────────────
 # 安装老是失败时，先把容器内 Python / arch 状态打到日志，方便远程定位。
@@ -156,6 +165,7 @@ find /data -maxdepth 2 -type f -name '*.tmp.*' -mmin +60 -delete 2>/dev/null || 
 # ── the bundled defaults.  Done in Python (in a separate file, not a
 # ── heredoc) because jq + nested merge is awkward AND heredoc-embedded
 # ── Python is fragile when user input contains quotes / Chinese.
+# PYTHONPATH=/app 在脚本顶部已 export，让 ``from src._io_utils import ...`` 找到 /app/src/。
 python3 /app/render_effective_config.py
 
 # ── Map log level ───────────────────────────────────────────────────────────
