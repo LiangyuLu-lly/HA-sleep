@@ -8,7 +8,7 @@
 # Home Assistant → Settings → Add-ons → Add-on Store → ⋮ → Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "2.1.0"
+version: "2.1.1"
 slug: sleep_classifier
 # v2.0.3: 补充 url 字段，Supervisor UI 的"Project homepage"链接指向 GitHub 仓库。
 url: "https://github.com/LiangyuLu-lly/HA-sleep"
