@@ -36,6 +36,10 @@ echo "[run.sh] sleep_classifier add-on start (v2.2.0 — diag pythonpath + ls /a
 # 所以这里全局 export 一份。
 export PYTHONPATH="/app${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Supervisor proxy URL: some HA OS configs have broken DNS for the 'supervisor'
+# hostname inside addon containers. Use the static IP (172.30.32.2) as fallback.
+export SUPERVISOR_HA_BASE="http://172.30.32.2/core"
+
 # ── v2.1.1 诊断块 ───────────────────────────────────────────────────────────
 # 安装老是失败时，先把容器内 Python / arch 状态打到日志，方便远程定位。
 echo "[run.sh] === diagnostics ==="
@@ -226,7 +230,7 @@ supervise_smart_service() {
         cd /app
         if python3 scripts/run_ha_smart_service.py \
                 --config /data/effective_config.json \
-                --base-url "http://supervisor/core" \
+                --base-url "http://172.30.32.2/core" \
                 --area "$AREA" \
                 --infer-interval "$INFER_INTERVAL" \
                 --session-interval "$SESSION_INTERVAL" \
