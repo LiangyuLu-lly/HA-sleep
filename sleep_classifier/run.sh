@@ -28,7 +28,7 @@
 # (http://supervisor/core) so the user never deals with a token.
 set -euo pipefail
 
-echo "[run.sh] sleep_classifier add-on start (v2.1.8 — PYTHONPATH guard, AppArmor py3 fix)"
+echo "[run.sh] sleep_classifier add-on start (v2.2.0 — diag pythonpath + ls /app/src)"
 
 # /app 是 add-on 的 PYTHONPATH 根：``from src._io_utils import ...``、
 # ``from training_config.config_loader import ...`` 这类绝对导入都需要
@@ -43,6 +43,10 @@ echo "[run.sh] uname:    $(uname -a 2>&1 || true)"
 echo "[run.sh] which py: $(command -v python3 2>&1 || echo 'NOT_FOUND')"
 echo "[run.sh] py ver:   $(python3 --version 2>&1 || echo 'CANNOT_RUN')"
 echo "[run.sh] PATH:     ${PATH}"
+echo "[run.sh] PYTHONPATH=${PYTHONPATH:-<unset>}"
+echo "[run.sh] ls /app:           $(ls /app 2>&1 | head -c 300 || true)"
+echo "[run.sh] ls /app/src:       $(ls /app/src 2>&1 | head -c 300 || true)"
+echo "[run.sh] /app/src/_io_utils.py: $(test -f /app/src/_io_utils.py && echo present || echo MISSING)"
 echo "[run.sh] ls /usr/local/bin/python*: $(ls /usr/local/bin/python* 2>&1 || true)"
 echo "[run.sh] ls /usr/bin/python*:       $(ls /usr/bin/python* 2>&1 || true)"
 echo "[run.sh] ===================="
