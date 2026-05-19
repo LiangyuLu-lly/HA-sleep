@@ -123,6 +123,87 @@ _BUFFER_DIR = Path("/data") if Path("/data").is_dir() else PROJECT_ROOT
 # Natural-sleep persistence paths (v1.2.0).
 _PROFILE_PATH = _BUFFER_DIR / "user_profile.json"
 
+# v3.0.0 — algorithmic moat persistence paths（design §2.5 / §3）。
+# 训练产物（``population_prior.pickle`` / ``stage_predictor.onnx``）由开发者
+# 离线训练后镜像到 add-on 内部 ``training_config/`` 目录；运行时产物
+# （``bao_model.pickle`` / ``causal_factors.jsonl`` / ``predictor_audit.jsonl``）
+# 走 supervisor 持久卷 ``/data``，全部经 ``_io_utils.atomic_write_*`` 写入
+# （PR3）。
+_V3_TRAINING_CONFIG_DIR: Path = PROJECT_ROOT / "training_config"
+_V3_PRIOR_PATH: Path = _V3_TRAINING_CONFIG_DIR / "population_prior.pickle"
+_V3_PREDICTOR_MODEL_PATH: Path = _V3_TRAINING_CONFIG_DIR / "stage_predictor.onnx"
+_V3_BAO_STATE_PATH: Path = _BUFFER_DIR / "bao_model.pickle"
+_V3_CAUSAL_FACTORS_PATH: Path = _BUFFER_DIR / "causal_factors.jsonl"
+_V3_PREDICTOR_AUDIT_PATH: Path = _BUFFER_DIR / "predictor_audit.jsonl"
+_V3_INSTALL_ID_PATH: Path = _BUFFER_DIR / "install_id.uuid"
+
+
+def _season_from_month(month: int) -> str:
+    """Return the v3 prior season label（与 ``Season`` literal 对齐）。
+
+    采用北半球温带划分：3-5 春、6-8 夏、9-11 秋、12/1/2 冬。这是 MESA /
+    SHHS 训练集（北美东海岸）的自然分桶；南半球用户的偏差在
+    :class:`PopulationPriorRepository.lookup` 的 fallback_level 兜底里
+    被吸收。
+    """
+    if 3 <= month <= 5:
+        return "spring"
+    if 6 <= month <= 8:
+        return "summer"
+    if 9 <= month <= 11:
+        return "autumn"
+    return "winter"
+
+
+def _age_band_from_birth_year(birth_year: Optional[int]) -> str:
+    """Map ``birth_year`` to an :class:`AgeBand` literal; empty string when unknown."""
+    if not birth_year or birth_year <= 0:
+        return ""
+    try:
+        from datetime import date as _date
+        age = _date.today().year - int(birth_year)
+    except (TypeError, ValueError):
+        return ""
+    if age < 18:
+        return ""  # below schema min — fall back to lookup neutral
+    if age <= 25:
+        return "18-25"
+    if age <= 35:
+        return "26-35"
+    if age <= 50:
+        return "36-50"
+    if age <= 65:
+        return "51-65"
+    return "65+"
+
+
+def _get_or_load_install_id(path: Path) -> str:
+    """Return the persistent ``install_id`` UUID, creating it on first call.
+
+    The same file is shared with :class:`TelemetryReporter._install_id_path`
+    so v3 modules and telemetry agree on a single opaque add-on id. The
+    raw value is **never logged**; it only feeds into the BAO Thompson
+    Sampling RNG seed (R2.6, ``sha256(install_id + ISO-date)``) and is
+    SHA-256-hashed before any persistence (R14.2).
+    """
+    try:
+        if path.exists():
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+    except OSError:
+        pass
+    new_id = uuid.uuid4().hex
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Cheap write — same atomicity guarantee as TelemetryReporter:
+        # if the path is on a tmpfs / read-only volume we just keep
+        # the in-memory id for this run.
+        path.write_text(new_id, encoding="utf-8")
+    except OSError:
+        logger.debug("install_id persist skipped (read-only %s)", path)
+    return new_id
+
 # Type alias kept short so the ``_route_state_change`` /
 # ``_task_inference_loop`` signatures stay scannable.
 _Engine = ExternalStageSubscriber
@@ -408,6 +489,672 @@ class SmartSleepService:
         # ``None`` so dry-run and unit-test paths don't accidentally try to
         # POST to a non-existent server.
         self.publisher: Optional[SleepStatePublisher] = None
+
+        # ------------------------------------------------------------------ #
+        # v3.0.0 — algorithmic moat state（task 8.1, design §2.5 / §6.2）。   #
+        # ------------------------------------------------------------------ #
+        # 4 个 flag 与 user_profile 字段在 ``home_assistant.v3`` 子树下；
+        # ``_apply_v3_defaults`` 已经把缺失字段填好默认值（task 6.2）。任
+        # 何一个 flag = false 时本类**不 import** 对应模块（lazy import in
+        # ``_init_v3_modules`` 内部 ``if flag:`` 分支），保证 R11.4 字节级
+        # 等价回退到 v2.1.0 行为。
+        v3_cfg = ha_cfg.get("v3", {}) if isinstance(ha_cfg, dict) else {}
+        self._v3_bayesian_optimizer_enabled: bool = bool(
+            v3_cfg.get("bayesian_optimizer_enabled", True)
+        )
+        self._v3_causal_attribution_enabled: bool = bool(
+            v3_cfg.get("causal_attribution_enabled", True)
+        )
+        self._v3_population_prior_enabled: bool = bool(
+            v3_cfg.get("population_prior_enabled", True)
+        )
+        self._v3_stage_predictor_enabled: bool = bool(
+            v3_cfg.get("stage_predictor_enabled", True)
+        )
+        self._v3_user_profile_age_band: str = str(
+            v3_cfg.get("user_profile_age_band") or ""
+        ).strip()
+        self._v3_user_profile_sex: str = str(
+            v3_cfg.get("user_profile_sex") or ""
+        ).strip()
+        self._v3_user_profile_chronotype: str = str(
+            v3_cfg.get("user_profile_chronotype") or ""
+        ).strip()
+        # ``prior_weight_lock`` 由 Web UI onboarding 写入 web_ui_overrides.json
+        # （task 7.1）；构造期还读不到 overrides，先保持 None，由
+        # ``_init_v3_modules`` 在 run() 内部刷新。
+        self._v3_prior_weight_lock: Optional[float] = None
+
+        # 4 个模块的运行时引用；任一加载失败 / flag = false → 保持 None。
+        self._v3_bao: Any = None
+        self._v3_cae_engine: Any = None
+        self._v3_prior_repo: Any = None
+        self._v3_predictor: Any = None
+
+        # ``recommend()`` 闭包需要看到「当晚的运行时状态」（current_stage /
+        # locked_dimensions），主入口在 ``_task_inference_loop`` 每次 tick 前
+        # 通过 ``_v3_update_runtime_state`` 刷新这两个槽位。
+        self._v3_current_stage: SleepStage = SleepStage.AWAKE
+        self._v3_locked_dimensions: frozenset[str] = frozenset()
+
+        # PR5 优雅退出：4 个模块 fire-and-forget 派发的后台 task 在 SIGTERM
+        # 时统一通过 ``pending_persist_tasks()`` / ``pending_listener_tasks()``
+        # 从 BAO / PreferenceLearner 拿到，再 await asyncio.gather；本字段保
+        # 留为编排层也派发自己的任务时的注册点。
+        self._v3_tasks: List[asyncio.Task[Any]] = []
+        # listener / persist 派发使用的统一 stop signal —— 当前 4 个模块的内
+        # 部 task 都不监听此事件（它们是单次 fire-and-forget），但留作
+        # forward-compat 钩子（task 8.5 P19 测试需要 set 然后 gather）。
+        self._v3_shutdown_event: Optional[asyncio.Event] = None
+        # 启动期一次性日志去重 —— 重复 run() 调用（测试场景）时不重复打印。
+        self._v3_status_banner_logged: bool = False
+        # task 8.2 — auto-degradation state machine: tracks which modules
+        # have been permanently disabled due to error_count >= 3.  Once a
+        # module name is added here, the health check becomes a no-op for
+        # that module (idempotent).  Module refs are NOT nulled out so the
+        # publisher can still read their error_count and show "degraded".
+        self._v3_degraded: set[str] = set()
+
+    # ================================================================== #
+    # v3.0.0 algorithmic moat — startup orchestration (task 8.1)         #
+    # ================================================================== #
+
+    def _v3_load_prior_weight_lock(self) -> None:
+        """Refresh ``prior_weight_lock`` from ``web_ui_overrides.json``.
+
+        Called once before BAO init; the Web UI onboarding wizard
+        (task 7.1) writes ``v3_user_profile.prior_weight_lock`` to
+        the same overrides file used by v2.x. ``None`` ⇒ default
+        exponential decay (R8.4); ``0.0`` ⇒ user opted out of
+        cohort prior altogether (R8.5).
+        """
+        overrides_path = _BUFFER_DIR / "web_ui_overrides.json"
+        if not overrides_path.exists():
+            return
+        try:
+            data = json.loads(overrides_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("v3 prior_weight_lock read skipped: %s", exc)
+            return
+        v3_profile = data.get("v3_user_profile") if isinstance(data, dict) else None
+        if not isinstance(v3_profile, dict):
+            return
+        raw = v3_profile.get("prior_weight_lock")
+        if raw is None:
+            return
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return
+        if 0.0 <= value <= 1.0:
+            self._v3_prior_weight_lock = value
+
+    def _v3_build_bao_user_profile(self) -> Any:
+        """Build the BAO :class:`UserProfile` from config + on-disk profile.
+
+        BAO 的 ``UserProfile`` 是 inert 的「桶 key + ``prior_weight_lock``」，
+        与 ``src.user_profile.UserProfile`` 是两个不同的概念（design
+        §3.2.1）。这里把 v2.x 的 ``self.profile.birth_year`` /
+        ``self.profile.chronotype`` 与 v3 配置项里直接的 ``user_profile_*``
+        合成 BAO 需要的桶 key。配置项 > on-disk profile 优先级。
+        """
+        # Lazy import keeps the module-level import chain free of numpy /
+        # scipy when ``bayesian_optimizer_enabled = false`` (R11.4).
+        from src.bayesian_optimizer import UserProfile as BAOUserProfile
+
+        age_band = self._v3_user_profile_age_band or _age_band_from_birth_year(
+            self.profile.birth_year if self.profile is not None else None,
+        )
+        sex = self._v3_user_profile_sex or "unspecified"
+        chronotype = (
+            self._v3_user_profile_chronotype
+            or (str(getattr(self.profile, "chronotype", "")) if self.profile else "")
+            or "neutral"
+        )
+        season = _season_from_month(now_local().month)
+        return BAOUserProfile(
+            age_band=age_band,
+            sex=sex,
+            chronotype=chronotype,
+            season=season,
+            prior_weight_lock=self._v3_prior_weight_lock,
+        )
+
+    def _v3_update_runtime_state(
+        self,
+        *,
+        current_stage: Optional[SleepStage] = None,
+        locked_dimensions: Optional[frozenset[str]] = None,
+    ) -> None:
+        """Refresh slots read by the BAO ``set_setpoint_provider`` closure.
+
+        Only mutates fields when explicitly provided so callers can
+        update either dimension independently.
+        """
+        if current_stage is not None:
+            self._v3_current_stage = current_stage
+        if locked_dimensions is not None:
+            self._v3_locked_dimensions = frozenset(locked_dimensions)
+
+    def _init_v3_modules(self, controller: SmartEnvironmentController) -> None:
+        """Load + wire the 4 algorithmic-moat modules（design §2.5）。
+
+        启动序列严格遵循 design §2.5 顺序图：
+        ``load config → PP load → BAO init（注入 PP）→ EMST try_load → CAE init``。
+        任一模块的 import / 加载失败 → 仅 log INFO + 对应 sensor 留 None
+        （publisher 在 ``_publish_v3_sensors`` 内统一发布 ``state="disabled"``），
+        主流程继续（R11.3）。
+
+        ``*_enabled = false`` 时**不 import** 对应模块（lazy import 在
+        ``if flag:`` 里完成），保证 R11.4 字节级等价回退到 v2.1.0 行为。
+
+        :param controller: The :class:`SmartEnvironmentController` already
+            constructed in :meth:`run`. Used to register the BAO setpoint
+            provider closure（R1.4 / task 3.2）。
+        """
+        # 先把 web_ui_overrides 里的 prior_weight_lock 拉进内存。
+        self._v3_load_prior_weight_lock()
+
+        # ---- 1. PopulationPrior ---------------------------------------- #
+        if self._v3_population_prior_enabled:
+            try:
+                from src.population_prior import PopulationPriorRepository
+                self._v3_prior_repo = PopulationPriorRepository.load(
+                    _V3_PRIOR_PATH,
+                )
+                if self._v3_prior_repo is None:
+                    logger.info(
+                        "v3.population_prior: prior file %s missing or "
+                        "invalid; BAO will run without cohort prior "
+                        "(prior_status=unavailable).",
+                        _V3_PRIOR_PATH,
+                    )
+            except Exception as exc:    # noqa: BLE001
+                # ImportError, OSError, hashlib failure — anything goes
+                # to graceful degrade (R11.3).
+                logger.info(
+                    "v3.population_prior: load failed (%s); disabling.",
+                    exc,
+                )
+                self._v3_prior_repo = None
+
+        # ---- 2. BayesianOptimizer ------------------------------------- #
+        if self._v3_bayesian_optimizer_enabled:
+            try:
+                from src.bayesian_optimizer import (
+                    BayesianOptimizer,
+                    GPHyperparams,
+                )
+                self._v3_bao = BayesianOptimizer.load_or_init(
+                    state_path=_V3_BAO_STATE_PATH,
+                    prior=self._v3_prior_repo,
+                    hyperparams=GPHyperparams(),
+                )
+                # Register the setpoint-provider closure on the controller
+                # (task 3.2 / R1.4).  The closure captures the runtime
+                # state (current_stage + locked_dimensions) via the
+                # ``self._v3_*`` slots so the orchestrator can tweak them
+                # without touching BAO.
+                install_id = _get_or_load_install_id(_V3_INSTALL_ID_PATH)
+                bao_ref = self._v3_bao
+
+                def _bao_setpoint_provider() -> Any:
+                    """Zero-arg closure satisfying ``set_setpoint_provider``."""
+                    # task 8.2 — short-circuit if BAO has been auto-degraded.
+                    if "bao" in self._v3_degraded:
+                        return None
+                    user_profile = self._v3_build_bao_user_profile()
+                    in_wind_down = (
+                        self._v3_current_stage is SleepStage.AWAKE
+                        and self._effective_control_stage(
+                            self._v3_current_stage,
+                        )
+                        is not SleepStage.AWAKE
+                    )
+                    return bao_ref.recommend(
+                        user_profile=user_profile,
+                        current_stage=self._v3_current_stage,
+                        in_wind_down=in_wind_down,
+                        locked_dimensions=self._v3_locked_dimensions,
+                        install_id=install_id,
+                    )
+
+                controller.set_setpoint_provider(_bao_setpoint_provider)
+            except Exception as exc:    # noqa: BLE001
+                logger.info(
+                    "v3.bayesian_optimizer: init failed (%s); disabling.",
+                    exc,
+                )
+                self._v3_bao = None
+                # Make sure the controller falls back to v2.x path.
+                try:
+                    controller.set_setpoint_provider(None)
+                except Exception:    # noqa: BLE001
+                    pass
+
+        # ---- 3. StagePredictor ---------------------------------------- #
+        if self._v3_stage_predictor_enabled:
+            try:
+                from src.stage_predictor import StagePredictor
+                self._v3_predictor = StagePredictor.try_load(
+                    model_path=_V3_PREDICTOR_MODEL_PATH,
+                    audit_jsonl=_V3_PREDICTOR_AUDIT_PATH,
+                )
+                if self._v3_predictor is None:
+                    logger.info(
+                        "v3.stage_predictor: model %s missing or "
+                        "onnxruntime unavailable; predictor disabled.",
+                        _V3_PREDICTOR_MODEL_PATH,
+                    )
+            except Exception as exc:    # noqa: BLE001
+                logger.info(
+                    "v3.stage_predictor: try_load failed (%s); disabling.",
+                    exc,
+                )
+                self._v3_predictor = None
+
+        # ---- 4. CausalAttribution ------------------------------------- #
+        if self._v3_causal_attribution_enabled:
+            try:
+                from src.causal_attribution import CausalAttributionEngine
+                self._v3_cae_engine = CausalAttributionEngine(
+                    jsonl_path=_V3_CAUSAL_FACTORS_PATH,
+                )
+            except Exception as exc:    # noqa: BLE001
+                logger.info(
+                    "v3.causal_attribution: init failed (%s); disabling.",
+                    exc,
+                )
+                self._v3_cae_engine = None
+
+        # ---- Hook registration ---------------------------------------- #
+        # ``set_setpoint_provider`` already happened above (closure needs
+        # the BAO instance). Now wire ``add_session_listener`` and
+        # ``add_pre_transition_hook``.
+
+        # 4a. PreferenceLearner.add_session_listener(CAE.on_session)
+        if (
+            self._v3_cae_engine is not None
+            and self.learner is not None
+            and hasattr(self.learner, "add_session_listener")
+        ):
+            cae_ref = self._v3_cae_engine
+            install_id = _get_or_load_install_id(_V3_INSTALL_ID_PATH)
+
+            async def _cae_session_listener(session: SleepSession) -> None:
+                """Forward each persisted session into CAE.
+
+                CAE 不消费 v2.x 的 environment 因子（temperature / humidity /
+                brightness），它的 6 因子（``bedtime_offset`` /
+                ``prior_night_debt`` / ``temperature_drift`` / ``noise_level`` /
+                ``hrv_anomaly`` / ``substance_use``）由专门的传感器或用户输入
+                填充。task 8.1 编排层只负责把 session **送达** CAE；具体因子
+                由 CAE 内部的 ``factors`` 入参从未来的 sensor wiring 传入。
+                此处先送一个 ``factors={}`` 的最小记录（normalize 后所有 6 个
+                因子都是 None / NaN），保证 jsonl 流水线在没有 sensor 接入时
+                也能维持 R4.3 滚动窗口；后续 sensor wiring 落地时只需在此处
+                填充实际 factor 值即可。
+                """
+                # task 8.2 — skip if CAE has been auto-degraded.
+                if "cae" in self._v3_degraded:
+                    return
+                try:
+                    await cae_ref.on_session(
+                        session=session,
+                        install_id=install_id,
+                        factors={},
+                    )
+                except Exception as exc:    # noqa: BLE001
+                    logger.warning(
+                        "v3.causal_attribution.on_session failed: %s", exc,
+                    )
+
+            try:
+                self.learner.add_session_listener(_cae_session_listener)
+            except Exception as exc:    # noqa: BLE001
+                logger.info(
+                    "v3.causal_attribution: add_session_listener failed "
+                    "(%s); CAE will receive no new records this run.",
+                    exc,
+                )
+
+        # 4b. ExternalStageSubscriber.add_pre_transition_hook(EMST.maybe_anticipate)
+        # 此 hook 必须挂到 ``run()`` 里实际构造的 ``ExternalStageSubscriber``
+        # 实例上，``_init_v3_modules`` 缺少这个引用，所以由调用方
+        # （``run()``）在调用本方法之后立即注册（见 :meth:`_v3_register_pre_transition_hook`）。
+
+        # ---- Publisher wire-up ---------------------------------------- #
+        if self.publisher is not None and (
+            self._v3_bao is not None
+            or self._v3_cae_engine is not None
+            or self._v3_prior_repo is not None
+            or self._v3_predictor is not None
+        ):
+            try:
+                self.publisher.set_v3_modules(
+                    bao=self._v3_bao,
+                    cae_engine=self._v3_cae_engine,
+                    prior_repo=self._v3_prior_repo,
+                    predictor=self._v3_predictor,
+                )
+            except Exception as exc:    # noqa: BLE001
+                logger.info(
+                    "v3 publisher.set_v3_modules failed (%s); v3 sensors "
+                    "will stay at boot placeholders.",
+                    exc,
+                )
+
+        # ---- Status banner（design §6.2）------------------------------ #
+        self._v3_log_status_banner()
+
+    def _v3_register_pre_transition_hook(
+        self, engine: _Engine,
+    ) -> None:
+        """Wire ``EMST.maybe_anticipate`` into the stage subscriber.
+
+        Separated from :meth:`_init_v3_modules` because the engine is
+        constructed in :meth:`run` after the v3 init point — keeping
+        them apart avoids a circular dependency between subscriber
+        wiring and module loading.
+        """
+        if self._v3_predictor is None:
+            return
+        if not hasattr(engine, "add_pre_transition_hook"):
+            return
+        predictor_ref = self._v3_predictor
+
+        async def _emst_pre_transition_hook(
+            new_stage: SleepStage, last_stage: SleepStage,
+        ) -> None:
+            """Run EMST anticipation on every stable transition.
+
+            EMST 期望「当前 stage + 一个 ``PredictorOutput``」；后者来自
+            ``predictor.predict(...)``，需要 5 分钟的 HRV / motion /
+            breathing 滑窗。本编排层尚未对接这三个传感器（待后续
+            sensor wiring 任务），所以这里 best-effort 调用：
+            如果 ``self._v3_predictor_window_provider`` 已被设置（forward-
+            compat hook），就调用之；否则把 hook 当作 no-op，保证 100ms
+            budget 不被超过（R10.1）。
+            """
+            # task 8.2 — skip if EMST has been auto-degraded.
+            if "emst" in self._v3_degraded:
+                return
+            window_provider = getattr(
+                self, "_v3_predictor_window_provider", None,
+            )
+            if window_provider is None:
+                return
+            try:
+                window = window_provider(last_stage, new_stage)
+            except Exception as exc:    # noqa: BLE001
+                logger.debug(
+                    "v3.stage_predictor: window provider raised: %s", exc,
+                )
+                return
+            if window is None:
+                return
+            try:
+                predicted = await predictor_ref.predict(window)
+            except Exception as exc:    # noqa: BLE001
+                logger.debug("v3.stage_predictor.predict: %s", exc)
+                return
+            if predicted is None:
+                return
+            controller = getattr(self, "_v3_controller_ref", None)
+            if controller is None:
+                return
+            try:
+                await predictor_ref.maybe_anticipate(
+                    current_stage=last_stage,
+                    predicted=predicted,
+                    controller=controller,
+                )
+            except Exception as exc:    # noqa: BLE001
+                logger.debug(
+                    "v3.stage_predictor.maybe_anticipate: %s", exc,
+                )
+
+        try:
+            engine.add_pre_transition_hook(_emst_pre_transition_hook)
+        except Exception as exc:    # noqa: BLE001
+            logger.info(
+                "v3.stage_predictor: add_pre_transition_hook failed "
+                "(%s); pre-emption disabled this run.",
+                exc,
+            )
+
+    # ================================================================== #
+    # v3.0.0 — error-count → auto-degradation state machine (task 8.2)   #
+    # ================================================================== #
+
+    async def _v3_check_health_and_degrade(
+        self,
+        controller: SmartEnvironmentController,
+    ) -> None:
+        """Inspect the 4 v3 modules' ``should_disable`` and disable on threshold.
+
+        Called by the inference loop after each ``controller.apply()``
+        tick.  When a module's ``error_count >= 3``:
+
+        1. Set the internal enabled flag to ``False`` (so the module
+           won't be called again in subsequent cycles).
+        2. Clear the hook on the controller / subscriber so the module
+           is fully disconnected from the hot path.
+        3. Publish ``*_health = "degraded"`` via
+           :class:`SleepStatePublisher`.
+
+        This method is idempotent: once a module is disabled, repeated
+        calls are no-ops.
+        """
+        # ---- BAO (BayesianOptimizer) --------------------------------- #
+        if self._v3_bao is not None and "bao" not in self._v3_degraded:
+            bao_should_disable = getattr(self._v3_bao, "should_disable", False)
+            # Also check the controller-side provider error count (tracks
+            # cases where BAO returned None or raised in the closure).
+            provider_should_disable = (
+                getattr(controller, "provider_error_count", 0) >= 3
+            )
+            if bao_should_disable or provider_should_disable:
+                logger.warning(
+                    "v3.bayesian_optimizer: auto-degraded "
+                    "(bao.error_count=%d, provider_error_count=%d); "
+                    "disabling BAO and falling back to v2.x learner path.",
+                    getattr(self._v3_bao, "error_count", 0),
+                    getattr(controller, "provider_error_count", 0),
+                )
+                self._v3_degraded.add("bao")
+                # Disconnect the BAO setpoint provider → controller
+                # reverts to the v2.x PreferenceLearner.recommend() path.
+                try:
+                    controller.set_setpoint_provider(None)
+                except Exception:  # noqa: BLE001
+                    pass
+                # Publish degraded health — module ref stays so
+                # publisher can read error_count and show "degraded".
+                if self.publisher is not None:
+                    try:
+                        await self.publisher._publish_v3_sensors()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # ---- CAE (CausalAttributionEngine) --------------------------- #
+        if self._v3_cae_engine is not None and "cae" not in self._v3_degraded:
+            if getattr(self._v3_cae_engine, "should_disable", False):
+                logger.warning(
+                    "v3.causal_attribution: auto-degraded "
+                    "(error_count=%d); disabling CAE.",
+                    getattr(self._v3_cae_engine, "error_count", 0),
+                )
+                self._v3_degraded.add("cae")
+                # Publish degraded health.
+                if self.publisher is not None:
+                    try:
+                        await self.publisher._publish_v3_sensors()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # ---- EMST (StagePredictor) ----------------------------------- #
+        if self._v3_predictor is not None and "emst" not in self._v3_degraded:
+            if getattr(self._v3_predictor, "should_disable", False):
+                logger.warning(
+                    "v3.stage_predictor: auto-degraded "
+                    "(error_count=%d); disabling predictor.",
+                    getattr(self._v3_predictor, "error_count", 0),
+                )
+                self._v3_degraded.add("emst")
+                # Publish degraded health.
+                if self.publisher is not None:
+                    try:
+                        await self.publisher._publish_v3_sensors()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # ---- PP (PopulationPrior) ------------------------------------ #
+        # PP is read-only at runtime (loaded once at startup), so errors
+        # are extremely unlikely.  Still checked for uniformity.
+        if self._v3_prior_repo is not None and "pp" not in self._v3_degraded:
+            if getattr(self._v3_prior_repo, "should_disable", False):
+                logger.warning(
+                    "v3.population_prior: auto-degraded "
+                    "(error_count=%d); disabling prior.",
+                    getattr(self._v3_prior_repo, "error_count", 0),
+                )
+                self._v3_degraded.add("pp")
+                # Publish degraded health.
+                if self.publisher is not None:
+                    try:
+                        await self.publisher._publish_v3_sensors()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    def _v3_log_status_banner(self) -> None:
+        """Print the design §6.2 startup status banner（INFO，仅一次）。"""
+        if self._v3_status_banner_logged:
+            return
+        self._v3_status_banner_logged = True
+
+        def _bao_summary() -> str:
+            if not self._v3_bayesian_optimizer_enabled:
+                return "enabled=False  (config-disabled)"
+            if self._v3_bao is None:
+                return "enabled=True   load=failed"
+            n_obs = int(getattr(self._v3_bao, "n_observations", 0) or 0)
+            prior_loaded = self._v3_prior_repo is not None
+            return (
+                f"enabled=True   prior={'loaded' if prior_loaded else 'unavailable'}  "
+                f"observations={n_obs}"
+            )
+
+        def _cae_summary() -> str:
+            if not self._v3_causal_attribution_enabled:
+                return "enabled=False  (config-disabled)"
+            if self._v3_cae_engine is None:
+                return "enabled=True   init=failed"
+            try:
+                records = int(self._v3_cae_engine.n_records())
+            except Exception:    # noqa: BLE001
+                records = 0
+            return f"enabled=True   records={records}/90"
+
+        def _pp_summary() -> str:
+            if not self._v3_population_prior_enabled:
+                return "enabled=False  (config-disabled)"
+            if self._v3_prior_repo is None:
+                return "enabled=True   prior=unavailable"
+            return "enabled=True   prior=loaded"
+
+        def _emst_summary() -> str:
+            if not self._v3_stage_predictor_enabled:
+                return "enabled=False  (config-disabled)"
+            if self._v3_predictor is None:
+                return "enabled=True   model=unavailable"
+            try:
+                size_kb = max(
+                    1, int(_V3_PREDICTOR_MODEL_PATH.stat().st_size / 1024),
+                )
+                size_label = f"{size_kb} KB"
+            except OSError:
+                size_label = "unknown size"
+            return f"enabled=True   model=stage_predictor.onnx ({size_label})"
+
+        logger.info(
+            "v3.0.0 algorithmic moat status:\n"
+            "  • bayesian_optimizer:  %s\n"
+            "  • causal_attribution:  %s\n"
+            "  • population_prior:    %s\n"
+            "  • stage_predictor:     %s",
+            _bao_summary(), _cae_summary(),
+            _pp_summary(), _emst_summary(),
+        )
+        # Prior provenance line（design §6.2）—— 仅在 prior 真正加载时打印，
+        # 避免 mock / 单测路径上误导用户。
+        if self._v3_prior_repo is not None:
+            try:
+                meta = getattr(self._v3_prior_repo, "metadata", None)
+                if meta is not None:
+                    sources = getattr(meta, "sources", ())
+                    if sources:
+                        logger.info(
+                            "v3.population_prior provenance: %s",
+                            ", ".join(str(s) for s in sources),
+                        )
+            except Exception:    # noqa: BLE001
+                pass
+
+    async def _v3_drain_pending_tasks(self, timeout: float = 10.0) -> None:
+        """Await fire-and-forget v3 tasks under a 10-second budget（PR5）。
+
+        SIGTERM 时主入口先 ``set`` ``_v3_shutdown_event`` 让模块的内部
+        task 主动退出，再 ``await asyncio.wait_for(asyncio.gather(*tasks,
+        return_exceptions=True), timeout=10)``，超时则 ``cancel()``。
+        """
+        pending: List[asyncio.Task[Any]] = []
+        # BAO persist tasks（task 3.3）。
+        bao = self._v3_bao
+        if bao is not None and hasattr(bao, "pending_persist_tasks"):
+            try:
+                pending.extend(bao.pending_persist_tasks())
+            except Exception as exc:    # noqa: BLE001
+                logger.debug("BAO.pending_persist_tasks: %s", exc)
+        # PreferenceLearner listener tasks（task 4.2）。
+        pl = self.learner
+        if pl is not None and hasattr(pl, "pending_listener_tasks"):
+            try:
+                pending.extend(pl.pending_listener_tasks())
+            except Exception as exc:    # noqa: BLE001
+                logger.debug("learner.pending_listener_tasks: %s", exc)
+        # 编排层自己派发的任务（forward-compat）。
+        pending.extend(t for t in self._v3_tasks if not t.done())
+
+        if self._v3_shutdown_event is not None:
+            self._v3_shutdown_event.set()
+
+        if not pending:
+            return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "v3 background tasks did not drain within %.1fs; "
+                "cancelling %d task(s).",
+                timeout, sum(1 for t in pending if not t.done()),
+            )
+            for t in pending:
+                if not t.done():
+                    t.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "v3 task cancellation also exceeded budget; moving on.",
+                )
 
     # ------------------------------------------------------------------ #
     # State change handler                                               #
@@ -782,6 +1529,13 @@ class SmartSleepService:
                 # substitutes, so users aren't confused by a sensor
                 # that lies.
                 effective_stage = self._effective_control_stage(stage)
+                # v3.0.0 task 8.1 — refresh the slot the BAO setpoint
+                # provider closure reads on every call.  We feed the
+                # *raw* stage (not effective) so BAO sees what the user
+                # actually is doing, and then BAO's own
+                # ``in_wind_down`` flag picks up the substitution
+                # signal independently.
+                self._v3_update_runtime_state(current_stage=stage)
                 if effective_stage is not stage:
                     logger.info(
                         "  wind-down active: controlling as %s instead of %s",
@@ -797,6 +1551,12 @@ class SmartSleepService:
                 actions = await controller.apply(effective_stage, safe_env)
                 if actions:
                     logger.info("  → %d HA action(s) planned", len(actions))
+
+                # v3.0.0 (task 8.2) — auto-degradation health check.
+                # After the controller tick (which invokes BAO.recommend
+                # via the setpoint provider), inspect error counts on
+                # all v3 modules and disable any that hit the threshold.
+                await self._v3_check_health_and_degrade(controller)
 
                 # Mirror diagnostics back to HA so users see the result on
                 # their Lovelace dashboard.  Failures are swallowed inside
@@ -1108,6 +1868,33 @@ class SmartSleepService:
             # Diagnostic state publisher — populates HA Lovelace entities.
             self.publisher = SleepStatePublisher(ha)
 
+            # ---- v3.0.0 algorithmic moat init（task 8.1）-------------- #
+            # 在 publisher 构造之后、placeholder publish 之前接入 4 个
+            # 新模块，这样首次 ``publish_initial_placeholders`` 就会包含
+            # 14 个 v3 sensor 的 disabled / healthy 占位，避免 Lovelace
+            # 显示「Entity not available」。任一模块加载失败 → 仅 log
+            # INFO，不阻塞主流程（R11.3 graceful degrade）。
+            self._v3_controller_ref = controller
+            try:
+                self._init_v3_modules(controller)
+            except Exception as exc:    # noqa: BLE001
+                # 全套 v3 init 应该自己 catch；最外层兜底防御性 try 防止
+                # 意外的 ImportError 导致整个 add-on 启动失败。
+                logger.info(
+                    "v3 init unexpectedly raised (%s); continuing with "
+                    "v2.1.0 fallback path.",
+                    exc,
+                )
+            # 在 engine 上注册 EMST pre-transition hook（必须在 engine 已
+            # 经构造、且 v3 模块完成 try_load 之后）。
+            try:
+                self._v3_register_pre_transition_hook(engine)
+            except Exception as exc:    # noqa: BLE001
+                logger.info(
+                    "v3 pre-transition hook registration failed (%s); "
+                    "EMST anticipation disabled this run.", exc,
+                )
+
             # v1.9.0 — delay before first publish to let HA core's REST
             # API fully initialise after a restart.  Without this, the
             # first POST /api/states/<entity> can 502 if the add-on
@@ -1246,6 +2033,14 @@ class SmartSleepService:
                     logger.warning(
                         "Some tasks did not finish within 10s shutdown window"
                     )
+                # PR5 task 8.1: drain BAO persist + PreferenceLearner
+                # session-listener fire-and-forget tasks within their own
+                # 10-second budget so they survive across this shutdown
+                # without losing the latest pickle / jsonl write.
+                try:
+                    await self._v3_drain_pending_tasks(timeout=10.0)
+                except Exception as exc:    # noqa: BLE001
+                    logger.warning("v3 task drain failed: %s", exc)
                 self._persist_session(controller, partial=False)
         return 0
 

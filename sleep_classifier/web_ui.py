@@ -33,6 +33,7 @@ Things this server intentionally does NOT do
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import logging
 import os
@@ -113,6 +114,28 @@ _SLOTS: List[Dict[str, Any]] = [
     {"key": "feedback_entity",     "label": "主观评分输入 / Subjective rating",
      "domains": _INPUT_NUMBER_DOMAINS, "multi": False},
 ]
+
+
+# ---------------------------------------------------------------------------
+# v3.0.0 user-profile enums (Task 7.1, R8.2)
+# ---------------------------------------------------------------------------
+#
+# Allowed values for the ``v3_user_profile`` sub-dict written into
+# ``/data/web_ui_overrides.json``.  Empty string is **always** allowed and
+# means "user did not specify"; the consumers (BAO bucket lookup, etc.)
+# treat missing/empty values as ``unspecified`` / ``neutral`` per design
+# §4.3.  The enums must stay in lockstep with the ``Literal`` aliases in
+# ``src/population_prior.py`` (``AgeBand`` / ``Sex`` / ``Chronotype``).
+
+_V3_AGE_BANDS: tuple[str, ...] = ("18-25", "26-35", "36-50", "51-65", "65+")
+_V3_SEXES: tuple[str, ...] = ("M", "F", "unspecified")
+_V3_CHRONOTYPES: tuple[str, ...] = ("morning", "evening", "neutral")
+
+# Subset of the ``sensor.*`` aggregate v3 health entity emitted by
+# ``SleepStatePublisher`` (R11.6, design §3.5).  We surface its state +
+# per-module attributes in the sticky banner that lives on every UI page.
+_V3_HEALTH_SENSOR = "sensor.sleep_classifier_v3_health_summary"
+_V3_HEALTH_MODULES: tuple[str, ...] = ("bao", "cae", "pp", "emst")
 
 
 
@@ -235,6 +258,122 @@ def _normalise(value: Any) -> Any:
     if isinstance(value, list):
         return [v for v in (_normalise(x) for x in value) if v != ""]
     return value
+
+
+# ---------------------------------------------------------------------------
+# v3.0.0 user-profile helpers (Task 7.1)
+# ---------------------------------------------------------------------------
+
+
+def _coerce_enum(value: Any, allowed: tuple[str, ...]) -> str:
+    """Return *value* if it's a valid enum member, otherwise empty string.
+
+    Empty / missing / wrong-type / illegal-value all collapse to ``""``;
+    callers interpret ``""`` as "user did not specify" (R8.2).  We never
+    raise — onboarding tolerates malformed picks rather than 500ing.
+    """
+    if not isinstance(value, str):
+        return ""
+    v = value.strip()
+    return v if v in allowed else ""
+
+
+def _build_v3_user_profile(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Project the wizard POST body into the ``v3_user_profile`` sub-dict.
+
+    Returns ``None`` when the body carries no v3 profile fields at all,
+    so legacy clients (and the Skip button) don't grow an empty
+    sub-dict in ``web_ui_overrides.json``.
+
+    Schema (design §4.3)::
+
+        {
+          "age_band": "26-35" | "",
+          "sex": "F" | "M" | "unspecified" | "",
+          "chronotype": "evening" | ...,
+          "set_at": "ISO-8601 UTC",
+          "prior_weight_lock": null | 0.0,
+        }
+
+    ``prior_weight_lock`` is either ``None`` (no lock) or ``0.0`` (R8.5
+    user-controlled hard kill of the population prior).  The flag is
+    sourced from a checkbox (``prior_weight_lock_zero``) to keep the
+    JSON shape forward-compatible with future intermediate values.
+    """
+    profile_keys = (
+        "age_band", "sex", "chronotype", "prior_weight_lock_zero",
+    )
+    if not any(k in body for k in profile_keys):
+        return None
+
+    age_band = _coerce_enum(body.get("age_band", ""), _V3_AGE_BANDS)
+    sex = _coerce_enum(body.get("sex", ""), _V3_SEXES)
+    chronotype = _coerce_enum(body.get("chronotype", ""), _V3_CHRONOTYPES)
+    lock_flag = bool(body.get("prior_weight_lock_zero", False))
+
+    return {
+        "age_band": age_band,
+        "sex": sex,
+        "chronotype": chronotype,
+        "set_at": _dt.datetime.now(_dt.timezone.utc)
+                  .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "prior_weight_lock": 0.0 if lock_flag else None,
+    }
+
+
+async def _fetch_v3_health_summary() -> Dict[str, Any]:
+    """Return the ``sensor.sleep_classifier_v3_health_summary`` snapshot.
+
+    Output shape::
+
+        {
+          "state": "green" | "amber" | "red" | "unknown",
+          "modules": {"bao": "...", "cae": "...", "pp": "...", "emst": "..."},
+        }
+
+    Module values come from the sensor's per-module attributes (R11.6,
+    design §3.5); each value is one of ``healthy`` / ``degraded`` /
+    ``red`` / ``disabled`` / ``unknown``.  When HA Core is unreachable
+    or the sensor doesn't exist yet, we degrade to ``unknown`` rather
+    than 502 — the banner is informational, not load-bearing.
+    """
+    fallback: Dict[str, Any] = {
+        "state": "unknown",
+        "modules": {m: "unknown" for m in _V3_HEALTH_MODULES},
+    }
+
+    if not _TOKEN:
+        return fallback
+
+    headers = {"Authorization": f"Bearer {_TOKEN}",
+               "Content-Type": "application/json"}
+    timeout = aiohttp.ClientTimeout(total=5)
+    url = f"{_HA_BASE}/api/states/{_V3_HEALTH_SENSOR}"
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as r:
+                if r.status != 200:
+                    logger.debug(
+                        "v3 health summary HTTP %s from %s", r.status, url,
+                    )
+                    return fallback
+                payload = await r.json()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+        logger.debug("v3 health summary fetch failed: %s", exc)
+        return fallback
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "v3 health summary unexpected %s: %s", type(exc).__name__, exc,
+        )
+        return fallback
+
+    state = str(payload.get("state") or "unknown")
+    attrs = payload.get("attributes") or {}
+    modules: Dict[str, str] = {}
+    for m in _V3_HEALTH_MODULES:
+        v = attrs.get(m)
+        modules[m] = str(v) if isinstance(v, str) and v else "unknown"
+    return {"state": state, "modules": modules}
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +591,32 @@ _INDEX_HTML = r"""<!doctype html>
   #status.ok { color: #2e7d32; }
   #status.err { color: #c62828; }
   details { margin-top: 18px; font-size: 13px; color: #666; }
+  .v3-health { position: sticky; top: 0; z-index: 100;
+               background: var(--bg, #fafafa); border: 1px solid #ddd;
+               border-radius: 4px; padding: 6px 12px; margin-bottom: 12px;
+               font-size: 13px; display: flex; gap: 8px;
+               align-items: center; flex-wrap: wrap; }
+  .v3-health .badge { display: inline-flex; align-items: center;
+                      gap: 4px; padding: 2px 8px; border-radius: 10px;
+                      border: 1px solid #ccc; background: var(--bg, #fff); }
+  .v3-health .dot { width: 8px; height: 8px; border-radius: 50%;
+                    background: #bbb; display: inline-block; }
+  .v3-health .dot.green { background: #2e7d32; }
+  .v3-health .dot.amber { background: #ed6c02; }
+  .v3-health .dot.red { background: #c62828; }
+  .v3-health .dot.disabled { background: #9e9e9e; }
+  .v3-health .dot.unknown { background: #bdbdbd; }
 </style>
 </head>
 <body>
+
+<div id="v3-health" class="v3-health" data-state="unknown">
+  <strong>v3 modules:</strong>
+  <span class="badge" data-module="bao"><span class="dot unknown"></span>BAO: <span class="m-state">unknown</span></span>
+  <span class="badge" data-module="cae"><span class="dot unknown"></span>CAE: <span class="m-state">unknown</span></span>
+  <span class="badge" data-module="pp"><span class="dot unknown"></span>PP: <span class="m-state">unknown</span></span>
+  <span class="badge" data-module="emst"><span class="dot unknown"></span>EMST: <span class="m-state">unknown</span></span>
+</div>
 
 <h1>Sleep Classifier — Entity Picker</h1>
 <p class="lead">从 Home Assistant 的实时实体里选,而不是手敲 entity_id。<br>
@@ -577,6 +739,34 @@ document.getElementById('form').addEventListener('submit', async (ev) => {
 
 document.getElementById('reload').addEventListener('click', loadEntities);
 loadEntities();
+
+// v3 health summary banner (Task 7.1, R11.6)
+function _v3StateClass(s) {
+  s = (s || '').toLowerCase();
+  if (s === 'green' || s === 'healthy') return 'green';
+  if (s === 'amber' || s === 'degraded') return 'amber';
+  if (s === 'red') return 'red';
+  if (s === 'disabled') return 'disabled';
+  return 'unknown';
+}
+function _v3Refresh() {
+  fetch('api/v3/health').then(r=>r.json()).then(d => {
+    const banner = document.getElementById('v3-health');
+    if (!banner) return;
+    banner.dataset.state = _v3StateClass(d.state);
+    const mods = d.modules || {};
+    banner.querySelectorAll('.badge').forEach(b => {
+      const m = b.dataset.module;
+      const v = mods[m] || 'unknown';
+      const dot = b.querySelector('.dot');
+      const lbl = b.querySelector('.m-state');
+      if (dot) dot.className = 'dot ' + _v3StateClass(v);
+      if (lbl) lbl.textContent = v;
+    });
+  }).catch(()=>{});
+}
+_v3Refresh();
+setInterval(_v3Refresh, 30000);
 </script>
 </body>
 </html>
@@ -660,6 +850,21 @@ async def api_upgrade_status(_: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# v3 health summary route (Task 7.1, R11.6)
+# ---------------------------------------------------------------------------
+
+
+async def api_v3_health(_: web.Request) -> web.Response:
+    """GET /api/v3/health — drive the sticky health banner.
+
+    Always returns 200; degraded states surface in the JSON body rather
+    than as HTTP errors so the banner JS can keep its layout.  See
+    :func:`_fetch_v3_health_summary` for output shape.
+    """
+    return web.json_response(await _fetch_v3_health_summary())
+
+
+# ---------------------------------------------------------------------------
 # Onboarding wizard routes (Task 6.1)
 # ---------------------------------------------------------------------------
 
@@ -714,6 +919,24 @@ def _onboarding_html(locale: str) -> str:
         "Strongly recommended: keep dry_run=true for at least 7 days.")
     step4_finish = onb.get("step4_finish", "Finish setup")
 
+    # v3.0.0 user-profile labels (Task 7.1).  Translation files may
+    # override; fallbacks below keep the wizard usable when YAML is
+    # missing.
+    profile_title = onb.get("profile_title",
+        "Optional user profile (improves cold-start setpoints)")
+    profile_subtitle = onb.get("profile_subtitle",
+        "All fields are optional. Empty values fall back to 'unspecified'.")
+    profile_age_label = onb.get("profile_age_label", "Age band")
+    profile_sex_label = onb.get("profile_sex_label", "Sex")
+    profile_chrono_label = onb.get("profile_chrono_label", "Chronotype")
+    profile_lock_label = onb.get("profile_lock_label",
+        "Lock prior_weight to 0 (do not blend population data)")
+    profile_lock_hint = onb.get("profile_lock_hint",
+        "When checked, the population prior is fully ignored — even before "
+        "you have 7 nights of personal history.")
+    profile_privacy = onb.get("profile_privacy",
+        "Stored locally in /data/web_ui_overrides.json. Never uploaded.")
+
     return f"""<!doctype html>
 <html lang="{locale}">
 <head>
@@ -735,6 +958,27 @@ def _onboarding_html(locale: str) -> str:
   .telemetry-toggle {{ position: sticky; top: 40px; z-index: 99;
                        background: #f5f5f5; padding: 6px 12px;
                        border-radius: 4px; font-size: 13px; }}
+  .v3-health {{ position: sticky; top: 76px; z-index: 98;
+                background: #fafafa; border: 1px solid #ddd;
+                border-radius: 4px; padding: 6px 12px; font-size: 13px;
+                display: flex; gap: 8px; align-items: center;
+                flex-wrap: wrap; }}
+  .v3-health .badge {{ display: inline-flex; align-items: center;
+                       gap: 4px; padding: 2px 8px; border-radius: 10px;
+                       border: 1px solid #ccc; background: #fff; }}
+  .v3-health .dot {{ width: 8px; height: 8px; border-radius: 50%;
+                     background: #bbb; display: inline-block; }}
+  .v3-health .dot.green {{ background: #2e7d32; }}
+  .v3-health .dot.amber {{ background: #ed6c02; }}
+  .v3-health .dot.red {{ background: #c62828; }}
+  .v3-health .dot.disabled {{ background: #9e9e9e; }}
+  .v3-health .dot.unknown {{ background: #bdbdbd; }}
+  .v3-profile {{ margin: 16px 0; padding: 12px;
+                 border: 1px solid #ddd; border-radius: 6px; }}
+  .v3-profile .group {{ margin-bottom: 10px; }}
+  .v3-profile legend {{ font-weight: 500; padding: 0 6px; }}
+  .v3-profile label {{ margin-right: 12px; font-weight: normal; }}
+  .v3-profile .hint {{ color: #666; font-size: 12px; margin-top: 4px; }}
 </style>
 </head>
 <body>
@@ -744,6 +988,13 @@ def _onboarding_html(locale: str) -> str:
 <div class="telemetry-toggle">
   <label><input type="checkbox" id="telemetry-cb"> Anonymous telemetry</label>
   <a class="privacy-link" href="../PRIVACY.md">Privacy policy</a>
+</div>
+<div id="v3-health" class="v3-health" data-state="unknown">
+  <strong>v3 modules:</strong>
+  <span class="badge" data-module="bao"><span class="dot unknown"></span>BAO: <span class="m-state">unknown</span></span>
+  <span class="badge" data-module="cae"><span class="dot unknown"></span>CAE: <span class="m-state">unknown</span></span>
+  <span class="badge" data-module="pp"><span class="dot unknown"></span>PP: <span class="m-state">unknown</span></span>
+  <span class="badge" data-module="emst"><span class="dot unknown"></span>EMST: <span class="m-state">unknown</span></span>
 </div>
 
 <div id="step1" class="step active">
@@ -768,6 +1019,48 @@ def _onboarding_html(locale: str) -> str:
 <div id="step3" class="step">
   <h2>{step3_title}</h2>
   <p>Select your environment sensors and actuators below.</p>
+
+  <fieldset class="v3-profile">
+    <legend>{profile_title}</legend>
+    <p class="hint">{profile_subtitle}</p>
+
+    <div class="group" id="ageband-group">
+      <strong>{profile_age_label}:</strong>
+      <label><input type="radio" name="age_band" value=""> —</label>
+      <label><input type="radio" name="age_band" value="18-25"> 18-25</label>
+      <label><input type="radio" name="age_band" value="26-35"> 26-35</label>
+      <label><input type="radio" name="age_band" value="36-50"> 36-50</label>
+      <label><input type="radio" name="age_band" value="51-65"> 51-65</label>
+      <label><input type="radio" name="age_band" value="65+"> 65+</label>
+    </div>
+
+    <div class="group" id="sex-group">
+      <strong>{profile_sex_label}:</strong>
+      <label><input type="radio" name="sex" value=""> —</label>
+      <label><input type="radio" name="sex" value="M"> M</label>
+      <label><input type="radio" name="sex" value="F"> F</label>
+      <label><input type="radio" name="sex" value="unspecified"> unspecified</label>
+    </div>
+
+    <div class="group" id="chronotype-group">
+      <strong>{profile_chrono_label}:</strong>
+      <label><input type="radio" name="chronotype" value=""> —</label>
+      <label><input type="radio" name="chronotype" value="morning"> morning</label>
+      <label><input type="radio" name="chronotype" value="evening"> evening</label>
+      <label><input type="radio" name="chronotype" value="neutral"> neutral</label>
+    </div>
+
+    <div class="group">
+      <label>
+        <input type="checkbox" id="prior-lock-cb" name="prior_weight_lock_zero">
+        {profile_lock_label}
+      </label>
+      <p class="hint">{profile_lock_hint}</p>
+    </div>
+
+    <p class="hint">{profile_privacy}</p>
+  </fieldset>
+
   <button onclick="showStep(4)">Next</button>
 </div>
 
@@ -819,6 +1112,15 @@ function skipWizard() {{
 }}
 async function finishWizard(disableDryRun) {{
   const body = {{sleep_stage_source: 'user_selected'}};
+  // v3 user profile (Task 7.1).  Empty string means "unspecified".
+  const ageBand = document.querySelector('input[name="age_band"]:checked');
+  const sex = document.querySelector('input[name="sex"]:checked');
+  const chrono = document.querySelector('input[name="chronotype"]:checked');
+  body.age_band = ageBand ? ageBand.value : '';
+  body.sex = sex ? sex.value : '';
+  body.chronotype = chrono ? chrono.value : '';
+  const lockCb = document.getElementById('prior-lock-cb');
+  body.prior_weight_lock_zero = !!(lockCb && lockCb.checked);
   if (disableDryRun) body.confirm_disable_dry_run = true;
   await fetch('api/onboarding/save', {{
     method: 'POST',
@@ -846,6 +1148,33 @@ document.getElementById('telemetry-cb').addEventListener('change', (ev) => {{
     body: JSON.stringify({{enabled: ev.target.checked}})
   }});
 }});
+// v3 health summary banner (Task 7.1, R11.6)
+function _v3StateClass(s) {{
+  s = (s || '').toLowerCase();
+  if (s === 'green' || s === 'healthy') return 'green';
+  if (s === 'amber' || s === 'degraded') return 'amber';
+  if (s === 'red') return 'red';
+  if (s === 'disabled') return 'disabled';
+  return 'unknown';
+}}
+function _v3Refresh() {{
+  fetch('api/v3/health').then(r=>r.json()).then(d => {{
+    const banner = document.getElementById('v3-health');
+    if (!banner) return;
+    banner.dataset.state = _v3StateClass(d.state);
+    const mods = d.modules || {{}};
+    banner.querySelectorAll('.badge').forEach(b => {{
+      const m = b.dataset.module;
+      const v = mods[m] || 'unknown';
+      const dot = b.querySelector('.dot');
+      const lbl = b.querySelector('.m-state');
+      if (dot) dot.className = 'dot ' + _v3StateClass(v);
+      if (lbl) lbl.textContent = v;
+    }});
+  }}).catch(()=>{{}});
+}}
+_v3Refresh();
+setInterval(_v3Refresh, 30000);
 </script>
 </body>
 </html>"""
@@ -900,6 +1229,16 @@ async def api_onboarding_save(request: web.Request) -> web.Response:
                 "fan_target", "humidifier_target"):
         if key in body:
             data[key] = body[key]
+
+    # v3.0.0 user profile (Task 7.1, R8.2 / R8.5 / R8.7).  Empty/missing
+    # fields collapse to "" and are interpreted downstream as
+    # ``unspecified`` / ``neutral``; the prior_weight_lock checkbox
+    # writes 0.0 (R8.5) or null.  We only mutate the sub-dict when at
+    # least one v3 profile field is present in the body so that pure
+    # v2.x clients (or the Skip path) leave existing v3 settings alone.
+    v3_profile = _build_v3_user_profile(body)
+    if v3_profile is not None:
+        data["v3_user_profile"] = v3_profile
 
     data["onboarding_skipped"] = True
 
@@ -1041,6 +1380,7 @@ def make_app(
     app.router.add_get("/api/telemetry/status", api_telemetry_status)
     app.router.add_post("/api/telemetry/toggle", api_telemetry_toggle)
     app.router.add_get("/api/upgrade/status", api_upgrade_status)
+    app.router.add_get("/api/v3/health", api_v3_health)
     app.router.add_post("/api/dashboard/import", api_dashboard_import)
     return app
 

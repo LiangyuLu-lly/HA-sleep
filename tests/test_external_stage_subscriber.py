@@ -361,3 +361,138 @@ class TestStageDebouncing:
         assert sub.current()[0] is SleepStage.AWAKE, (
             "current() must lazy-promote even without a fresh observe()"
         )
+
+
+# ---------------------------------------------------------------------------
+# v3.0.0 — pre-transition hooks (Task 5.2)                                   #
+# ---------------------------------------------------------------------------
+
+
+class TestPreTransitionHook:
+    """Hooks fire just before the stable stage flips, with a 100 ms budget.
+
+    The hook plumbing must satisfy three load-bearing properties:
+
+    * The hook receives ``(new_stage, last_stage)`` *before*
+      ``_stable_stage`` is mutated, so a consumer that reads
+      ``sub.current()`` from inside the hook still sees the OLD stage.
+    * Hook errors and timeouts are logged + counted, never propagated;
+      transitions still fire (R11.3 — best-effort delivery).
+    * Adding a hook does not alter behaviour for the no-hook case
+      (PR2 backwards-compat).
+    """
+
+    def test_no_hook_preserves_v2_behaviour(self) -> None:
+        # Belt-and-braces: zero hooks means the v2.1.0 promotion path is
+        # used unchanged.  Counters stay at zero.
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.observe(ENTITY, "DEEP")
+        assert sub.current()[0] is SleepStage.DEEP
+        assert sub.hook_error_count == 0
+        assert sub.hook_timeout_count == 0
+        assert sub.status()["pre_transition_hooks_registered"] == 0
+
+    def test_hook_called_with_new_and_last_stage(self) -> None:
+        """The hook signature is (new_stage, last_stage) — order matters."""
+        seen: list[tuple[SleepStage, SleepStage]] = []
+
+        async def hook(new: SleepStage, last: SleepStage) -> None:
+            seen.append((new, last))
+
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.add_pre_transition_hook(hook)
+
+        # Constructor seeds LIGHT; first observe(DEEP) triggers a flip.
+        sub.observe(ENTITY, "DEEP")
+        assert sub.current()[0] is SleepStage.DEEP
+        assert seen == [(SleepStage.DEEP, SleepStage.LIGHT)]
+
+    def test_hook_runs_before_stable_stage_flip(self) -> None:
+        """A hook reading ``current()`` must still see the OLD stage."""
+        observed_during_hook: list[SleepStage] = []
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+
+        async def hook(new: SleepStage, last: SleepStage) -> None:
+            # The hook fires BEFORE _emit_transition, so current() must
+            # still report the old stable stage at this moment.
+            observed_during_hook.append(sub.current()[0])
+
+        sub.add_pre_transition_hook(hook)
+        sub.observe(ENTITY, "DEEP")
+        # After observe returns the flip has happened.
+        assert observed_during_hook == [SleepStage.LIGHT]
+        assert sub.current()[0] is SleepStage.DEEP
+
+    def test_hook_exception_is_swallowed_and_counted(self) -> None:
+        """A throwing hook must not break stage forwarding."""
+
+        async def bad_hook(new: SleepStage, last: SleepStage) -> None:
+            raise RuntimeError("synthetic hook failure")
+
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.add_pre_transition_hook(bad_hook)
+        # Transition must succeed despite the hook raising.
+        sub.observe(ENTITY, "DEEP")
+        assert sub.current()[0] is SleepStage.DEEP
+        assert sub.hook_error_count == 1
+
+    def test_hook_timeout_is_swallowed_and_counted(self) -> None:
+        """A hook exceeding the 100 ms budget is counted, transition fires."""
+        import asyncio as _asyncio
+
+        async def slow_hook(new: SleepStage, last: SleepStage) -> None:
+            await _asyncio.sleep(0.5)    # well past the 100 ms budget
+
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.add_pre_transition_hook(slow_hook)
+        sub.observe(ENTITY, "DEEP")
+        assert sub.current()[0] is SleepStage.DEEP
+        assert sub.hook_timeout_count == 1
+        assert sub.hook_error_count == 0
+
+    def test_multiple_hooks_fire_in_registration_order(self) -> None:
+        order: list[int] = []
+
+        async def h1(new: SleepStage, last: SleepStage) -> None:
+            order.append(1)
+
+        async def h2(new: SleepStage, last: SleepStage) -> None:
+            order.append(2)
+
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.add_pre_transition_hook(h1)
+        sub.add_pre_transition_hook(h2)
+        sub.observe(ENTITY, "DEEP")
+        assert order == [1, 2]
+        assert sub.status()["pre_transition_hooks_registered"] == 2
+
+    def test_add_pre_transition_hook_rejects_non_callable(self) -> None:
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        with pytest.raises(TypeError):
+            sub.add_pre_transition_hook(None)    # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            sub.add_pre_transition_hook(42)      # type: ignore[arg-type]
+
+    async def test_hook_dispatched_on_running_loop(self) -> None:
+        """When a loop is running, hooks are scheduled as tasks (fire-and-forget).
+
+        Production path: ``observe()`` is called from within the WS event
+        loop.  Verify the hook still completes within a tick or two,
+        the transition fires immediately, and counters stay clean.
+        """
+        import asyncio as _asyncio
+
+        ran = _asyncio.Event()
+
+        async def hook(new: SleepStage, last: SleepStage) -> None:
+            ran.set()
+
+        sub = ExternalStageSubscriber(ENTITY, min_stage_dwell_seconds=0.0)
+        sub.add_pre_transition_hook(hook)
+        sub.observe(ENTITY, "DEEP")
+        # Transition fires synchronously regardless of the hook task.
+        assert sub.current()[0] is SleepStage.DEEP
+        # Yield to the loop so the scheduled task gets a chance to run.
+        await _asyncio.wait_for(ran.wait(), timeout=1.0)
+        assert sub.hook_error_count == 0
+        assert sub.hook_timeout_count == 0

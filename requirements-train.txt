@@ -1,0 +1,35 @@
+# 训练 / 评估时依赖 —— 仅开发者机器手动安装。
+#
+# 严格隔离契约（R12.5 / PR4）
+# -----------------------------
+#   * 本文件 **不进** add-on 镜像（``sleep_classifier/Dockerfile``
+#     只 ``pip install -r requirements-runtime.txt``）。
+#   * ``requirements.txt`` **不**通过 ``-r`` 引用本文件，确保 CI
+#     单测环境无须安装这些重量级依赖。
+#   * 这些依赖仅由 ``scripts/train_population_prior.py`` /
+#     ``scripts/train_stage_predictor.py`` / ``scripts/eval_*.py``
+#     在开发者机器上使用，输出 ``population_prior.pickle`` /
+#     ``stage_predictor.onnx`` 等 artifact 后镜像构建期 COPY 到
+#     ``sleep_classifier/rootfs/training_config/``。
+#
+# 安装方式
+# --------
+#   pip install -r requirements-train.txt
+#
+# 注意：``torch`` 仅训练 EMST 时需要，CPU wheel 即可（不需要 GPU
+# 版本）；如带宽紧张可加 ``--index-url
+# https://download.pytorch.org/whl/cpu``。
+
+# EMST：训练 stage_predictor.onnx 的深度模型框架（CPU wheel 即可）
+torch>=2.1.0,<3.0
+# Population Prior：MESA / SHHS CSV 解析 + DataFrame 操作
+pandas>=2.0.0,<3.0
+# EMST：解析 PhysioNet Sleep-EDF 的 .edf 多导睡眠图原始信号
+pyEDFlib>=0.1.30,<0.2
+# EMST：导出 ONNX + INT8 量化（onnxruntime 仅推理，不能导出）
+onnx>=1.15.0,<2.0
+# 评估脚本：matplotlib 绘制 regret / hit-rate 曲线
+# （仅训练 / 评估环境用，不进 runtime 镜像）
+matplotlib>=3.7.0,<4.0
+# Population Prior：从 NSRR 下载 MESA / SHHS PSG 数据集
+nsrr-toolkit>=0.4.0,<1.0

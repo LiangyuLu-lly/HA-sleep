@@ -87,4 +87,30 @@ find "$ROOTFS" -type d -name "__pycache__" -prune -exec rm -rf {} +
 find "$ROOTFS" -type d -name "sleep-edf-telemetry" -prune -exec rm -rf {} +
 find "$ROOTFS" -type f -name "*.pyc" -delete
 
+# v3.0.0 训练产物兜底镜像（R7.5 / R12.1）
+# ---------------------------------------------------------------------------
+# 上面的 ``copy_dir_required training_config`` 已经整树拷贝了 training_config/，
+# 因此 population_prior.pickle / stage_predictor.onnx 若位于源目录顶层，
+# 也会被一并镜像。这里再显式 cp 一次是「腰带 + 背带」式的防御：
+#
+#   * 未来若把 *.pickle / *.onnx 加进 .gitignore（防止开发者误提交大文件），
+#     copy_dir_required 仍能拷贝到工作树里的产物，但显式 cp 让脚本意图更清晰；
+#   * 训练产物可能由 ``scripts/train_population_prior.py`` /
+#     ``scripts/train_stage_predictor.py`` 直接写入 training_config/，缺失
+#     时 ``2>/dev/null || true`` 让 prepare 不被 set -e 中断（构建期校验留给 CI）。
+#
+# 两个产物都是「可选输入」——开发者首次跑 prepare 时往往还没训练，本地 prepare
+# 阶段以 WARN 级别提示即可，不应让构建挂掉。
+mkdir -p "$ROOTFS/training_config"
+cp -f "$REPO_ROOT/training_config/population_prior.pickle" "$ROOTFS/training_config/" 2>/dev/null || true
+cp -f "$REPO_ROOT/training_config/stage_predictor.onnx"   "$ROOTFS/training_config/" 2>/dev/null || true
+
+# 非 strict 模式校验训练产物尺寸 + 嵌入 SHA-256（R7.5 / R12.1）
+# ---------------------------------------------------------------------------
+# 缺失文件以 WARN 级别提示并 exit 0；只有 size / sha256 违规才 exit 1。
+# 这里再叠一层 ``|| true`` 是为了即便检查脚本未来被改成更严格也不影响本地
+# prepare 流程。CI 侧调用 ``scripts/check_artifacts.py --strict`` 把缺失视
+# 为硬失败，那才是发布闸门。
+python "$REPO_ROOT/scripts/check_artifacts.py" || true
+
 echo "[prepare] done"

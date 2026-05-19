@@ -9,7 +9,7 @@
 # Home Assistant -> Settings -> Add-ons -> Add-on Store -> menu -> Repositories.
 # The store then offers this add-on as "Sleep Classifier".
 name: Sleep Classifier
-version: "2.2.2"
+version: "3.0.0"
 slug: sleep_classifier
 # v2.0.3: url field for the Supervisor UI "Project homepage" link.
 url: "https://github.com/LiangyuLu-lly/HA-sleep"
@@ -140,6 +140,19 @@ options:
   telemetry_enabled: false
   upgrade_notifications_enabled: true
 
+  # ---- v3.0.0 algorithmic moat ------------------------------------------
+  # 4 个算法模块的总开关，全部默认开启；任一模块异常 ≥ 3 次会自动停用。
+  bayesian_optimizer_enabled: true
+  causal_attribution_enabled: true
+  population_prior_enabled: true
+  stage_predictor_enabled: true
+  # 默认只展示 top-3 因子；置 true 时 attribution attribute 暴露全部 6 个因子。
+  causal_attribution_explain_all: false
+  # 用户画像（驱动 PopulationPrior 桶查找）；留空均视为 unspecified / neutral。
+  user_profile_age_band: ""        # one of: 18-25 / 26-35 / 36-50 / 51-65 / 65+
+  user_profile_sex: ""             # one of: M / F / unspecified
+  user_profile_chronotype: ""      # one of: morning / evening / neutral
+
 # Schema validates user input in the UI.
 schema:
   area: str?
@@ -200,3 +213,13 @@ schema:
   # v2.1.0 commercial-readiness additions
   telemetry_enabled: "bool?"
   upgrade_notifications_enabled: "bool?"
+
+  # v3.0.0 algorithmic moat -- all keys optional (PR6 兼容旧 v2.1.0 config)
+  bayesian_optimizer_enabled: "bool?"
+  causal_attribution_enabled: "bool?"
+  population_prior_enabled: "bool?"
+  stage_predictor_enabled: "bool?"
+  causal_attribution_explain_all: "bool?"
+  user_profile_age_band: 'match(^$|^""$|^(18-25|26-35|36-50|51-65|65\+)$)?'
+  user_profile_sex: 'match(^$|^""$|^(M|F|unspecified)$)?'
+  user_profile_chronotype: 'match(^$|^""$|^(morning|evening|neutral)$)?'

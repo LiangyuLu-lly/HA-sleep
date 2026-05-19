@@ -449,3 +449,139 @@ class TestTimezoneRobustness:
         # Sanity: the recommended bedtime should be in the evening range.
         hh = int(result["weekday_bedtime"].split(":")[0])
         assert hh >= 20 or hh <= 2, f"Unexpected bedtime hour: {hh}"
+
+
+# ---------------------------------------------------------------------------
+# v3.0.0 — Session listener hook (Task 4.2)
+# ---------------------------------------------------------------------------
+#
+# 这些测试覆盖 Requirements 4.2 / 11.3 关键不变量：
+#   1. listener 在 record_session 持久化成功后被 fire-and-forget 调用
+#   2. listener 抛异常仅 log + 计数，不传播；不影响 record_session 返回
+#   3. 派发的 task 进入 _v3_tasks，可由 pending_listener_tasks() 拿到
+#      用于 PR5 优雅退出
+#   4. 没有运行中事件循环时 record_session 仍可同步调用（向后兼容 v2.x）
+
+
+import asyncio
+
+
+class TestSessionListenerHook:
+    async def test_listener_invoked_after_record_session(self, tmp_path: Path):
+        """注册的 async listener 在 record_session 后被调用。"""
+        cfg = PreferenceConfig(history_path=str(tmp_path / "h.json"))
+        learner = PreferenceLearner(cfg)
+
+        seen: List[SleepSession] = []
+
+        async def listener(session: SleepSession) -> None:
+            seen.append(session)
+
+        learner.add_session_listener(listener)
+        s = _session("a", 80.0)
+        learner.record_session(s)
+
+        # fire-and-forget — drain 所有 pending listener task。
+        await asyncio.gather(*learner.pending_listener_tasks())
+
+        assert len(seen) == 1
+        assert seen[0].session_id == "a"
+
+    async def test_record_session_signature_unchanged(self, tmp_path: Path):
+        """PR2 不变量：record_session 仍返回 None，仍是同步可调用。"""
+        cfg = PreferenceConfig(history_path=str(tmp_path / "h.json"))
+        learner = PreferenceLearner(cfg)
+        # 没有 listener 注册的情况下，record_session 行为完全等价 v2.x。
+        result = learner.record_session(_session("a", 80.0))
+        assert result is None
+        assert learner.pending_listener_tasks() == ()
+
+    async def test_listener_exception_does_not_propagate(self, tmp_path: Path):
+        """Listener 抛异常只 log + 计数，不污染调用栈。"""
+        cfg = PreferenceConfig(history_path=str(tmp_path / "h.json"))
+        learner = PreferenceLearner(cfg)
+
+        async def boom(session: SleepSession) -> None:
+            raise RuntimeError("listener exploded")
+
+        learner.add_session_listener(boom)
+        # record_session 必须正常返回，不冒泡 RuntimeError。
+        learner.record_session(_session("a", 80.0))
+
+        # 等所有 task 跑完，让 _invoke_listener 捕获异常并计数。
+        await asyncio.gather(
+            *learner.pending_listener_tasks(), return_exceptions=True,
+        )
+
+        assert learner.listener_error_count == 1
+
+    async def test_multiple_listeners_isolated(self, tmp_path: Path):
+        """多个 listener 互相隔离：一个失败不阻止其它执行。"""
+        cfg = PreferenceConfig(history_path=str(tmp_path / "h.json"))
+        learner = PreferenceLearner(cfg)
+
+        good_calls: List[str] = []
+
+        async def good(session: SleepSession) -> None:
+            good_calls.append(session.session_id)
+
+        async def bad(session: SleepSession) -> None:
+            raise ValueError("bad listener")
+
+        # 顺序：bad → good，验证 good 仍然被调用。
+        learner.add_session_listener(bad)
+        learner.add_session_listener(good)
+
+        learner.record_session(_session("a", 80.0))
+        await asyncio.gather(
+            *learner.pending_listener_tasks(), return_exceptions=True,
+        )
+
+        assert good_calls == ["a"]
+        assert learner.listener_error_count == 1
+
+    async def test_pending_tasks_registered_for_graceful_shutdown(
+        self, tmp_path: Path,
+    ):
+        """派发的 task 进入 _v3_tasks，可被 PR5 SIGTERM 流程 await。"""
+        cfg = PreferenceConfig(history_path=str(tmp_path / "h.json"))
+        learner = PreferenceLearner(cfg)
+
+        gate = asyncio.Event()
+
+        async def slow(session: SleepSession) -> None:
+            await gate.wait()  # 故意挂住，模拟慢 listener
+
+        learner.add_session_listener(slow)
+        learner.record_session(_session("a", 80.0))
+
+        pending = learner.pending_listener_tasks()
+        assert len(pending) == 1
+        assert not pending[0].done()
+        # 返回值应为 tuple，调用方不能从外部 mutate 内部清单。
+        assert isinstance(pending, tuple)
+
+        # 释放 listener 让 task 完结，避免污染后续测试的 event loop。
+        gate.set()
+        await asyncio.gather(*pending)
+        # done task 在下一次访问时被自动剔除。
+        assert learner.pending_listener_tasks() == ()
+
+    def test_record_session_works_without_running_loop(self, tmp_path: Path):
+        """record_session 从同步上下文调用（无 loop）时不抛异常。"""
+        cfg = PreferenceConfig(history_path=str(tmp_path / "h.json"))
+        learner = PreferenceLearner(cfg)
+
+        called = []
+
+        async def listener(session: SleepSession) -> None:
+            called.append(session.session_id)
+
+        learner.add_session_listener(listener)
+        # 不在 async 测试函数里 → 没有 running loop。
+        # 期望：log + 跳过 listener 派发，不抛 RuntimeError。
+        learner.record_session(_session("sync", 70.0))
+
+        # listener 没有被调度（没有 loop 接住 task）。
+        assert called == []
+        assert learner.pending_listener_tasks() == ()

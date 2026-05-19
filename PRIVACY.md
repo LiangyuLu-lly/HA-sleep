@@ -71,6 +71,42 @@ volume 内，只有本 Add-on 与同主机上的 root 可访问：
 `/share/` 目录可选用于把诊断导出给其它 add-on 使用，默认不写入睡眠原始数据。
 `/config/` 与 `/media/` 默认不被本 Add-on 读写。
 
+## v3.0.0 算法栈数据流
+
+> 适用版本：v3.0.0 起；本节是
+> [Requirement 14.3](.kiro/specs/algorithmic-moat-v3.0.0/requirements.md)
+> 的权威映射，列举 v3.0.0 引入的「4 个算法护城河」模块各处理哪些数据、
+> 写到哪些文件、是否离开本地。**所有问题的答案均为「否」**——4 个模块
+> 全部为纯本地推理 + 纯本地持久化，无任何新出站网络请求。
+
+### 模块逐一披露
+
+| 模块 | 读取的数据 | 写入的文件 | 写入函数 | 是否离开本地 |
+|---|---|---|---|---|
+| **BAO（Bayesian Optimizer，贝叶斯优化器）** | `/data/user_preferences.json` 中的历史 session 观测（环境读数 + 睡眠质量分），最多滚动 60 个（FIFO） | `/data/bao_model.pickle`：GP 后验状态（kernel 超参、观测点坐标、cholesky 分解缓存） | `_io_utils.atomic_write_bytes` | **否**。文件全部留在 add-on 的私有 `/data/` volume；不进入遥测 payload，不上传任何外部服务 |
+| **CAE（Causal Attribution Engine，因果归因引擎）** | session 完成后由主流程注入的 6 维干扰因子（HRV、噪声、光、温度漂移、湿度漂移、体动）+ 当晚睡眠质量分 | `/data/causal_factors.jsonl`：每行一条 `{install_id_hash, ts_hour, factors, effect, ci_low, ci_high, ...}`，FIFO 90 行 | `_io_utils.atomic_append_jsonl` | **否**。`install_id_hash` 字段仅存 `sha256(install_id)` 的前 16 字节十六进制，**永远不存原始 `install_id`**（R14.2 隐私契约）；时间戳精度截断到小时；不进入遥测 payload |
+| **PP（Population Prior，人群先验）** | `training_config/population_prior.pickle`（**只读**，由 prepare 脚本在镜像构建期 COPY 进 add-on，运行时挂载到容器内只读路径） | **不写任何文件**；运行时仅 `Path.read_bytes` + `pickle.loads` + `hashlib.sha256` 校验 | —（永不写） | **否**。pickle 内**只**含按 `(age_band, sex, chronotype, season)` 4 维分桶的聚合标量（均值、方差、`n_samples`），**不含**任何 EDF 波形、annotation、subject ID、时间戳等可还原个体的信息；用户填写的 `age_band / sex / chronotype` 仅写入 `/data/web_ui_overrides.json` 的 `v3_user_profile` 子字段，亦不出本机（与 [`docs/POPULATION_PRIOR.md`](docs/POPULATION_PRIOR.md) §7 一致） |
+| **EMST（End-Model Stage Predictor，端侧 stage 预测）** | `training_config/stage_predictor.onnx`（≤ 80 KB，INT8 量化，**只读**，prepare 脚本镜像进来）+ 运行时来自 HA 的 5 分钟时间窗 (HRV、体动、呼吸率) 三通道时序 | `/data/predictor_audit.jsonl`：每次提前预测的命中审计（预测 stage、实际 stage、置信度、时间戳），按 7 晚滚动 prune | `_io_utils.atomic_append_jsonl` | **否**。ONNX 推理由 `onnxruntime` 的 CPU provider 在本机执行，无任何模型权重 / 中间张量 / 推理输入向外网传输 |
+
+### 出口清单（与 §5 第三方传输总表一致）
+
+v3.0.0 **不新增**任何出站网络请求 ——
+
+- BAO / CAE / PP / EMST 全部为本地推理；没有任何 endpoint 接收它们的中间状态或输出。
+- §5 表中已有的 telemetry endpoint 与 GitHub Releases API 的 payload **不**因 v3.0.0 而扩展字段；遥测 payload 的硬正则自检（§5「强约束」）会拒绝任何包含 entity_id / 因子值 / setpoint 数值 / GP 超参的 payload。
+- 即便用户主动开启 `telemetry_enabled = true`，BAO 的 GP 状态、CAE 的 effect / CI、PP 的桶 key、EMST 的命中率均**不**进入遥测 payload（与 R14.2「不可还原个体」红线一致）。
+
+### 用户的删除路径
+
+与 §4「数据保留期限」一致，用户可随时删除 v3.0.0 新增文件以重置算法栈：
+
+- `rm /data/bao_model.pickle` —— 下次启动 BAO 退化为「无观测」冷启动，仅用 PP 推荐。
+- `rm /data/causal_factors.jsonl` —— CAE 历史归因清零；新一晚 session 后会重新累积。
+- `rm /data/predictor_audit.jsonl` —— EMST 的命中率统计清零，不影响推理本身。
+- 关闭 `population_prior_enabled` —— BAO 立即停用 PP 影响，等价于 v2.x 默认行为。
+
+> 一句话总结：**v3.0.0 算法栈不引入任何新出站网络请求；4 个模块全部本地推理 + 本地持久化。**
+
 ## 4. 数据保留期限
 
 - 默认情况下**无限期保留**：偏好学习希望尽量长的历史以便季节性建模（指数衰减

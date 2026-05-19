@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.data_structures import SleepStage
 from src.device_capabilities import Capability, capabilities_of, is_available
@@ -441,6 +441,24 @@ class SmartEnvironmentController:
         # temperature control".
         self._skipped_by_cap: Dict[str, int] = {}
 
+        # ------------------------------------------------------------ #
+        # v3.0.0 (Task 3.2) — BAO setpoint-provider hook.              #
+        # ------------------------------------------------------------ #
+        # ``set_setpoint_provider(provider)`` injects an optional       #
+        # callable (typically :meth:`BayesianOptimizer.recommend`       #
+        # bound by the orchestrator with the right kwargs) that takes  #
+        # priority over the v2.x learner path inside :meth:`_baseline`. #
+        # When the provider returns ``None`` or raises any exception   #
+        # we fall back to the existing learner-based baseline and bump #
+        # ``_provider_error_count``; the orchestrator inspects this     #
+        # counter to drive the 3-strikes auto-disable state machine    #
+        # (R1.4 / R11.3 / design §2.4 PR1 守护点).                       #
+        # Default ``None`` keeps v2.x behaviour byte-for-byte           #
+        # equivalent when ``bayesian_optimizer_enabled = false``        #
+        # (R11.4 全关回退不变量).                                         #
+        self._setpoint_provider: Optional[Callable[[], Any]] = None
+        self._provider_error_count: int = 0
+
     # ------------------------------------------------------------------ #
     # Target selection                                                   #
     # ------------------------------------------------------------------ #
@@ -451,6 +469,73 @@ class SmartEnvironmentController:
         Bad scores enable exploration in the learner.
         """
         self._recent_quality = float(score)
+
+    # ------------------------------------------------------------------ #
+    # v3.0.0 (Task 3.2) — BAO setpoint-provider hook                     #
+    # ------------------------------------------------------------------ #
+
+    def set_setpoint_provider(
+        self,
+        provider: Optional[Callable[[], Any]],
+    ) -> None:
+        """Inject (or clear) the BAO setpoint provider used by :meth:`_baseline`.
+
+        The orchestrator wires this in
+        :func:`scripts.run_ha_smart_service.run` after constructing
+        :class:`src.bayesian_optimizer.BayesianOptimizer`.  ``provider``
+        is a zero-arg callable — typically a closure that captures the
+        BAO instance plus the runtime kwargs (user_profile, current
+        stage, wind-down flag, locked dimensions, install_id) the
+        orchestrator already knows.  Wrapping the kwargs in a closure
+        keeps this controller's contract independent of the BAO API,
+        so a future v3.1.0 federated optimiser can plug in here without
+        touching ``smart_environment_controller``.
+
+        Decision path inside :meth:`_baseline`:
+
+        1. ``provider is None`` (default, also after explicit clear) ⇒
+           v2.x behaviour: call ``self.learner.recommend(...)``.
+        2. ``provider() is not None`` ⇒ convert the returned object
+           (any duck-typed value with ``temperature_c`` /
+           ``humidity_pct`` / ``brightness_pct`` attributes — e.g.
+           :class:`src.bayesian_optimizer.GPRecommendation` or
+           :class:`EnvironmentParams`) into an
+           :class:`EnvironmentParams` baseline and use it.
+        3. ``provider()`` returns ``None`` **or** raises any exception ⇒
+           fall back to the v2.x learner path **and** bump
+           ``_provider_error_count`` so the orchestrator can drive the
+           3-strikes auto-disable state machine (R11.3).
+
+        Passing ``None`` explicitly clears any previously-set provider
+        without touching the error counter, which is what the
+        orchestrator does when it auto-disables BAO after 3 failures.
+
+        :param provider: Zero-arg callable returning either an
+            :class:`EnvironmentParams`-like object **or** ``None`` on
+            soft failure.  Set to ``None`` to disable (default v2.x
+            behaviour).
+        """
+        # Note: deliberately not validating ``callable(provider)`` —
+        # ``None`` is the sentinel for "disabled" and ``callable()``
+        # would also be True for that.  Test doubles (``MagicMock``,
+        # function stubs) are accepted as-is.
+        self._setpoint_provider = provider
+
+    @property
+    def provider_error_count(self) -> int:
+        """Cumulative count of provider failures observed in :meth:`_baseline`.
+
+        Incremented every time the injected provider returns ``None``
+        OR raises any exception (whichever happens first).  The
+        orchestrator reads this to drive the auto-disable state machine
+        (≥ 3 errors ⇒ clear provider via ``set_setpoint_provider(None)``
+        + publish ``optimizer_health = degraded``; design §2.4).
+
+        Read-only: never reset internally — the orchestrator can either
+        leave it strictly monotonic for diagnostics, or clear by
+        constructing a fresh controller on a full v3 re-init.
+        """
+        return self._provider_error_count
 
     def _should_explore(self) -> bool:
         if self._recent_quality is None:
@@ -465,14 +550,79 @@ class SmartEnvironmentController:
 
         v1.9.0: if ``config.user_temperature_override_c`` is set (from
         an HA input_number), it replaces the learner's temperature_c.
+
+        v3.0.0 (Task 3.2): when a setpoint provider has been injected
+        via :meth:`set_setpoint_provider`, it is consulted **first**.
+        A non-``None`` return value is converted into the baseline
+        (replacing the v2.x learner path); ``None`` or any exception
+        triggers a fallback to the learner path **and** increments
+        :attr:`provider_error_count` for the orchestrator's
+        3-strikes auto-disable state machine.  The
+        ``user_temperature_override_c`` step is always applied last,
+        even on the provider path, so the HA input_number override
+        keeps overriding any source of truth (R11.3 / design §2.4).
         """
-        defaults = _DEFAULT_TARGETS[SleepStage.LIGHT]
-        if self.learner is None:
-            baseline = defaults
-        else:
-            baseline = self.learner.recommend(
-                defaults, explore=self._should_explore(),
-            )
+        baseline: Optional[EnvironmentParams] = None
+
+        # ------------------------------------------------------------ #
+        # v3.0.0 (Task 3.2) — setpoint provider takes priority         #
+        # ------------------------------------------------------------ #
+        if self._setpoint_provider is not None:
+            try:
+                provided = self._setpoint_provider()
+            except Exception:    # noqa: BLE001 — provider must never blow up _baseline
+                # Provider is not trusted; never let it crash the
+                # control loop.  Fall through to the v2.x path and
+                # bump the error counter so the orchestrator can
+                # auto-disable BAO after 3 strikes (R11.3).
+                self._provider_error_count += 1
+                logger.warning(
+                    "Setpoint provider raised; falling back to v2.x "
+                    "learner path (provider_error_count=%d)",
+                    self._provider_error_count,
+                    exc_info=True,
+                )
+                provided = None
+
+            if provided is None:
+                # Soft failure (provider chose to abstain).  Same
+                # fallback path as a hard exception, but no traceback
+                # in the log because it was a graceful abstention.
+                self._provider_error_count += 1
+                logger.debug(
+                    "Setpoint provider returned None; falling back to "
+                    "v2.x learner path (provider_error_count=%d)",
+                    self._provider_error_count,
+                )
+            else:
+                # Duck-type: any object with the four ``EnvironmentParams``
+                # attributes is accepted.  This intentionally covers
+                # both :class:`GPRecommendation` (which has temp / hum /
+                # bright but no fan_speed_pct — we fall back to the
+                # default LIGHT-stage fan target for that field) and
+                # plain :class:`EnvironmentParams`.
+                baseline = EnvironmentParams(
+                    temperature_c=getattr(provided, "temperature_c", None),
+                    humidity_pct=getattr(provided, "humidity_pct", None),
+                    brightness_pct=getattr(provided, "brightness_pct", None),
+                    fan_speed_pct=getattr(
+                        provided, "fan_speed_pct",
+                        _DEFAULT_TARGETS[SleepStage.LIGHT].fan_speed_pct,
+                    ),
+                )
+
+        # ------------------------------------------------------------ #
+        # v2.x fallback — learner-based weighted-median path           #
+        # ------------------------------------------------------------ #
+        if baseline is None:
+            defaults = _DEFAULT_TARGETS[SleepStage.LIGHT]
+            if self.learner is None:
+                baseline = defaults
+            else:
+                baseline = self.learner.recommend(
+                    defaults, explore=self._should_explore(),
+                )
+
         if self.config.user_temperature_override_c is not None:
             baseline = EnvironmentParams(
                 temperature_c=self.config.user_temperature_override_c,
@@ -1182,6 +1332,211 @@ class SmartEnvironmentController:
     # ------------------------------------------------------------------ #
     # Execution                                                          #
     # ------------------------------------------------------------------ #
+
+    # ``dispatch_with_lookahead`` (v3.0.0, task 5.3) — slow-device
+    # category whitelist matching :data:`stage_predictor.StagePredictor.slow_devices_only`
+    # (R10.1).  Lights / fans have ~0 actuator latency so leading them
+    # by 60 s only produces user-visible flicker; we silently skip them.
+    _LOOKAHEAD_SLOW_DEVICE_CLASSES: frozenset[str] = frozenset(
+        {"climate", "humidifier"},
+    )
+
+    async def dispatch_with_lookahead(
+        self,
+        *,
+        stage: SleepStage,
+        lead_seconds: int,
+    ) -> None:
+        """Pre-emptively push slow-device setpoints for a *future* stage.
+
+        This is the SmartEnvironmentController side of the EMST
+        algorithmic-moat path (v3.0.0, R10.1).  When
+        :class:`src.stage_predictor.StagePredictor` predicts a likely
+        LIGHT → DEEP transition with sufficient confidence, it calls
+        this method with ``stage=DEEP, lead_seconds=60`` so the AC,
+        electric blanket (also a ``climate`` entity in HA), or
+        humidifier start moving toward the DEEP setpoint **now** —
+        giving them their full ~15-minute actuator-response window
+        before the user actually transitions.
+
+        Composition (intentionally narrow vs. :meth:`apply`):
+
+        * **Per-actuator target** is computed via the existing
+          :meth:`target_for_actuator`, so the lookahead path inherits
+          the same ``baseline + per-stage delta + safe clamp`` planner
+          as normal anticipation — no new setpoint logic to audit.
+        * **Device-class whitelist** is :attr:`_LOOKAHEAD_SLOW_DEVICE_CLASSES`
+          = ``{"climate", "humidifier"}``, which matches the entity
+          domain used by HA for slow-response actuators
+          (electric blanket / underfloor heating are exposed as
+          ``climate`` per the HA convention; see design §3.4.2).  The
+          fast-response ``light`` / ``fan`` buckets are skipped: they
+          have ~0 ms actuator latency so leading them by 60 s wastes
+          the call and produces visible flicker.
+        * **Capability + liveness gates** are reused unchanged
+          (:meth:`_device_supports`, :meth:`_liveness_guard`).  An AC
+          that doesn't advertise ``SET_TEMPERATURE`` is skipped exactly
+          as in :meth:`plan_actions`.
+        * **Dry-run guard** is the same single ``self.config.dry_run``
+          short-circuit used by :meth:`apply` (PR1 / R11.5 invariant).
+          This method MUST NOT call :meth:`HomeAssistantClient.call_service`
+          on any path when ``dry_run=True``.
+        * **Deadband / futile-retry suppression are intentionally
+          skipped**: this is a forward intent without an
+          ``EnvironmentParams`` reading at the lookahead horizon, so
+          we cannot evaluate "did the device move".  The next regular
+          :meth:`apply` tick (within ``min_seconds_between_actions``
+          of the actual transition) will re-engage the deadband and
+          futility tracking.
+
+        :param stage: The *future* sleep stage whose setpoint we want
+                      the slow devices to reach.  E.g. when the
+                      predictor expects DEEP in 60 s, pass
+                      ``SleepStage.DEEP``.
+        :param lead_seconds: How many seconds early this dispatch
+                             fires.  Informational only in v3.0.0 —
+                             the StagePredictor decides *when* to call;
+                             this method simply dispatches *now* and
+                             writes ``lead_seconds`` into the action
+                             ``reason`` field for the audit trail.
+        """
+        if not self.config.enabled:
+            return
+
+        actions: List[ControlAction] = []
+
+        # Climate actuators — covers AC, heat-pump, electric blanket,
+        # underfloor heating (all exposed as ``climate.*`` in HA).
+        if "climate" in self._LOOKAHEAD_SLOW_DEVICE_CLASSES:
+            climate_target = self.target_for_actuator(stage, "climate")
+            if (
+                climate_target.temperature_c is not None
+                and self.devices.climates
+            ):
+                for c in self.devices.climates:
+                    if not self._device_supports(c, Capability.SET_TEMPERATURE):
+                        continue
+                    if not self._liveness_guard(c):
+                        continue
+                    # Wake the unit first if it's off.  Without a
+                    # current_env reading at the lookahead horizon we
+                    # can't tell heat-vs-cool, so fall back to "auto"
+                    # (the same conservative default
+                    # :meth:`_climate_mode_for_target` returns when
+                    # ambient is unknown).
+                    if self.live_state.is_off(c.entity_id):
+                        actions.append(ControlAction(
+                            domain="climate",
+                            service="set_hvac_mode",
+                            entity_id=c.entity_id,
+                            data={"hvac_mode": "auto"},
+                            reason=(
+                                f"lookahead stage={stage.name} "
+                                f"lead={lead_seconds}s climate is off; "
+                                f"turning on in auto mode before setpoint"
+                            ),
+                        ))
+                        self.live_state.count_auto_turn_on(c.entity_id)
+                    actions.append(ControlAction(
+                        domain="climate",
+                        service="set_temperature",
+                        entity_id=c.entity_id,
+                        data={
+                            "temperature": round(climate_target.temperature_c, 1),
+                        },
+                        reason=(
+                            f"lookahead stage={stage.name} "
+                            f"lead={lead_seconds}s "
+                            f"target={climate_target.temperature_c:.1f}°C"
+                        ),
+                    ))
+
+        # Humidifier actuators — typical 5-min response time so the
+        # 60-s lead is meaningful.
+        if "humidifier" in self._LOOKAHEAD_SLOW_DEVICE_CLASSES:
+            humidifier_target = self.target_for_actuator(stage, "humidifier")
+            if (
+                humidifier_target.humidity_pct is not None
+                and self.devices.humidifiers
+            ):
+                for h in self.devices.humidifiers:
+                    if not self._device_supports(h, Capability.SET_HUMIDITY):
+                        continue
+                    if not self._liveness_guard(h):
+                        continue
+                    if self.live_state.is_off(h.entity_id):
+                        actions.append(ControlAction(
+                            domain="humidifier",
+                            service="turn_on",
+                            entity_id=h.entity_id,
+                            data={},
+                            reason=(
+                                f"lookahead stage={stage.name} "
+                                f"lead={lead_seconds}s humidifier is off; "
+                                f"turning on before setpoint"
+                            ),
+                        ))
+                        self.live_state.count_auto_turn_on(h.entity_id)
+                    actions.append(ControlAction(
+                        domain="humidifier",
+                        service="set_humidity",
+                        entity_id=h.entity_id,
+                        data={
+                            "humidity": int(round(humidifier_target.humidity_pct)),
+                        },
+                        reason=(
+                            f"lookahead stage={stage.name} "
+                            f"lead={lead_seconds}s "
+                            f"target={humidifier_target.humidity_pct:.0f}%"
+                        ),
+                    ))
+
+        if not actions:
+            logger.info(
+                "dispatch_with_lookahead: no slow-device actions for "
+                "stage=%s (lead=%ds) — no eligible climate/humidifier "
+                "actuators bound or all gated by capability/liveness.",
+                stage.name, lead_seconds,
+            )
+            return
+
+        logger.info(
+            "dispatch_with_lookahead: dispatching %d slow-device action(s) "
+            "%ds early for predicted stage=%s",
+            len(actions), lead_seconds, stage.name,
+        )
+
+        # Reuse the same dispatch + dry-run guard structure as
+        # :meth:`apply` — single source of truth for the PR1 invariant.
+        for action in actions:
+            self._actions_log.append(action)
+            if self.config.dry_run:
+                logger.info(
+                    "[dry-run] would call %s  // %s",
+                    action.describe(), action.reason,
+                )
+                continue
+            try:
+                await self.ha.call_service(
+                    action.domain,
+                    action.service,
+                    entity_id=action.entity_id,
+                    **action.data,
+                )
+                self._last_action_ts[action.domain] = time.time()
+                # v1.7.1 — mark this dispatch so the resulting
+                # state_changed echo isn't misclassified as a user
+                # override.
+                self.live_state.record_self_dispatch(action.entity_id)
+                logger.info(
+                    "Executed %s  // %s",
+                    action.describe(), action.reason,
+                )
+            except Exception as exc:    # noqa: BLE001
+                logger.error(
+                    "Service call failed (%s): %s",
+                    action.describe(), exc,
+                )
 
     async def apply(
         self,

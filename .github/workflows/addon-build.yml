@@ -13,6 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Run prepare.sh
         run: |
           chmod +x sleep_classifier/prepare.sh
@@ -20,6 +25,58 @@ jobs:
 
       - name: Verify rootfs is clean (no uncommitted diff)
         run: git diff --exit-code sleep_classifier/rootfs/
+
+      # ------------------------------------------------------------------ #
+      # v3.0.0 训练产物完整性校验（R7.3 / R7.5 / R9.2）
+      # CI 用 --strict：缺文件 → 构建失败；本地 prepare 用非 strict（仅 WARN）
+      # ------------------------------------------------------------------ #
+      - name: Check training artifacts (strict)
+        run: python scripts/check_artifacts.py --strict
+
+      # ------------------------------------------------------------------ #
+      # R12.4 / P11 — 静态扫描：numpy / scipy / onnxruntime 各须在 src/
+      # 至少有一处 import 路径覆盖，否则属于「装了不用」无谓增大镜像。
+      # ------------------------------------------------------------------ #
+      - name: Static import coverage scan (numpy / scipy / onnxruntime)
+        run: |
+          set -euo pipefail
+          missing=()
+          for mod in numpy scipy onnxruntime; do
+            if ! grep -REq "^[[:space:]]*(import[[:space:]]+${mod}([[:space:].]|$)|from[[:space:]]+${mod}([[:space:].]|$))" src/; then
+              missing+=("$mod")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Runtime deps without any import in src/: ${missing[*]}"
+            echo "Either remove them from requirements-runtime.txt or wire them into src/."
+            exit 1
+          fi
+          echo "All v3.0.0 runtime deps have at least one import path in src/."
+
+      # ------------------------------------------------------------------ #
+      # R12.3 / PR4 — musllinux wheel 存在性检查
+      # Add-on 镜像基于 python:3.11-alpine（musl libc），numpy / scipy /
+      # onnxruntime 必须在 PyPI 上有现成 musllinux wheel，否则会触发源码
+      # 编译，镜像体积爆炸。这里用 pip download --only-binary=:all: 模拟
+      # 镜像内 pip install 行为，提前在 CI 拦截。
+      # ------------------------------------------------------------------ #
+      - name: musllinux wheel availability check
+        run: |
+          set -euo pipefail
+          mkdir -p .musllinux-wheels
+          python -m pip install --upgrade pip
+          pip download \
+            --only-binary=:all: \
+            --no-deps \
+            --platform musllinux_1_2_aarch64 \
+            --platform musllinux_1_2_x86_64 \
+            --python-version 3.11 \
+            --implementation cp \
+            --abi cp311 \
+            --dest .musllinux-wheels \
+            -r requirements-runtime.txt
+          echo "musllinux wheels resolved successfully:"
+          ls -la .musllinux-wheels
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -31,6 +88,11 @@ jobs:
             --tag sleep_classifier:test \
             sleep_classifier/
 
+      # ------------------------------------------------------------------ #
+      # R12.3 / PR4 — 镜像体积守护
+      # 基线 80 MB（.github/baseline_image_size.txt），上限 = 基线 × 1.20
+      # ≈ 96 MB；超出即构建失败。
+      # ------------------------------------------------------------------ #
       - name: Image size guard
         run: |
           # Build a single-platform image to measure size locally
@@ -60,9 +122,9 @@ jobs:
             local unit=$(echo "$size_str" | grep -oP '[A-Za-z]+')
             case "$unit" in
               B)  echo "$num" | awk '{printf "%.0f", $1}' ;;
-              kB|KB) echo "$num" | awk '{printf "%.0f", $1 * 1000}' ;;
-              MB) echo "$num" | awk '{printf "%.0f", $1 * 1000000}' ;;
-              GB) echo "$num" | awk '{printf "%.0f", $1 * 1000000000}' ;;
+              kB|KB|K) echo "$num" | awk '{printf "%.0f", $1 * 1000}' ;;
+              MB|M) echo "$num" | awk '{printf "%.0f", $1 * 1000000}' ;;
+              GB|G) echo "$num" | awk '{printf "%.0f", $1 * 1000000000}' ;;
               *)  echo "$num" | awk '{printf "%.0f", $1}' ;;
             esac
           }
@@ -70,13 +132,13 @@ jobs:
           ACTUAL_BYTES=$(parse_size "$ACTUAL_SIZE")
           BASELINE_BYTES=$(parse_size "$BASELINE")
 
-          # Fail if actual > baseline * 1.10
-          THRESHOLD=$(echo "$BASELINE_BYTES" | awk '{printf "%.0f", $1 * 1.10}')
-          echo "Threshold (110%): $THRESHOLD bytes"
+          # Fail if actual > baseline * 1.20 (R12.3 / PR4)
+          THRESHOLD=$(echo "$BASELINE_BYTES" | awk '{printf "%.0f", $1 * 1.20}')
+          echo "Threshold (120%): $THRESHOLD bytes"
           echo "Actual: $ACTUAL_BYTES bytes"
 
           if [ "$ACTUAL_BYTES" -gt "$THRESHOLD" ]; then
-            echo "::error::Image size $ACTUAL_SIZE exceeds 110% of baseline $BASELINE"
+            echo "::error::Image size $ACTUAL_SIZE exceeds 120% of baseline $BASELINE"
             exit 1
           fi
-          echo "Image size within acceptable range."
+          echo "Image size within acceptable range (≤ 120% of baseline)."

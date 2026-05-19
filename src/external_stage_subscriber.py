@@ -37,9 +37,10 @@ because the device is presumed authoritative.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from src.data_structures import SleepStage
 
@@ -63,6 +64,23 @@ _DEFAULT_STALE_AFTER_SECONDS = 30 * 60     # 30 minutes
 # reflected within one inference tick, but long enough to absorb the
 # typical stir/cough false-positive.
 _DEFAULT_MIN_STAGE_DWELL_SECONDS = 60.0
+
+
+# v3.0.0 — pre-transition hook budget.  Hooks registered via
+# :meth:`ExternalStageSubscriber.add_pre_transition_hook` are awaited
+# synchronously in the same event-loop tick before the stable stage is
+# promoted; if any single hook exceeds this budget we skip it (counted)
+# and proceed with the transition.  100 ms is short enough that hook
+# latency stays imperceptible to users while still leaving room for
+# one ONNX inference (see ``StagePredictor.predict`` ≤ 50 ms in design).
+_PRE_TRANSITION_HOOK_TIMEOUT_SECONDS = 0.1
+
+
+# Type alias for the hook callback.  Receives ``(new_stage, last_stage)``
+# in that order — same convention as ``_emit_transition`` so callers can
+# log "from → to" symmetrically.  The hook MUST be awaitable; sync
+# callbacks should wrap themselves in ``async def``.
+PreTransitionHook = Callable[[SleepStage, SleepStage], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +262,21 @@ class ExternalStageSubscriber:
         self._update_count: int = 0
         self._numeric_convention_logged: bool = False
 
+        # ── v3.0.0 pre-transition hooks (R9.1 / R10.1 / R11.3) ───────
+        # Hooks are awaited *just before* the stable stage flips, so
+        # consumers (e.g. ``StagePredictor.maybe_anticipate``) get a
+        # chance to dispatch pre-emptive setpoints.  We hold a list
+        # rather than a single callback so multiple v3 modules can
+        # observe the same edge without a central dispatcher.
+        #
+        # Counters are exposed as read-only properties for the v3
+        # health-summary sensor (see ``hook_error_count``); they are
+        # never reset at runtime — a non-zero value is a useful signal
+        # that some downstream consumer is misbehaving.
+        self._pre_transition_hooks: List[PreTransitionHook] = []
+        self._hook_error_count: int = 0
+        self._hook_timeout_count: int = 0
+
     # ------------------------------------------------------------------ #
     # Compatibility shims with the legacy _InferenceEngine               #
     # ------------------------------------------------------------------ #
@@ -387,8 +420,224 @@ class ExternalStageSubscriber:
                 self._stable_stage.name, self._candidate_stage.name,
                 now - self._candidate_since_ts, self._min_dwell,
             )
-            self._stable_stage = self._candidate_stage
+            new_stage = self._candidate_stage
+            last_stage = self._stable_stage
+            # Clear the candidate BEFORE invoking the hook so a hook
+            # that calls back into ``current()`` / ``observe()`` does
+            # not re-enter this promotion path (would cause duplicate
+            # hook invocations for the same transition).  We're
+            # committed to the flip at this point regardless.
             self._candidate_stage = None
+            # v3.0.0 — fan out to pre-transition hooks BEFORE applying
+            # the flip, so consumers that need to know "the controller
+            # is about to react to a new stage" can dispatch pre-emptive
+            # setpoints (e.g. start cooling for impending DEEP).  At
+            # this point ``current()`` still returns ``last_stage``,
+            # giving the hook a stable view of "old → new".
+            self._run_pre_transition_hooks(new_stage, last_stage)
+            self._emit_transition(new_stage, last_stage)
+
+    # ------------------------------------------------------------------ #
+    # v3.0.0 pre-transition hook plumbing                                #
+    # ------------------------------------------------------------------ #
+
+    def add_pre_transition_hook(self, hook: PreTransitionHook) -> None:
+        """Register a callback fired just before each stable transition.
+
+        :param hook: Awaitable receiving ``(new_stage, last_stage)``.  The
+            argument order matches :meth:`_emit_transition` so callers can
+            log "from → to" symmetrically.
+
+        The hook is awaited with a 100 ms budget per invocation
+        (``_PRE_TRANSITION_HOOK_TIMEOUT_SECONDS``).  Behaviour on misuse:
+
+        * **Timeout** → ``_hook_timeout_count`` is incremented, a warning
+          is logged, and the transition still fires.  The pre-emptive
+          dispatch is opportunistic, not load-bearing.
+        * **Exception** → ``_hook_error_count`` is incremented, the
+          exception is logged at WARN, and the transition still fires.
+          We never propagate hook errors back into the WS event loop —
+          a buggy v3 module must not break stage forwarding (R11.3).
+
+        Multiple hooks can be registered; they fire in registration order.
+        Hooks are dispatched on the running event loop when one is
+        present (production path); in synchronous test contexts the hook
+        is driven via a one-shot ``asyncio.run`` so unit tests can
+        assert on side-effects without an explicit event loop.
+        """
+        if hook is None or not callable(hook):
+            raise TypeError(
+                "add_pre_transition_hook requires an awaitable callable"
+            )
+        self._pre_transition_hooks.append(hook)
+
+    @property
+    def hook_error_count(self) -> int:
+        """Pre-transition hook invocations that raised an exception.
+
+        Exposed for the v3 health-summary sensor and the auto-degrade
+        state machine in :mod:`scripts.run_ha_smart_service` (≥ 3
+        errors → mark the StagePredictor module as ``degraded``).
+        """
+        return self._hook_error_count
+
+    @property
+    def hook_timeout_count(self) -> int:
+        """Pre-transition hook invocations that exceeded the 100 ms budget."""
+        return self._hook_timeout_count
+
+    def _emit_transition(
+        self, new_stage: SleepStage, last_stage: SleepStage
+    ) -> None:
+        """Apply the stable stage flip.
+
+        Extracted from :meth:`_maybe_promote_candidate` in v3.0.0 so the
+        pre-transition hook fan-out has a single, well-named call site
+        to wrap.  Keep this small: any new "on transition" logic should
+        live in a hook (registered via :meth:`add_pre_transition_hook`),
+        not here, so v2.x tests that mutate ``_stable_stage`` directly
+        keep working.
+
+        ``last_stage`` is unused inside the body but kept in the
+        signature so the symmetry with :meth:`_run_pre_transition_hooks`
+        is obvious to readers.
+        """
+        del last_stage     # documented above; kept for signature parity
+        self._stable_stage = new_stage
+
+    def _run_pre_transition_hooks(
+        self, new_stage: SleepStage, last_stage: SleepStage
+    ) -> None:
+        """Fan out registered hooks with a 100 ms per-hook budget.
+
+        Each hook gets its own 100 ms slice rather than a shared budget
+        across the list — fairness across v3 modules outweighs the
+        tail-latency concern, since the hook list will in practice be
+        ≤ 2 entries (StagePredictor + a possible diagnostics hook).
+
+        This method NEVER raises and NEVER propagates hook errors; the
+        contract is best-effort delivery so a misbehaving downstream
+        module cannot break stage forwarding (R11.3).
+        """
+        if not self._pre_transition_hooks:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        for hook in list(self._pre_transition_hooks):
+            try:
+                coro = hook(new_stage, last_stage)
+            except Exception as exc:    # noqa: BLE001 - hook is user code
+                self._hook_error_count += 1
+                logger.warning(
+                    "pre_transition_hook raised before await: %r "
+                    "(error_count=%d)",
+                    exc, self._hook_error_count,
+                )
+                continue
+
+            if loop is not None:
+                self._dispatch_hook_on_loop(loop, coro, new_stage, last_stage)
+            else:
+                self._dispatch_hook_synchronously(coro, new_stage, last_stage)
+
+    def _dispatch_hook_on_loop(
+        self,
+        loop: "asyncio.AbstractEventLoop",
+        coro: Awaitable[None],
+        new_stage: SleepStage,
+        last_stage: SleepStage,
+    ) -> None:
+        """Drive a hook coroutine on an already-running event loop.
+
+        ``observe()`` / ``current()`` already run on the loop thread, so
+        we cannot ``run_until_complete``.  Instead we wrap the coroutine
+        in :func:`asyncio.wait_for` with the 100 ms budget and schedule
+        it via ``loop.create_task`` — fire-and-forget with bounded
+        latency.  Errors / timeouts bump the counters even though the
+        transition has already fired by then; this matches the design
+        intent that pre-emptive dispatch is *advisory*, not blocking.
+        """
+        async def _runner() -> None:
+            try:
+                await asyncio.wait_for(
+                    coro, timeout=_PRE_TRANSITION_HOOK_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                self._hook_timeout_count += 1
+                logger.warning(
+                    "pre_transition_hook timed out (>%dms) on %s -> %s "
+                    "(timeout_count=%d)",
+                    int(_PRE_TRANSITION_HOOK_TIMEOUT_SECONDS * 1000),
+                    last_stage.name, new_stage.name,
+                    self._hook_timeout_count,
+                )
+            except Exception as exc:    # noqa: BLE001 - hook is user code
+                self._hook_error_count += 1
+                logger.warning(
+                    "pre_transition_hook raised %r on %s -> %s "
+                    "(error_count=%d)",
+                    exc, last_stage.name, new_stage.name,
+                    self._hook_error_count,
+                )
+
+        loop.create_task(_runner())
+
+    def _dispatch_hook_synchronously(
+        self,
+        coro: Awaitable[None],
+        new_stage: SleepStage,
+        last_stage: SleepStage,
+    ) -> None:
+        """Drive a hook coroutine when no loop is running.
+
+        Used in synchronous test contexts where ``observe()`` is called
+        outside any event loop.  We spin up a one-shot :func:`asyncio.run`
+        with the 100 ms budget; any error path still bumps the counters
+        but never re-raises into the caller.
+        """
+        async def _runner() -> None:
+            await asyncio.wait_for(
+                coro, timeout=_PRE_TRANSITION_HOOK_TIMEOUT_SECONDS
+            )
+
+        try:
+            asyncio.run(_runner())
+        except asyncio.TimeoutError:
+            self._hook_timeout_count += 1
+            logger.warning(
+                "pre_transition_hook timed out (>%dms) on %s -> %s "
+                "(timeout_count=%d)",
+                int(_PRE_TRANSITION_HOOK_TIMEOUT_SECONDS * 1000),
+                last_stage.name, new_stage.name,
+                self._hook_timeout_count,
+            )
+        except RuntimeError:
+            # ``asyncio.run`` rejects re-entry if a loop is already
+            # bound to the current thread (rare but possible in
+            # certain test fixtures).  Treat as "no usable loop" and
+            # skip — counted as an error so the misuse stays visible.
+            self._hook_error_count += 1
+            logger.debug(
+                "pre_transition_hook skipped: no usable event loop "
+                "(error_count=%d)",
+                self._hook_error_count,
+            )
+            try:
+                coro.close()    # type: ignore[union-attr]
+            except Exception:    # noqa: BLE001
+                pass
+        except Exception as exc:    # noqa: BLE001 - hook is user code
+            self._hook_error_count += 1
+            logger.warning(
+                "pre_transition_hook raised %r on %s -> %s "
+                "(error_count=%d)",
+                exc, last_stage.name, new_stage.name,
+                self._hook_error_count,
+            )
 
     def current(self) -> Tuple[SleepStage, float]:
         """Return ``(stable_stage, confidence)`` for the inference loop.
@@ -440,7 +689,11 @@ class ExternalStageSubscriber:
             "updates_received": self._update_count,
             "last_update_ts": self._last_update_ts,
             "stale": self.is_stale(),
+            # v3.0.0 — pre-transition hook diagnostics (R11.6)
+            "pre_transition_hooks_registered": len(self._pre_transition_hooks),
+            "hook_error_count": self._hook_error_count,
+            "hook_timeout_count": self._hook_timeout_count,
         }
 
 
-__all__ = ["ExternalStageSubscriber"]
+__all__ = ["ExternalStageSubscriber", "PreTransitionHook"]

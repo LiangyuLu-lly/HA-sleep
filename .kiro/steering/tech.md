@@ -8,12 +8,20 @@
 ## 核心依赖
 ### 运行时（`requirements-runtime.txt`，会装入 Add-on 镜像）
 - `aiohttp >= 3.9.0` —— HA REST + WebSocket 客户端 + 内嵌 Web UI server。
+- `numpy >= 1.24, < 2.0` —— BAO 高斯过程后验向量化运算 + CAE bootstrap 95% CI 抽样（v3.0.0 破例引入，详见下文）。
+- `scipy >= 1.10, < 2.0` —— BAO `scipy.linalg.cho_factor` / `cho_solve` 解 cholesky 分解后的线性系统（v3.0.0 破例引入，详见下文）。
+- `onnxruntime >= 1.16, < 2.0` —— EMST 端侧 INT8 量化 `stage_predictor.onnx` 推理，仅启用 CPU provider（v3.0.0 破例引入，详见下文）。
 
-> v1.6.0 之后 `src/` 与 `scripts/` 已不再 `import numpy`：
-> 加权中位数、指数衰减、睡眠债推算都用纯 Python（`math.exp`
-> + 手写循环）实现，因此 numpy 已从运行时依赖中移除，镜像
-> 再瘦约 5 MB。未来若要向量化，请先用 `grep -R "numpy" src/`
-> 确认并同步加回 `requirements-runtime.txt`。
+### v3.0.0 破例理由（Algorithmic Moat）
+v1.6.0 至 v2.1.0 期间 `src/` 与 `scripts/` 全程不 `import numpy`，加权中位数、指数衰减、睡眠债推算都用纯 Python（`math.exp` + 手写循环）实现，镜像因此长期保持在 ~15 MB。v3.0.0 引入「4 个算法护城河」中的 3 个本地推理模块（BAO / CAE / EMST），无法在合理代码量下用纯 Python 完成 GP 后验、bootstrap 重采样与 ONNX 推理，故有针对性地重新拉回科学计算栈。每个新依赖的算法归属如下：
+
+- **numpy** —— BAO 高斯过程后验的向量化运算（RBF kernel 矩阵、Thompson Sampling 抽样），同时被 CAE 用于 bootstrap 95% CI 抽样。
+- **scipy** —— BAO 用 `scipy.linalg.cho_factor` / `cho_solve` 解 cholesky 分解后的线性系统，避免直接对 kernel 矩阵做数值不稳定的求逆。
+- **onnxruntime** —— EMST 端侧 INT8 量化 `stage_predictor.onnx` 推理；仅启用 CPU provider，不引入 GPU / TensorRT 等额外依赖以控制镜像体积。
+
+镜像体积基线随之从 ~15 MB 提升到 ~80 MB（见 `.github/baseline_image_size.txt`），CI 守护上限 96 MB（基线 ×1.20，PR4）；超出即构建失败。CI 还会做静态扫描，确保 `numpy` / `scipy` / `onnxruntime` 在 `src/` 内**至少有一处** `import` 路径覆盖（防止「装了不用」造成无谓体积膨胀，R12.4 / Property 11）。版本范围全部固定大版本，避免破坏性升级（R12.1）。
+
+> 反向不变量：BAO / CAE / EMST 任一模块的 feature flag 关闭时，主流程**不 import** 对应模块（lazy import in `if flag:`），保证 4 个 flag 全 false 时字节级等价回退到 v2.1.0 行为；但运行时镜像体积仍按 ~80 MB 计（依赖装在镜像里）。
 
 ### 开发 / 测试（`requirements.txt`）
 - `pytest >= 7.4.0`
@@ -25,9 +33,9 @@
 > 因此 hypothesis **不在**开发依赖中。
 
 ### 明确不再使用
-- **不用 TensorFlow / Keras / PyTorch**（v1.3.0 删除了本地模型）。
+- **不用 TensorFlow / Keras / PyTorch**（v1.3.0 删除了本地模型；v3.0.0 的 `stage_predictor.onnx` 由开发者机器训练 + 离线导出 ONNX，**不**在 add-on 内做训练）。
 - **不用 MQTT / paho-mqtt**（走 HA REST + WS API）。
-- **不用 scipy / h5py / PyWavelets / numpy**。
+- **不用 h5py / PyWavelets**（CNN-BiLSTM 时代的 PSG 特征提取依赖，v1.3.0 起已无引用）。
 
 ## 架构总览
 ```

@@ -24,7 +24,10 @@ sort together and clearly attribute themselves to this add-on.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.data_structures import SleepStage
@@ -231,6 +234,122 @@ _STATIC_ATTRS_QUALITY_ONSET = {
 }
 
 
+# ---------------------------------------------------------------------------
+# v3.0.0 — algorithmic moat sensors（PR2 兼容契约：仅追加，绝不修改既有
+# entity_id）。表与 ``.kiro/specs/algorithmic-moat-v3.0.0/design.md`` §3.5
+# 逐字对齐；任一新模块停用时仍然发布对应 sensor 但 state = ``"disabled"``，
+# 保证 Lovelace 一致渲染（design §3.5 / §6.3）。
+# ---------------------------------------------------------------------------
+ENTITY_OPTIMIZER_HEALTH = "sensor.sleep_classifier_optimizer_health"
+ENTITY_OPTIMIZER_STATUS = "sensor.sleep_classifier_optimizer_status"
+ENTITY_OPTIMIZER_UNCERTAINTY = "sensor.sleep_classifier_optimizer_uncertainty"
+ENTITY_DECISION_MODE = "sensor.sleep_classifier_decision_mode"
+ENTITY_LOCKED_DIMENSIONS = "sensor.sleep_classifier_locked_dimensions"
+ENTITY_QUALITY_TREND_14D = "sensor.sleep_classifier_quality_trend_14d"
+ENTITY_ATTRIBUTION = "sensor.sleep_classifier_attribution"
+ENTITY_ATTRIBUTION_FULL = "sensor.sleep_classifier_attribution_full"
+ENTITY_PRIOR_STATUS = "sensor.sleep_classifier_prior_status"
+ENTITY_PRIOR_WEIGHT = "sensor.sleep_classifier_prior_weight"
+ENTITY_PREDICTOR_HEALTH = "sensor.sleep_classifier_predictor_health"
+ENTITY_PREDICTOR_STATUS = "sensor.sleep_classifier_predictor_status"
+ENTITY_PREDICTOR_HIT_RATE_7D = "sensor.sleep_classifier_predictor_hit_rate_7d"
+ENTITY_V3_HEALTH_SUMMARY = "sensor.sleep_classifier_v3_health_summary"
+
+# HA Core ``state`` 字段长度上限（design §3.5 契约）。超长内容仅放 attribute。
+_HA_STATE_MAX_LEN = 255
+
+_STATIC_ATTRS_OPTIMIZER_HEALTH = {
+    "friendly_name": "Optimizer health (BAO)",
+    "icon": "mdi:heart-pulse",
+    "device_class": "enum",
+    "options": ["healthy", "degraded", "disabled"],
+}
+_STATIC_ATTRS_OPTIMIZER_STATUS = {
+    "friendly_name": "Optimizer status (BAO)",
+    "icon": "mdi:trending-up",
+    "device_class": "enum",
+    # ``disabled`` 加进 options 是为了保持模块停用时也能在 Lovelace 上以
+    # enum chip 形式渲染，与 design §3.5 「state = disabled」契约一致。
+    "options": ["learning", "converging", "converged", "disabled"],
+}
+_STATIC_ATTRS_OPTIMIZER_UNCERTAINTY = {
+    "friendly_name": "Optimizer posterior σ_T (°C)",
+    "icon": "mdi:gauge-low",
+    "unit_of_measurement": "°C",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_DECISION_MODE = {
+    "friendly_name": "BAO decision mode",
+    "icon": "mdi:robot-confused",
+    "device_class": "enum",
+    "options": [
+        "exploit", "explore-temp", "explore-humidity",
+        "explore-brightness", "prior-only", "disabled",
+    ],
+}
+_STATIC_ATTRS_LOCKED_DIMENSIONS = {
+    "friendly_name": "BAO locked dimensions",
+    "icon": "mdi:lock",
+}
+_STATIC_ATTRS_QUALITY_TREND_14D = {
+    "friendly_name": "Quality trend (14-night slope)",
+    "icon": "mdi:chart-line",
+    "unit_of_measurement": "score/d",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_ATTRIBUTION = {
+    "friendly_name": "Causal attribution",
+    "icon": "mdi:lightbulb-on-outline",
+    # ``disabled`` 加进 options 是为了 design §3.5 「state = disabled」契约。
+    "device_class": "enum",
+    "options": [
+        "ok", "nominal", "insufficient_data", "timeout", "disabled",
+    ],
+}
+_STATIC_ATTRS_ATTRIBUTION_FULL = {
+    "friendly_name": "Causal attribution (full effects)",
+    "icon": "mdi:graph-outline",
+    "device_class": "enum",
+    "options": ["ok", "disabled"],
+}
+_STATIC_ATTRS_PRIOR_STATUS = {
+    "friendly_name": "Population prior status",
+    "icon": "mdi:database-check",
+    "device_class": "enum",
+    "options": ["loaded", "fallback", "unavailable", "disabled"],
+}
+_STATIC_ATTRS_PRIOR_WEIGHT = {
+    "friendly_name": "Prior weight α",
+    "icon": "mdi:weight",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_PREDICTOR_HEALTH = {
+    "friendly_name": "Predictor health (EMST)",
+    "icon": "mdi:heart-pulse",
+    "device_class": "enum",
+    "options": ["healthy", "degraded", "disabled"],
+}
+_STATIC_ATTRS_PREDICTOR_STATUS = {
+    "friendly_name": "Predictor status (EMST)",
+    "icon": "mdi:radar",
+    "device_class": "enum",
+    "options": ["active", "auto_disabled", "disabled"],
+}
+_STATIC_ATTRS_PREDICTOR_HIT_RATE_7D = {
+    "friendly_name": "Predictor 7-day hit rate",
+    "icon": "mdi:target",
+    "unit_of_measurement": "%",
+    "state_class": "measurement",
+}
+_STATIC_ATTRS_V3_HEALTH_SUMMARY = {
+    "friendly_name": "v3 algorithmic moat health",
+    "icon": "mdi:shield-check",
+    "device_class": "enum",
+    # ``disabled`` 表示 4 个 flag 全部关闭（v2.1.0 等价模式，design §6.3）。
+    "options": ["green", "amber", "red", "disabled"],
+}
+
+
 @dataclass
 class PublisherStats:
     """Bookkeeping so we don't spam HA with redundant POSTs."""
@@ -259,6 +378,15 @@ class SleepStatePublisher:
         self._ha = ha_client
         self._deadband = float(confidence_deadband)
         self.stats = PublisherStats()
+        # v3.0.0 — 4 个算法护城河模块的引用；编排层（Task 8.1）通过
+        # :meth:`set_v3_modules` 注入。停用 / 未注入时 ``_publish_v3_sensors``
+        # 仍会发布对应 sensor，但 state = ``"disabled"``，保证 Lovelace 渲染
+        # 一致（design §3.5 / §6.3）。
+        self._v3_modules_loaded: bool = False
+        self._v3_bao: Any = None
+        self._v3_cae_engine: Any = None
+        self._v3_prior_repo: Any = None
+        self._v3_predictor: Any = None
 
     async def publish_stage(
         self,
@@ -807,6 +935,747 @@ class SleepStatePublisher:
         await self._safe_update(
             ENTITY_QUALITY_ONSET, 0, _STATIC_ATTRS_QUALITY_ONSET,
         )
+
+        # v3.0.0 — boot-time seeding of the 14 algorithmic-moat sensors.
+        # 仅当编排层（Task 8.1）已经调用 ``set_v3_modules`` 注入引用之后
+        # 才发布 v3 sensor。4 个 flag 全关时主入口**不**调用
+        # ``set_v3_modules``，``_v3_modules_loaded`` 保持 ``False``，本方法
+        # 退回到 v2.1.0 行为（仅写 20 个旧 sensor），保证 R11.4 字节级等价
+        # 回退；任一 flag 开启时编排层会先注入 ``set_v3_modules`` 再调用本
+        # 方法，14 个 v3 sensor 此时按 design §3.5 / §6.3 一并发布（停用
+        # 模块对应 sensor 仍写 ``state = "disabled"``，PR2 兼容契约：既有
+        # 20 个 sensor 的 entity_id + attribute schema 逐字保留）。
+        if self._v3_modules_loaded:
+            await self._publish_v3_sensors()
+
+    # ------------------------------------------------------------------ #
+    # v3.0.0 — algorithmic moat sensors                                   #
+    # ------------------------------------------------------------------ #
+
+    def set_v3_modules(
+        self,
+        *,
+        bao: Any = None,
+        cae_engine: Any = None,
+        prior_repo: Any = None,
+        predictor: Any = None,
+    ) -> None:
+        """Register references to the 4 v3 algorithmic moat modules.
+
+        Called once by the orchestrator (Task 8.1) after each module
+        finishes ``load_or_init`` / ``try_load`` / ``__init__``.  Any
+        argument may be :data:`None` — the corresponding sensor will
+        still be published with ``state = "disabled"`` so Lovelace
+        cards render consistently regardless of which feature flags
+        are turned off (design §3.5 / §6.3).
+
+        Calling this method flips :attr:`_v3_modules_loaded` to
+        ``True`` so the orchestrator can guard the publish call with
+        ``if publisher.v3_modules_loaded`` (PR2: existing 20-sensor
+        publish path is unchanged).
+        """
+        self._v3_bao = bao
+        self._v3_cae_engine = cae_engine
+        self._v3_prior_repo = prior_repo
+        self._v3_predictor = predictor
+        self._v3_modules_loaded = True
+
+    @property
+    def v3_modules_loaded(self) -> bool:
+        """Return ``True`` once :meth:`set_v3_modules` has been called."""
+        return self._v3_modules_loaded
+
+    async def _publish_v3_sensors(
+        self,
+        *,
+        bao: Any = None,
+        cae_engine: Any = None,
+        prior_repo: Any = None,
+        predictor: Any = None,
+        attribution_result: Any = None,
+        quality_trend: Optional[Dict[str, Any]] = None,
+        locked_dimensions: Optional[Dict[str, Any]] = None,
+        last_recommendation: Any = None,
+        decision_mode: Optional[str] = None,
+        prior_weight: Optional[float] = None,
+        prior_weight_locked: bool = False,
+        bucket_key: Optional[str] = None,
+        fallback_level: Optional[int] = None,
+        bucket_n_samples: Optional[int] = None,
+        optimizer_streak_days: Optional[int] = None,
+        optimizer_status_label: Optional[str] = None,
+    ) -> None:
+        """Publish the 14 v3 algorithmic-moat sensors (design §3.5).
+
+        Any module argument may be :data:`None` (or absent on the
+        registered :attr:`_v3_*` attributes); the corresponding sensor
+        is still published with ``state = "disabled"`` so Lovelace
+        renders the chip consistently in every flag combination
+        (design §3.5 / §6.3).
+
+        :param bao: Optional :class:`BayesianOptimizer` reference.
+            Falls back to :attr:`_v3_bao` registered via
+            :meth:`set_v3_modules`.
+        :param cae_engine: Optional :class:`CausalAttributionEngine`.
+        :param prior_repo: Optional :class:`PopulationPriorRepository`.
+        :param predictor: Optional :class:`StagePredictor`.
+        :param attribution_result: Optional latest
+            :class:`AttributionResult` from CAE; when ``None`` the
+            attribution sensors fall back to a benign ``"nominal"``
+            state (CAE healthy, just no fresh result yet).
+        :param quality_trend: Optional ``{"slope_score_per_day": float,
+            "window_nights": int, "n_observations": int}`` payload
+            produced by the orchestrator's 24-h trend job.
+        :param locked_dimensions: Optional
+            ``{"dimensions": list[str], "expires_at_iso": str}``;
+            corresponds to user-pinned axes (R2.5).
+        :param last_recommendation: Optional
+            :class:`GPRecommendation` whose ``mode`` /
+            ``posterior_std`` / ``prior_weight`` populate the BAO
+            decision-mode + uncertainty + prior-weight sensors.
+        :param decision_mode: Optional override for
+            ``sensor.sleep_classifier_decision_mode``; falls back to
+            ``last_recommendation.mode`` when absent.
+        :param prior_weight: Optional explicit prior-weight value
+            (0..1).  Falls back to ``last_recommendation.prior_weight``
+            and finally to :data:`None` → state = ``"unknown"``.
+        :param prior_weight_locked: ``True`` when the user has pinned
+            the prior weight via Web UI (R8.5).
+        :param bucket_key: Optional pre-formatted bucket key string
+            for ``sensor.sleep_classifier_prior_status`` attributes.
+        :param fallback_level: Optional ``int`` (0..3) returned by
+            :meth:`PopulationPriorRepository.lookup`.
+        :param bucket_n_samples: Optional bucket sample count.
+        :param optimizer_streak_days: Optional consecutive-night
+            count where the slope ≥ +0.5 score/day (R3.2).
+        :param optimizer_status_label: Optional explicit value for
+            ``sensor.sleep_classifier_optimizer_status``; falls back
+            to ``"learning"`` when not supplied (avoids tripping the
+            converging / converged latch from sensor publishes alone).
+        """
+        # 优先用入参；缺省时回退 ``set_v3_modules`` 注册的实例引用，保证
+        # 编排层既可以一次注入然后省略入参，也可以按需在每次 publish 调用
+        # 现传当晚最新的 ``AttributionResult`` / ``GPRecommendation``。
+        bao = bao if bao is not None else self._v3_bao
+        cae_engine = (
+            cae_engine if cae_engine is not None else self._v3_cae_engine
+        )
+        prior_repo = (
+            prior_repo if prior_repo is not None else self._v3_prior_repo
+        )
+        predictor = (
+            predictor if predictor is not None else self._v3_predictor
+        )
+
+        await self._publish_v3_bao_sensors(
+            bao=bao,
+            last_recommendation=last_recommendation,
+            decision_mode=decision_mode,
+            prior_weight=prior_weight,
+            prior_weight_locked=prior_weight_locked,
+            quality_trend=quality_trend,
+            locked_dimensions=locked_dimensions,
+            optimizer_streak_days=optimizer_streak_days,
+            optimizer_status_label=optimizer_status_label,
+        )
+        await self._publish_v3_cae_sensors(
+            cae_engine=cae_engine,
+            attribution_result=attribution_result,
+        )
+        await self._publish_v3_prior_sensors(
+            prior_repo=prior_repo,
+            bucket_key=bucket_key,
+            fallback_level=fallback_level,
+            bucket_n_samples=bucket_n_samples,
+        )
+        await self._publish_v3_predictor_sensors(predictor=predictor)
+        await self._publish_v3_health_summary(
+            bao=bao,
+            cae_engine=cae_engine,
+            prior_repo=prior_repo,
+            predictor=predictor,
+        )
+
+    # -- BAO sensors ---------------------------------------------------- #
+
+    async def _publish_v3_bao_sensors(
+        self,
+        *,
+        bao: Any,
+        last_recommendation: Any,
+        decision_mode: Optional[str],
+        prior_weight: Optional[float],
+        prior_weight_locked: bool,
+        quality_trend: Optional[Dict[str, Any]],
+        locked_dimensions: Optional[Dict[str, Any]],
+        optimizer_streak_days: Optional[int],
+        optimizer_status_label: Optional[str],
+    ) -> None:
+        """Publish the 6 BAO-flavoured sensors (optimizer_* + decision_mode +
+        locked_dimensions + quality_trend_14d + prior_weight)."""
+        # ---- optimizer_health -----------------------------------------
+        attrs = dict(_STATIC_ATTRS_OPTIMIZER_HEALTH)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_OPTIMIZER_HEALTH, "disabled", attrs,
+            )
+        else:
+            error_count = int(getattr(bao, "error_count", 0) or 0)
+            attrs["error_count"] = error_count
+            last_error = getattr(bao, "last_error", None)
+            if last_error:
+                attrs["last_error"] = str(last_error)[:_HA_STATE_MAX_LEN]
+            health = "degraded" if error_count >= 3 else "healthy"
+            await self._safe_update(ENTITY_OPTIMIZER_HEALTH, health, attrs)
+
+        # ---- optimizer_status -----------------------------------------
+        attrs = dict(_STATIC_ATTRS_OPTIMIZER_STATUS)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_OPTIMIZER_STATUS, "disabled", attrs,
+            )
+        else:
+            # 默认保持 ``learning``；converging / converged 由编排层维护
+            # 7/14 晚 streak 后通过 ``optimizer_status_label`` 显式传入
+            # （R3.2，避免在 sensor 内部维护重复的 streak 状态机）。
+            status = optimizer_status_label or "learning"
+            if status not in ("learning", "converging", "converged"):
+                status = "learning"
+            if optimizer_streak_days is not None:
+                attrs["streak_days"] = int(optimizer_streak_days)
+            if quality_trend is not None:
+                slope = quality_trend.get("slope_score_per_day")
+                if slope is not None:
+                    attrs["slope_score_per_day"] = round(float(slope), 3)
+            await self._safe_update(ENTITY_OPTIMIZER_STATUS, status, attrs)
+
+        # ---- optimizer_uncertainty ------------------------------------
+        attrs = dict(_STATIC_ATTRS_OPTIMIZER_UNCERTAINTY)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_OPTIMIZER_UNCERTAINTY, "disabled", attrs,
+            )
+        else:
+            sigmas = self._extract_posterior_std(bao, last_recommendation)
+            if sigmas is None:
+                # GP 还没准备好（N<5 / cholesky 失败） — 状态退化但保留
+                # 既有 enum schema 不变（PR2）。
+                await self._safe_update(
+                    ENTITY_OPTIMIZER_UNCERTAINTY, "unknown", attrs,
+                )
+            else:
+                sigma_t, sigma_h, sigma_l = sigmas
+                attrs["sigma_temp_c"] = round(float(sigma_t), 3)
+                attrs["sigma_humidity_pct"] = round(float(sigma_h), 3)
+                attrs["sigma_brightness_pct"] = round(float(sigma_l), 3)
+                # state 仅放 σ_T（温度维度，℃），其余两维通过 attribute
+                # 暴露，state 长度 ≤ 255 字符（design §3.5 契约）。
+                await self._safe_update(
+                    ENTITY_OPTIMIZER_UNCERTAINTY,
+                    round(float(sigma_t), 3),
+                    attrs,
+                )
+
+        # ---- decision_mode --------------------------------------------
+        attrs = dict(_STATIC_ATTRS_DECISION_MODE)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_DECISION_MODE, "disabled", attrs,
+            )
+        else:
+            mode = decision_mode
+            if mode is None and last_recommendation is not None:
+                mode = getattr(last_recommendation, "mode", None)
+            mode_str = str(mode) if mode else "prior-only"
+            # 输入卫生：未知 mode 退回到 ``prior-only`` 而不是污染 enum。
+            allowed = {
+                "exploit", "explore-temp", "explore-humidity",
+                "explore-brightness", "prior-only",
+            }
+            if mode_str not in allowed:
+                mode_str = "prior-only"
+            effective_pw = self._resolve_prior_weight(
+                bao=bao,
+                explicit=prior_weight,
+                rec=last_recommendation,
+            )
+            if effective_pw is not None:
+                attrs["prior_weight"] = round(float(effective_pw), 4)
+            exploration_rate = getattr(
+                bao, "_exploration_rate", None,
+            )
+            if exploration_rate is None:
+                exploration_rate = getattr(bao, "exploration_rate", None)
+            if exploration_rate is not None:
+                attrs["exploration_rate_effective"] = round(
+                    float(exploration_rate), 4,
+                )
+            await self._safe_update(ENTITY_DECISION_MODE, mode_str, attrs)
+
+        # ---- locked_dimensions ----------------------------------------
+        attrs = dict(_STATIC_ATTRS_LOCKED_DIMENSIONS)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_LOCKED_DIMENSIONS, "disabled", attrs,
+            )
+        else:
+            dims: List[str] = []
+            expires_iso: Optional[str] = None
+            if locked_dimensions is not None:
+                raw_dims = locked_dimensions.get("dimensions") or []
+                dims = [str(d) for d in raw_dims if d]
+                expires_iso = locked_dimensions.get("expires_at_iso")
+            state = ",".join(dims) if dims else "none"
+            # state 上限 255 字符；超长情况下仅写 ``locked`` 占位符，
+            # 完整列表已经在 attribute 中暴露（design §3.5 契约）。
+            if len(state) > _HA_STATE_MAX_LEN:
+                state = "locked"
+            attrs["dimensions"] = dims
+            if expires_iso:
+                attrs["expires_at_iso"] = str(expires_iso)[:_HA_STATE_MAX_LEN]
+            await self._safe_update(ENTITY_LOCKED_DIMENSIONS, state, attrs)
+
+        # ---- quality_trend_14d ----------------------------------------
+        attrs = dict(_STATIC_ATTRS_QUALITY_TREND_14D)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_QUALITY_TREND_14D, "disabled", attrs,
+            )
+        else:
+            slope: Optional[float] = None
+            if quality_trend is not None:
+                raw_slope = quality_trend.get("slope_score_per_day")
+                if raw_slope is not None:
+                    try:
+                        slope = float(raw_slope)
+                    except (TypeError, ValueError):
+                        slope = None
+                window = quality_trend.get("window_nights")
+                if window is not None:
+                    attrs["window_nights"] = int(window)
+                n_obs = quality_trend.get("n_observations")
+                if n_obs is not None:
+                    attrs["n_observations"] = int(n_obs)
+            if slope is None or not math.isfinite(slope):
+                await self._safe_update(
+                    ENTITY_QUALITY_TREND_14D, "unknown", attrs,
+                )
+            else:
+                await self._safe_update(
+                    ENTITY_QUALITY_TREND_14D, round(slope, 3), attrs,
+                )
+
+        # ---- prior_weight ---------------------------------------------
+        attrs = dict(_STATIC_ATTRS_PRIOR_WEIGHT)
+        if bao is None:
+            await self._safe_update(
+                ENTITY_PRIOR_WEIGHT, "disabled", attrs,
+            )
+        else:
+            effective_pw = self._resolve_prior_weight(
+                bao=bao,
+                explicit=prior_weight,
+                rec=last_recommendation,
+            )
+            attrs["manually_locked"] = bool(prior_weight_locked)
+            if effective_pw is None or not math.isfinite(effective_pw):
+                await self._safe_update(
+                    ENTITY_PRIOR_WEIGHT, "unknown", attrs,
+                )
+            else:
+                # 裁剪到 [0, 1] — design §3.2.3 契约。
+                clipped = max(0.0, min(1.0, float(effective_pw)))
+                await self._safe_update(
+                    ENTITY_PRIOR_WEIGHT, round(clipped, 4), attrs,
+                )
+
+    # -- CAE sensors ---------------------------------------------------- #
+
+    async def _publish_v3_cae_sensors(
+        self,
+        *,
+        cae_engine: Any,
+        attribution_result: Any,
+    ) -> None:
+        """Publish the 2 CAE sensors (attribution + attribution_full)."""
+        # ---- attribution ---------------------------------------------
+        attrs = dict(_STATIC_ATTRS_ATTRIBUTION)
+        if cae_engine is None:
+            await self._safe_update(
+                ENTITY_ATTRIBUTION, "disabled", attrs,
+            )
+        else:
+            if attribution_result is None:
+                # CAE 加载成功但没有最新结果（启动期 / 当晚还未触发 → 默认
+                # ``nominal``，与 ``STATUS_NOMINAL`` 语义一致）。
+                state = "nominal"
+                attrs["explanation_zh"] = ""
+            else:
+                status = str(
+                    getattr(attribution_result, "status", "nominal")
+                )
+                allowed = {
+                    "ok", "nominal", "insufficient_data", "timeout",
+                }
+                state = status if status in allowed else "nominal"
+                top_factor = getattr(
+                    attribution_result, "top_factor", None,
+                )
+                if top_factor:
+                    attrs["top_factor"] = str(top_factor)
+                top_effect = getattr(
+                    attribution_result, "top_effect_pp", None,
+                )
+                if top_effect is not None:
+                    try:
+                        attrs["top_effect_pp"] = round(float(top_effect), 3)
+                    except (TypeError, ValueError):
+                        pass
+                cf_score = getattr(
+                    attribution_result, "counterfactual_score", None,
+                )
+                if cf_score is not None:
+                    try:
+                        attrs["counterfactual_score"] = round(
+                            float(cf_score), 2,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                explanation = getattr(
+                    attribution_result, "explanation_zh", "",
+                )
+                # explanation_zh 容易超过 255 字符，因此**只**放 attribute
+                # （design §3.5 契约：超长内容仅放 attribute）。
+                attrs["explanation_zh"] = (
+                    str(explanation)[:_HA_STATE_MAX_LEN]
+                )
+            await self._safe_update(ENTITY_ATTRIBUTION, state, attrs)
+
+        # ---- attribution_full ----------------------------------------
+        attrs = dict(_STATIC_ATTRS_ATTRIBUTION_FULL)
+        if cae_engine is None:
+            await self._safe_update(
+                ENTITY_ATTRIBUTION_FULL, "disabled", attrs,
+            )
+        else:
+            effects_payload: Dict[str, Any] = {}
+            if attribution_result is not None:
+                for eff in getattr(attribution_result, "effects", ()) or ():
+                    factor = getattr(eff, "factor", None)
+                    if not factor:
+                        continue
+                    to_dict = getattr(eff, "to_dict", None)
+                    if callable(to_dict):
+                        effects_payload[str(factor)] = to_dict()
+                    else:
+                        # 回退：手动展开 fields，保持 forward-compat。
+                        effects_payload[str(factor)] = {
+                            "effect_pp": getattr(eff, "effect_pp", None),
+                            "ci_low": getattr(eff, "ci_low", None),
+                            "ci_high": getattr(eff, "ci_high", None),
+                            "n_observations": getattr(
+                                eff, "n_observations", None,
+                            ),
+                            "is_significant": bool(
+                                getattr(eff, "is_significant", False)
+                            ),
+                        }
+            attrs["effects"] = effects_payload
+            await self._safe_update(ENTITY_ATTRIBUTION_FULL, "ok", attrs)
+
+    # -- PP sensor ------------------------------------------------------ #
+
+    async def _publish_v3_prior_sensors(
+        self,
+        *,
+        prior_repo: Any,
+        bucket_key: Optional[str],
+        fallback_level: Optional[int],
+        bucket_n_samples: Optional[int],
+    ) -> None:
+        """Publish the 1 PP-flavoured sensor (prior_status).
+
+        ``prior_weight`` belongs to BAO+PP and is published in
+        :meth:`_publish_v3_bao_sensors` because the effective value
+        depends on ``BayesianOptimizer._compute_prior_weight``."""
+        attrs = dict(_STATIC_ATTRS_PRIOR_STATUS)
+        if prior_repo is None:
+            await self._safe_update(
+                ENTITY_PRIOR_STATUS, "disabled", attrs,
+            )
+            return
+        # ``prior_repo is not None`` 表示 pickle 加载成功（PP.load 失败时
+        # 主入口直接传 ``None``）。fallback_level 区分 loaded / fallback。
+        if bucket_key:
+            attrs["bucket_key"] = str(bucket_key)[:_HA_STATE_MAX_LEN]
+        if fallback_level is not None:
+            attrs["fallback_level"] = int(fallback_level)
+        if bucket_n_samples is not None:
+            attrs["n_samples"] = int(bucket_n_samples)
+        if fallback_level is None:
+            # 还没第一次 lookup —— pickle 已加载但状态未知。
+            state = "loaded"
+        elif int(fallback_level) <= 0:
+            state = "loaded"
+        else:
+            state = "fallback"
+        await self._safe_update(ENTITY_PRIOR_STATUS, state, attrs)
+
+    # -- EMST sensors --------------------------------------------------- #
+
+    async def _publish_v3_predictor_sensors(
+        self,
+        *,
+        predictor: Any,
+    ) -> None:
+        """Publish the 3 EMST-flavoured sensors (predictor_health +
+        predictor_status + predictor_hit_rate_7d)."""
+        # ---- predictor_health ----------------------------------------
+        attrs = dict(_STATIC_ATTRS_PREDICTOR_HEALTH)
+        if predictor is None:
+            await self._safe_update(
+                ENTITY_PREDICTOR_HEALTH, "disabled", attrs,
+            )
+        else:
+            error_count = int(getattr(predictor, "error_count", 0) or 0)
+            attrs["error_count"] = error_count
+            last_inf_ms = getattr(predictor, "last_inference_ms", None)
+            if last_inf_ms is not None:
+                try:
+                    attrs["last_inference_ms"] = round(
+                        float(last_inf_ms), 2,
+                    )
+                except (TypeError, ValueError):
+                    pass
+            disabled_until = float(
+                getattr(predictor, "disabled_until", 0.0) or 0.0
+            )
+            if disabled_until > 0 and time.time() < disabled_until:
+                health = "degraded"
+            elif error_count > 0:
+                health = "degraded"
+            else:
+                health = "healthy"
+            await self._safe_update(
+                ENTITY_PREDICTOR_HEALTH, health, attrs,
+            )
+
+        # ---- predictor_status ----------------------------------------
+        attrs = dict(_STATIC_ATTRS_PREDICTOR_STATUS)
+        if predictor is None:
+            await self._safe_update(
+                ENTITY_PREDICTOR_STATUS, "disabled", attrs,
+            )
+        else:
+            raw_status = str(
+                getattr(predictor, "predictor_status", "active")
+            )
+            # 把 EMST 内部 ``healthy`` / ``degraded`` 映射到 sensor 表里
+            # 的 ``active`` —— design §3.5 行 12 的 enum 显式只允许
+            # ``active / auto_disabled / disabled``。
+            if raw_status == "auto_disabled":
+                state = "auto_disabled"
+                attrs["disabled_reason"] = "hit_rate_below_70pct_3_nights"
+            else:
+                state = "active"
+            disabled_until = float(
+                getattr(predictor, "disabled_until", 0.0) or 0.0
+            )
+            if disabled_until > 0:
+                attrs["disabled_until_iso"] = datetime.fromtimestamp(
+                    disabled_until, tz=timezone.utc,
+                ).isoformat()
+            await self._safe_update(
+                ENTITY_PREDICTOR_STATUS, state, attrs,
+            )
+
+        # ---- predictor_hit_rate_7d -----------------------------------
+        attrs = dict(_STATIC_ATTRS_PREDICTOR_HIT_RATE_7D)
+        if predictor is None:
+            await self._safe_update(
+                ENTITY_PREDICTOR_HIT_RATE_7D, "disabled", attrs,
+            )
+        else:
+            hit_rate_fn = getattr(predictor, "hit_rate_7d", None)
+            rate: Optional[float] = None
+            if callable(hit_rate_fn):
+                try:
+                    rate = hit_rate_fn()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "predictor.hit_rate_7d() raised: %s", exc,
+                    )
+                    rate = None
+            n_predictions = getattr(predictor, "n_predictions", None)
+            n_hits = getattr(predictor, "n_hits", None)
+            per_stage = getattr(predictor, "per_stage_hit_rate", None)
+            if n_predictions is not None:
+                attrs["n_predictions"] = int(n_predictions)
+            if n_hits is not None:
+                attrs["n_hits"] = int(n_hits)
+            if per_stage is not None:
+                attrs["per_stage"] = dict(per_stage)
+            if rate is None or not math.isfinite(float(rate)):
+                await self._safe_update(
+                    ENTITY_PREDICTOR_HIT_RATE_7D, "unknown", attrs,
+                )
+            else:
+                clipped = max(0.0, min(100.0, float(rate)))
+                await self._safe_update(
+                    ENTITY_PREDICTOR_HIT_RATE_7D,
+                    round(clipped, 1),
+                    attrs,
+                )
+
+    # -- aggregate summary --------------------------------------------- #
+
+    async def _publish_v3_health_summary(
+        self,
+        *,
+        bao: Any,
+        cae_engine: Any,
+        prior_repo: Any,
+        predictor: Any,
+    ) -> None:
+        """Aggregate the 4 module health states into a single sensor.
+
+        Mapping follows design.md §6.3:
+
+        * ``green`` — all 4 modules healthy
+        * ``amber`` — at least 1 degraded but none disabled
+        * ``red`` — at least 1 disabled while at least 1 healthy
+        * ``disabled`` — all 4 modules disabled (v2.1.0 equivalent)
+        """
+        statuses: Dict[str, str] = {
+            "bao": self._classify_bao_status(bao),
+            "cae": self._classify_cae_status(cae_engine),
+            "pp": self._classify_pp_status(prior_repo),
+            "emst": self._classify_emst_status(predictor),
+        }
+        all_disabled = all(s == "disabled" for s in statuses.values())
+        any_disabled = any(s == "disabled" for s in statuses.values())
+        any_degraded = any(s == "degraded" for s in statuses.values())
+        if all_disabled:
+            state = "disabled"
+        elif any_disabled:
+            state = "red"
+        elif any_degraded:
+            state = "amber"
+        else:
+            state = "green"
+
+        attrs = dict(_STATIC_ATTRS_V3_HEALTH_SUMMARY)
+        attrs.update(statuses)
+        await self._safe_update(ENTITY_V3_HEALTH_SUMMARY, state, attrs)
+
+    # ------------------------------------------------------------------ #
+    # v3.0.0 helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _extract_posterior_std(
+        bao: Any, last_recommendation: Any,
+    ) -> Optional[tuple[float, float, float]]:
+        """Return ``(σ_T, σ_H, σ_L)`` from the most recent recommendation.
+
+        Falls back to ``BayesianOptimizer.posterior_uncertainty`` at the
+        prior bucket centre (T=21°C, H=50%, L=5%) when no
+        recommendation is provided yet.  Returns :data:`None` if the
+        GP has too few observations or numerical-error has cleared the
+        Cholesky factor.
+        """
+        if last_recommendation is not None:
+            std = getattr(last_recommendation, "posterior_std", None)
+            if std is not None and len(std) == 3:
+                try:
+                    return (
+                        float(std[0]), float(std[1]), float(std[2]),
+                    )
+                except (TypeError, ValueError):
+                    pass
+        # 回退：直接探询 BAO 在 prior 桶中心点的 σ。注意 ``posterior_uncertainty``
+        # 在 N<5 时仍可调用（返回 σ_f），不会抛异常 — 与 design §3.2.4 一致。
+        post_fn = getattr(bao, "posterior_uncertainty", None)
+        if not callable(post_fn):
+            return None
+        try:
+            triple = post_fn(at=(21.0, 50.0, 5.0))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("posterior_uncertainty failed: %s", exc)
+            return None
+        if triple is None or len(triple) != 3:
+            return None
+        try:
+            return (float(triple[0]), float(triple[1]), float(triple[2]))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _resolve_prior_weight(
+        *,
+        bao: Any,
+        explicit: Optional[float],
+        rec: Any,
+    ) -> Optional[float]:
+        """Resolve the effective prior weight α for sensor publication.
+
+        Priority: explicit kwarg > recommendation.prior_weight >
+        ``bao._compute_prior_weight(N=bao.n_observations)`` when
+        available.  Returns :data:`None` if no source can be queried.
+        """
+        if explicit is not None:
+            try:
+                return float(explicit)
+            except (TypeError, ValueError):
+                return None
+        if rec is not None:
+            pw = getattr(rec, "prior_weight", None)
+            if pw is not None:
+                try:
+                    return float(pw)
+                except (TypeError, ValueError):
+                    pass
+        # 没有当晚 recommendation —— 用 BAO 当前 N 推算（仅 sensor 显示用，
+        # 不影响真实决策路径）。
+        compute_fn = getattr(bao, "_compute_prior_weight", None)
+        n_obs = getattr(bao, "n_observations", None)
+        if callable(compute_fn) and n_obs is not None:
+            try:
+                return float(compute_fn(n_obs=int(n_obs), lock=None))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("_compute_prior_weight fallback failed: %s", exc)
+        return None
+
+    @staticmethod
+    def _classify_bao_status(bao: Any) -> str:
+        if bao is None:
+            return "disabled"
+        ec = int(getattr(bao, "error_count", 0) or 0)
+        return "degraded" if ec >= 3 else "healthy"
+
+    @staticmethod
+    def _classify_cae_status(cae_engine: Any) -> str:
+        if cae_engine is None:
+            return "disabled"
+        ec = int(getattr(cae_engine, "error_count", 0) or 0)
+        return "degraded" if ec >= 3 else "healthy"
+
+    @staticmethod
+    def _classify_pp_status(prior_repo: Any) -> str:
+        if prior_repo is None:
+            return "disabled"
+        return "healthy"
+
+    @staticmethod
+    def _classify_emst_status(predictor: Any) -> str:
+        if predictor is None:
+            return "disabled"
+        raw = str(getattr(predictor, "predictor_status", "healthy"))
+        if raw == "auto_disabled":
+            return "disabled"
+        if raw == "degraded":
+            return "degraded"
+        return "healthy"
 
     async def _safe_update(
         self, entity_id: str, state: Any, attrs: Dict[str, Any],

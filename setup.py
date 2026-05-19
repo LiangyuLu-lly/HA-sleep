@@ -20,7 +20,7 @@ with open("requirements-runtime.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="sleep-classifier",
-    version="2.1.4",
+    version="3.0.0",
     description=(
         "Home Assistant Add-on: learns your ideal sleep environment "
         "from your own HA sleep-stage history and adapts the bedroom "

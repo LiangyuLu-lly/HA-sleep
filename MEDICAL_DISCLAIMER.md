@@ -160,6 +160,49 @@ any other sleep-related medical concern, seek professional medical care.
   [`commercial-readiness-v2.1.0/requirements.md`](.kiro/specs/commercial-readiness-v2.1.0/requirements.md)
   的 Requirement 5.6 / 5.7）。
 
+## 因果归因免责（v3.0.0+）
+
+> 适用版本：v3.0.0 起；仅当用户的 `causal_attribution_enabled = true`
+> （默认 true，可在 Add-on 配置中关闭）且 v3.0.0 因果归因模块
+> **Causal Attribution Engine（CAE）** 处于 `healthy` 时，本节适用。
+> 本节扩展自 [Requirement 6.5](.kiro/specs/algorithmic-moat-v3.0.0/requirements.md)
+> ：「归因解释为相关性 + 因果模型推断，非临床诊断」。
+
+v3.0.0 起，本 Add-on 在每晚醒来后会通过 CAE 在 Lovelace
+（`sensor.sleep_classifier_attribution_*`）暴露形如「今晚最大干扰是
+ X，因果效应估计 Y（95% CI `[a, b]`）」的归因解释。**该输出属于统计
+推断，不构成临床诊断、不替代医生意见**，具体边界如下：
+
+1. **本质是相关性 + 因果模型推断，不是临床诊断**：CAE 在 6 维干扰
+   因子（HRV、噪声、光、温度漂移、湿度漂移、体动）的有向无环图
+   （DAG）上做反事实推断，输入仅为消费级传感器读数 + 用户偏好历史，
+   **未经 PSG 校准**、**未做临床随机对照试验（RCT）**，亦未发表
+   peer-reviewed 论文。任何「这个因子让你今晚睡眠质量下降 X 分」
+   的结论，仅在 DAG 假设成立、可观测因子完整、IID（独立同分布）等
+   模型前提下有效；DAG 错配 / 混淆变量未观测 / 季节切换 / 重大生
+   活变化等情况都会让该结论偏离真实因果（与 §6「数据准确性的限制」
+   一致）。
+2. **95% CI 是 bootstrap 重采样的统计区间，不是临床置信度**：CAE
+   输出的 `[lower, upper]` 区间来自对历史 session 做 ≥ 200 次
+   bootstrap 重采样得到的 effect 分布的 2.5 / 97.5 百分位数，反映
+   **估计量自身的抽样波动**，**不**反映临床诊断或医疗决策的可靠性。
+   当区间跨 0 时，add-on 会自动在 `explanation_zh` 后追加「（统计
+   显著性弱）」提示；此时该因子的归因结论尤其不应被用于医学判断。
+3. **不构成医学建议**：用户**不应**基于「最大干扰是噪声」「呼吸率
+   因子 effect 显著」等 CAE 输出去自我诊断睡眠呼吸障碍、调整既有
+   处方、决定是否就医。任何持续性睡眠困扰仍应按 §3「何时必须就医」
+   的指引寻求专业医学帮助。
+4. **CAE 输出全部本地生成、永不上传**：归因结果落盘于
+   `/data/causal_factors.jsonl`，与原始 `install_id` 解耦（仅存
+   `sha256(install_id)`，R14.2）；详见 [`PRIVACY.md`](PRIVACY.md)
+   的「v3.0.0 算法栈数据流」段落（R14.3）。即便用户主动开启
+   `telemetry_enabled = true`，CAE 的因子值、effect、CI 也**不**进入
+   遥测 payload。
+
+简而言之：**CAE 是「为什么没睡好」的统计解释器，不是「你是否生病」
+的诊断器**。如出现 §3 列举的就医信号，应直接寻求专业医学帮助，与
+ CAE 当晚输出无关。
+
 ## 12. 联系方式
 
 - 一般问题：GitHub Issues 加 `[medical]` 标签。

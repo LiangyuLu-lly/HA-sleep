@@ -6,6 +6,25 @@
 
 ---
 
+## 为什么不一样
+
+不同于"按睡眠阶段套模板"的普通自动化，Sleep Classifier 自 v3.0.0 起在 v2.x 的 4 个时间尺度之上叠加了 4 个本地算法模块（默认开启，可独立关闭，加载或运行异常 ≥ 3 次自动停用并字节级回退到 v2.1.0 行为）。下文每条「数学保证」均带「在 X 假设下成立」前缀，仅描述算法的收敛 / 覆盖性质，**不构成临床疗效声明**（详见 [`MEDICAL_DISCLAIMER.md`](MEDICAL_DISCLAIMER.md)）。
+
+### 4 个算法护城河
+
+- **BAO — 贝叶斯优化器（GP + Thompson Sampling）**
+  用高斯过程后验取代单点中位数，按 `exploration_rate` 在环境参数空间中做探索 / 利用决策。**数学保证**：在 RBF kernel + 加性高斯噪声假设下成立，GP-UCB 类策略的累积 regret 满足次线性界 `O(√(T · γ_T))`，且 wind-down 与维度锁定时强制 exploit，不影响夜内稳定性。
+- **CAE — 因果归因引擎（do-calculus + bootstrap 95% CI）**
+  把"昨晚为什么睡得差"拆成 6 个因子（温度 / 湿度 / 亮度 / 风扇 / 入睡时间 / 工作日），用反事实推断给出每个因子的效应点估计 + 95% 置信区间。**数学保证**：在 6 因子 DAG 结构正确指定 + 观测 IID 假设下成立，合成 null 因子上 bootstrap 95% CI 覆盖率 ≥ 92%；置信区间跨 0 时归因解释会自动追加「（统计显著性弱）」。
+- **PP — 群体先验（8000+ 受试者夜 PSG 训练 prior）**
+  出厂内置由 [MESA + SHHS](docs/POPULATION_PRIOR.md) 共 ~8497 受试者夜聚合而成的 hierarchical Bayesian prior，按 `(age_band, sex, chronotype, season)` 4 维分桶（最大 180 桶）。**数学保证**：在桶内样本 `n_samples ≥ 50` 的假设下成立，N=0 新用户直接收敛到对应桶的群体后验均值，N=14 时 prior 权重指数衰减到 ≤ 0.1；样本不足时按 sex → chronotype → age_band 顺序逐层放宽，记录 `fallback_level ∈ {0,1,2,3}` 全程可审计。详见 [`docs/POPULATION_PRIOR.md`](docs/POPULATION_PRIOR.md)（含 NSRR DUA 摘要、桶定义、伦理审查说明）。
+- **EMST — 端侧 stage 预测（60 秒提前控制）**
+  INT8 量化 ONNX 模型（≤ 80 KB）在端侧推理未来 60 秒最可能 stage 的概率向量（AWAKE / LIGHT / DEEP / REM），单次推理 ≤ 50 ms。**数学保证**：在设备响应时间 ≥ 60 秒的假设下成立——LIGHT → DEEP 转换被高置信预测时（confidence ≥ 0.6），空调 / 电热毯 / 地暖会被提前 60 秒按 DEEP 的 setpoint 启动。**60 秒提前控制对快速响应设备（LED / 风扇 / 智能灯）无明显收益，仅对慢响应设备（空调 / 电热毯 / 地暖）有意义**；7 晚命中率 < 70% 持续 3 晚自动停用。
+
+> 🎁 **出厂带 8000+ 受试者 PSG 训练 prior**：v3.0.0 安装后首晚即可命中合适的桶级初值，新用户不必从零冷启动。Prior pickle 仅保存桶级聚合统计（均值 / 方差 / 样本数），不含任何个体可还原信息；数据来源、引用 DOI、桶定义、NSRR DUA 摘要详见 [`docs/POPULATION_PRIOR.md`](docs/POPULATION_PRIOR.md)。
+
+---
+
 ## 硬件需求 / Hardware Required
 
 > **还没有睡眠分期传感器？从这里开始。**

@@ -1,15 +1,26 @@
-# 开发 / CI 环境：runtime 依赖 + pytest 三件套。
+# 开发 / CI 环境：runtime 依赖 + pytest 三件套 + property-based 测试。
 #
-# 两层部署：
-#   * requirements-runtime.txt —— Add-on 镜像只装这一份（目前只有
-#     aiohttp；v1.6.0 已移除 numpy）。
-#   * requirements.txt（本文件）—— 工作站跑单测用，在 runtime 基础
-#     上加 pytest、pytest-asyncio、pytest-timeout。
+# 三层部署
+# --------
+#   * requirements-runtime.txt —— Add-on 镜像只装这一份（v3.0.0
+#     起含 aiohttp + numpy + scipy + onnxruntime）。
+#   * requirements.txt（本文件）—— 工作站跑单测 / CI 用，在 runtime
+#     基础上加 pytest 三件套 + hypothesis（PBT）。
+#   * requirements-train.txt —— **仅开发者机器**手动安装，包含
+#     PSG 数据集训练所需的 torch / pandas / pyEDFlib / onnx /
+#     matplotlib / nsrr-toolkit；**不进** add-on 镜像、**不**被本
+#     文件 ``-r`` 引用，避免 CI 安装过重（R12.5）。
 #
-# v1.3.0 起已删除本地 CNN-BiLSTM 模型与配套训练流水线，因此没有
-# ``requirements-train.txt``；Alpine Add-on 容器只安装
-# ``requirements-runtime.txt``。
+# 历史
+# ----
+# v1.3.0 起已删除本地 CNN-BiLSTM 模型与配套训练流水线；v3.0.0
+# 重新引入 ``requirements-train.txt`` 用于 Population Prior（MESA
+# / SHHS）与 Edge Micro-Stage Transformer（Sleep-EDF）的离线训
+# 练，但仍严格隔离于运行时镜像。
 -r requirements-runtime.txt
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pytest-timeout>=2.2.0
+# v3.0.0 新增 —— 仅 dev：property-based 测试框架，用于 P1–P20 等
+# 12+ 条 correctness property（不进 add-on 镜像）。
+hypothesis>=6.92.0,<7.0

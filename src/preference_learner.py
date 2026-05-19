@@ -24,6 +24,7 @@ session so the model survives restarts.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -33,11 +34,17 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.data_structures import SleepStage
 from src._time_utils import now_local
 from src._io_utils import atomic_write_json
+
+# v3.0.0 (Task 4.2): listener type alias for ``add_session_listener`` —
+# 任意接受 :class:`SleepSession` 的协程函数。listener 在 ``record_session``
+# 持久化成功后通过 ``asyncio.create_task`` fire-and-forget 调用，异常仅
+# log + 计数，不传播到调用方。
+SessionListener = Callable[["SleepSession"], Awaitable[None]]
 
 # ---------------------------------------------------------------------------
 # Tunables that don't belong in the per-user config (engineering defaults)
@@ -272,6 +279,23 @@ class PreferenceLearner:
         # In-memory cache; reloaded lazily.
         self._sessions: Optional[List[SleepSession]] = None
 
+        # ------------------------------------------------------------ #
+        # v3.0.0 — session listener hook (Task 4.2, Requirements 4.2 / #
+        # 11.3).  CausalAttribution 等下游模块通过 add_session_listener  #
+        # 注册回调，PreferenceLearner 在 ``record_session`` 持久化成功   #
+        # 后 fire-and-forget 调用所有 listener。listener 列表默认为空，   #
+        # 4 个 v3 flag 全 false 时不会有 listener 被注册，保持 v2.1.0    #
+        # 字节级等价回退（PR2 不变量）。                                #
+        # ------------------------------------------------------------ #
+        self._session_listeners: List[SessionListener] = []
+        # 已派发的 listener task 列表。主入口 SIGTERM 时通过           #
+        # ``pending_listener_tasks()`` 拿到此列表后 await asyncio.gather #
+        # 实现优雅退出（PR5）。                                        #
+        self._v3_tasks: List[asyncio.Task[Any]] = []
+        # listener 异常计数；用于上层观测 / 自动降级（design §3.4 错误  #
+        # 计数 → 降级状态机）。                                        #
+        self._listener_error_count: int = 0
+
     # ------------------------------------------------------------------ #
     # Persistence                                                        #
     # ------------------------------------------------------------------ #
@@ -365,6 +389,99 @@ class PreferenceLearner:
             "Recorded session %s (quality=%.1f, samples=%d)",
             session.session_id, session.quality_score, session.n_samples,
         )
+        # v3.0.0 — 持久化成功后 fire-and-forget 派发给所有 listener。
+        # 出错只 log + 计数，绝不传播到调用方（PR2：record_session 既有
+        # 签名/返回值不变；listener 失败不影响主调用栈）。
+        self._dispatch_session_listeners(session)
+
+    # ------------------------------------------------------------------ #
+    # v3.0.0 — Session listener hook (Task 4.2)                          #
+    # ------------------------------------------------------------------ #
+
+    def add_session_listener(self, listener: SessionListener) -> None:
+        """Register a coroutine listener invoked after a session is persisted.
+
+        Listener 签名：``async def listener(session: SleepSession) -> None``。
+        在 :meth:`record_session` 持久化成功后通过 ``asyncio.create_task``
+        fire-and-forget 调用，主调用栈不会被 listener 阻塞。listener 抛
+        异常仅 log + ``_listener_error_count`` += 1，不传播。
+
+        :param listener: 任意接受 :class:`SleepSession` 的 awaitable
+            callable；通常是 :class:`CausalAttributionEngine.on_session`。
+        """
+        if listener is None:  # 兜底：忽略 None（避免下游误传）
+            return
+        self._session_listeners.append(listener)
+
+    def pending_listener_tasks(self) -> Tuple["asyncio.Task[Any]", ...]:
+        """Return a snapshot of currently in-flight listener tasks.
+
+        主入口在 SIGTERM 时拿这份列表 ``await asyncio.gather(...)`` 实现
+        优雅退出（PR5）。返回 tuple 而非 list，调用方不能从外部 mutate
+        我们的内部清单。
+        """
+        # 顺手清理已经 done 的 task，避免 ``_v3_tasks`` 无界增长。
+        self._v3_tasks = [t for t in self._v3_tasks if not t.done()]
+        return tuple(self._v3_tasks)
+
+    @property
+    def listener_error_count(self) -> int:
+        """Listener 累计异常次数（用于 health sensor / 自动降级判断）。"""
+        return self._listener_error_count
+
+    def _dispatch_session_listeners(self, session: SleepSession) -> None:
+        """Schedule all registered listeners on the running event loop.
+
+        没有 listener、没有运行中的事件循环时直接 no-op；不抛异常。
+        每个 listener 单独包装在 ``_invoke_listener`` 中，互相隔离失败。
+        """
+        if not self._session_listeners:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # ``record_session`` 也可能从同步上下文（CLI 工具、测试）调用
+            # ——此时事件循环不存在，listener 直接跳过 + INFO 日志，不抛错
+            # 以保持 ``record_session`` 的同步调用兼容性（PR2）。
+            logger.info(
+                "record_session called outside running loop; "
+                "skipping %d listener(s) for session %s",
+                len(self._session_listeners), session.session_id,
+            )
+            return
+
+        # 顺手做一次 done-task 清理，避免 ``_v3_tasks`` 无界增长。
+        self._v3_tasks = [t for t in self._v3_tasks if not t.done()]
+
+        for listener in list(self._session_listeners):
+            task = loop.create_task(self._invoke_listener(listener, session))
+            self._v3_tasks.append(task)
+
+    async def _invoke_listener(
+        self,
+        listener: SessionListener,
+        session: SleepSession,
+    ) -> None:
+        """Run a single listener with full exception isolation.
+
+        listener 抛任意异常仅 log（warning）+ ``_listener_error_count``
+        += 1，绝不向上传播。``CancelledError`` 透传以支持 PR5 优雅退出
+        时的 ``task.cancel()`` 流程。
+        """
+        try:
+            await listener(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — listener 不受信，必须吃所有异常
+            self._listener_error_count += 1
+            logger.warning(
+                "Session listener %r raised for session %s "
+                "(total listener errors: %d)",
+                getattr(listener, "__qualname__", repr(listener)),
+                session.session_id,
+                self._listener_error_count,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------ #
     # Recommendation                                                     #
@@ -1004,6 +1121,7 @@ __all__ = [
     "SleepSession",
     "PreferenceConfig",
     "PreferenceLearner",
+    "SessionListener",
     "compute_quality_score",
     "stage_counts_from_sequence",
 ]

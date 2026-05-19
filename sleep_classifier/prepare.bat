@@ -82,6 +82,28 @@ for /d /r "%ROOTFS%" %%D in (__pycache__) do (
 if exist "%ROOTFS%\data\sleep-edf-telemetry" rmdir /s /q "%ROOTFS%\data\sleep-edf-telemetry"
 del /s /q "%ROOTFS%\*.pyc" >nul 2>&1
 
+:: v3.0.0 训练产物兜底镜像（R7.5 / R12.1）
+:: ----------------------------------------------------------------
+:: 上面的整树 xcopy training_config 已经把 population_prior.pickle /
+:: stage_predictor.onnx 拷贝到 rootfs；这里再显式 copy 一次是「腰带+
+:: 背带」式的防御，防止未来 .gitignore 把这两个产物排除后训练脚本生
+:: 成的本地副本被忽略。两个产物都是可选输入：缺失时 if exist 直接跳
+:: 过，不应让 prepare 挂掉。
+if not exist "%ROOTFS%\training_config" mkdir "%ROOTFS%\training_config"
+if exist "%REPO_ROOT%\training_config\population_prior.pickle" (
+    copy /y "%REPO_ROOT%\training_config\population_prior.pickle" "%ROOTFS%\training_config\" >nul
+)
+if exist "%REPO_ROOT%\training_config\stage_predictor.onnx" (
+    copy /y "%REPO_ROOT%\training_config\stage_predictor.onnx" "%ROOTFS%\training_config\" >nul
+)
+
+:: 非 strict 模式校验训练产物尺寸 + 嵌入 SHA-256（R7.5 / R12.1）
+:: ----------------------------------------------------------------
+:: 缺失文件以 WARN 级别提示，只有 size / sha256 违规才 exit 1。即便
+:: check_artifacts.py 返回非零也不要让 prepare 挂掉——本地 prepare 仅
+:: 提示，发布闸门留给 CI 的 --strict 调用。
+python "%REPO_ROOT%\scripts\check_artifacts.py"
+
 echo [prepare] done
 endlocal
 exit /b 0

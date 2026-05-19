@@ -55,3 +55,7 @@ data/*.csv
 # OS
 .DS_Store
 Thumbs.db
+
+# v3.0.0 — runtime install id (BAO Thompson Sampling RNG seed) generated
+# at first add-on launch.  Keep it private to each install.
+install_id.uuid

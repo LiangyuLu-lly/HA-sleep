@@ -67,7 +67,47 @@ jobs:
         run: python scripts/check_funding.py
 
       - name: Run pytest
-        run: pytest tests/ --timeout=60 --cov=src --cov=scripts --cov-fail-under=92 -q
+        run: pytest tests/ -m "not slow" --timeout=60 --cov=src --cov=scripts --cov-fail-under=92 -q
+
+  # -------------------------------------------------------------------- #
+  # v3.0.0 algorithmic-moat：``slow`` 矩阵分支。
+  # BAO/CAE/EMST 引入的训练管线 + property-based 端到端测试本质上慢
+  # （bootstrap 1000 次、长时段 SIGTERM drain、ONNX 推理 latency 抽样
+  # 等），不能塞进默认 60 秒超时。这里独立成 job，pytest 只跑 ``slow``
+  # 标记的用例，超时放大到 600 秒。
+  # -------------------------------------------------------------------- #
+  slow-tests:
+    name: Slow tests (pytest -m slow)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-runtime.txt
+            requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run slow pytest suite
+        run: |
+          # Exit code 5 = "no tests collected" — tolerated until v3.0.0 PBT
+          # tests (P19 / P20) land with the ``slow`` marker.
+          set +e
+          pytest tests/ -m "slow" --timeout=600 -q
+          rc=$?
+          if [ "$rc" -eq 5 ]; then
+            echo "::notice::No tests matched -m 'slow' yet; skipping."
+            exit 0
+          fi
+          exit "$rc"
 
   # -------------------------------------------------------------------- #
   # Catches the #1 gotcha: forgetting to mirror src/ → addons/.../rootfs/
