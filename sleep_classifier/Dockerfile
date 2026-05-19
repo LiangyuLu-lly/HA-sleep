@@ -162,19 +162,19 @@ RUN set -eux; \
     python3 -m pip install --no-cache-dir --break-system-packages --only-binary=:all: -r /app/requirements-runtime.txt; \
     # v3.0.0: onnxruntime has no musllinux wheel but DOES have a
     # manylinux_2_17_aarch64 wheel.  With gcompat installed above,
-    # the manylinux wheel runs fine on Alpine.  We use
-    # --platform manylinux_2_17_aarch64 + --target to force pip to
-    # grab the glibc wheel, then move it into site-packages.
-    # On amd64 the regular install works directly (musllinux_1_2_x86_64
-    # wheel exists).
-    python3 -m pip install --no-cache-dir --break-system-packages \
+    # the manylinux wheel runs fine on Alpine.  We download with
+    # explicit platform flags then install the .whl directly.
+    # On amd64 the regular install would also work (musllinux wheel
+    # exists) but we use the same flow for consistency.
+    mkdir -p /tmp/ort && \
+    python3 -m pip download --no-cache-dir --no-deps \
+        --only-binary=:all: \
         --platform manylinux_2_17_aarch64 \
-        --only-binary=:all: --target /tmp/ort \
-        'onnxruntime>=1.16,<2.0' 2>/dev/null \
-    && cp -r /tmp/ort/* "$(python3 -c 'import site; print(site.getsitepackages()[0])')/" \
+        --python-version 312 --abi cp312 \
+        -d /tmp/ort 'onnxruntime>=1.16,<2.0' 2>/dev/null \
+    && python3 -m pip install --no-cache-dir --break-system-packages \
+        --no-deps /tmp/ort/*.whl 2>/dev/null \
     && rm -rf /tmp/ort \
-    || python3 -m pip install --no-cache-dir --break-system-packages \
-        'onnxruntime>=1.16,<2.0' 2>/dev/null \
     || true; \
     find /usr -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
