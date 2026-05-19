@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sleep-classifier"
-version = "3.0.0"
+version = "3.0.1"
 description = "Home Assistant Add-on: learns your ideal sleep environment from HA sleep-stage history and adapts the bedroom across the night"
 readme = "README.md"
 requires-python = ">=3.10"
