@@ -133,7 +133,7 @@ RUN echo "=== /app contents (build-time) ===" && ls -la /app && echo "=== /app/s
 # CACHE_BUST: 改这行可以强制 buildx 重做整个 RUN（绕过 layer cache）。
 # 当 Supervisor 的 buildx cache 残留了旧 layer 时，
 # 增加 v 后缀（v3、v4...）即可让所有缓存全部 miss。
-ARG CACHE_BUST=v4
+ARG CACHE_BUST=v5
 RUN set -eux; \
     echo "cache-bust=${CACHE_BUST}"; \
     sed -i 's|https\?://dl-cdn.alpinelinux.org|https://mirrors.aliyun.com|g' /etc/apk/repositories || true; \
