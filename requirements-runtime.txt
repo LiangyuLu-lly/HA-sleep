@@ -34,10 +34,5 @@ numpy>=1.24,<2.0
 #              cholesky 分解后的线性系统，实现 RBF kernel GP 后验）
 scipy>=1.10,<2.0
 # onnxruntime: EMST（端侧 INT8 量化 stage_predictor.onnx 推理）
-# NOTE: onnxruntime has NO musllinux aarch64 wheel on PyPI.  The
-# Dockerfile installs it best-effort in a separate step with || true;
-# src/stage_predictor.py gracefully degrades when the import fails
-# (R11.3).  This line is commented out so the main pip install doesn't
-# fail on Alpine aarch64.  On amd64 the Dockerfile's separate step
-# succeeds.
-# onnxruntime>=1.16,<2.0
+# v3.0.0+ Debian glibc base：onnxruntime 直接装 manylinux wheel 即可。
+onnxruntime>=1.16,<2.0
