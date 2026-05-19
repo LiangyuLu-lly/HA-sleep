@@ -156,6 +156,11 @@ RUN set -eux; \
     python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn --break-system-packages 2>/dev/null || true; \
     python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip wheel; \
     python3 -m pip install --no-cache-dir --break-system-packages --only-binary=:all: -r /app/requirements-runtime.txt; \
+    # v3.0.0: onnxruntime has no musllinux aarch64 wheel on PyPI.
+    # Install it best-effort; src/stage_predictor.py gracefully degrades
+    # when the import fails (R11.3).  On amd64 the wheel exists and this
+    # succeeds; on aarch64 it silently skips.
+    python3 -m pip install --no-cache-dir --break-system-packages 'onnxruntime>=1.16,<2.0' 2>/dev/null || true; \
     find /usr -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
     find /usr -name '*.pyc' -delete 2>/dev/null || true; \
