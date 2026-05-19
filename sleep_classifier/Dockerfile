@@ -140,10 +140,8 @@ RUN set -eux; \
     apk add --no-cache \
         python3 py3-pip \
         bash jq tini \
-        # v3.0.0: gcompat provides the glibc shim layer that lets
-        # manylinux wheels (onnxruntime) run on Alpine musl.
-        # libstdc++ is needed by the onnxruntime C++ runtime.
-        gcompat libstdc++; \
+        gcompat libstdc++ \
+        wget; \
     # Supervisor 已加载的 AppArmor profile 缓存了旧版本，新 profile 文件
     # 修改后必须完全 uninstall + reinstall 才会被内核重载——但 uninstall
     # 会丢 /data。这里用兼容方案：
@@ -160,49 +158,43 @@ RUN set -eux; \
     python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn --break-system-packages 2>/dev/null || true; \
     python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip wheel; \
     python3 -m pip install --no-cache-dir --break-system-packages --only-binary=:all: -r /app/requirements-runtime.txt; \
-    # v3.0.0: onnxruntime has no musllinux wheel but DOES have a
-    # manylinux_2_27 wheel.  With gcompat installed above, the
-    # manylinux glibc-ABI wheel runs on Alpine musl.  We fetch the
-    # exact wheel URL with wget (bypassing pip's platform resolver
-    # which would refuse to install a manylinux wheel on a musllinux
-    # interpreter), then `pip install <local.whl>` which skips the
-    # platform check entirely.
-    #
-    # Pinning to onnxruntime 1.20.1 cp312 because:
-    #   * cp312 matches Alpine 3.20's python3 (3.12.x).
-    #   * 1.20.1 is the latest stable that still ships a 2_27 wheel
-    #     (older glibc baseline = better gcompat compat).
-    #   * Both aarch64 and x86_64 wheels are ~12 MB; well under our
-    #     96 MB image cap (numpy + scipy + ort = ~50 MB total).
-    ORT_BASE_URL=https://files.pythonhosted.org/packages; \
-    case "$(uname -m)" in \
-      aarch64) \
-        ORT_WHL_PATH="c5/9d/a42a84e10f1744dd27c6f2f9280cc3fb98f869dd19b7cd042e391ee2ab61/onnxruntime-1.20.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"; \
-        ORT_SHA256="f1f56e898815963d6dc4ee1c35fc6c36506466eff6d16f3cb9848cea4e8c8172"; \
-        ;; \
-      x86_64) \
-        ORT_WHL_PATH="47/42/2f71f5680834688a9c81becbe5c5bb996fd33eaed5c66ae0606c3b1d6a02/onnxruntime-1.20.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"; \
-        ORT_SHA256="bb71a814f66517a65628c9e4a2bb530a6edd2cd5d87ffa0af0f6f773a027d99e"; \
-        ;; \
-      *) \
-        echo "[onnxruntime] unsupported arch $(uname -m); EMST disabled."; \
-        ORT_WHL_PATH=""; \
-        ;; \
-    esac; \
-    if [ -n "$ORT_WHL_PATH" ]; then \
-      apk add --no-cache --virtual .ort-build wget; \
-      ORT_WHL=$(basename "$ORT_WHL_PATH"); \
-      wget -q -O "/tmp/$ORT_WHL" "$ORT_BASE_URL/$ORT_WHL_PATH"; \
-      echo "$ORT_SHA256  /tmp/$ORT_WHL" | sha256sum -c -; \
-      python3 -m pip install --no-cache-dir --break-system-packages "/tmp/$ORT_WHL"; \
-      rm -f "/tmp/$ORT_WHL"; \
-      apk del .ort-build; \
-      python3 -c "import onnxruntime; print('[onnxruntime] OK', onnxruntime.__version__)"; \
-    fi; \
+    # v3.0.0: onnxruntime install handled in a separate RUN block
+    # below — this keeps the failure mode loud and isolated.
     find /usr -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
     find /usr -name '*.pyc' -delete 2>/dev/null || true; \
     rm -rf /root/.cache /var/cache/apk/* /tmp/*
+
+# v3.0.0: install onnxruntime by directly downloading the manylinux
+# wheel from PyPI (bypasses pip resolver's musllinux-only constraint).
+# gcompat above provides glibc ABI shim so the wheel runs on Alpine.
+# This RUN block fails the build if onnxruntime can't be imported,
+# so silent regression is impossible.
+ARG BUILD_ARCH
+ARG ORT_CACHE_BUST=v1
+RUN set -eux; \
+    echo "ort-cache-bust=${ORT_CACHE_BUST}, arch=${BUILD_ARCH}, uname=$(uname -m)"; \
+    case "$(uname -m)" in \
+      aarch64) \
+        ORT_URL="https://files.pythonhosted.org/packages/c5/9d/a42a84e10f1744dd27c6f2f9280cc3fb98f869dd19b7cd042e391ee2ab61/onnxruntime-1.20.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"; \
+        ORT_SHA256="f1f56e898815963d6dc4ee1c35fc6c36506466eff6d16f3cb9848cea4e8c8172"; \
+        ;; \
+      x86_64) \
+        ORT_URL="https://files.pythonhosted.org/packages/47/42/2f71f5680834688a9c81becbe5c5bb996fd33eaed5c66ae0606c3b1d6a02/onnxruntime-1.20.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"; \
+        ORT_SHA256="bb71a814f66517a65628c9e4a2bb530a6edd2cd5d87ffa0af0f6f773a027d99e"; \
+        ;; \
+      *) \
+        echo "[onnxruntime] unsupported arch $(uname -m); skipping EMST."; \
+        exit 0; \
+        ;; \
+    esac; \
+    cd /tmp; \
+    wget -q "$ORT_URL"; \
+    ORT_WHL=$(basename "$ORT_URL"); \
+    echo "${ORT_SHA256}  ${ORT_WHL}" | sha256sum -c -; \
+    python3 -m pip install --no-cache-dir --break-system-packages "${ORT_WHL}"; \
+    rm -f "${ORT_WHL}"; \
+    python3 -c "import onnxruntime; print('[onnxruntime] OK', onnxruntime.__version__)"
 
 # Web UI for picking entity_ids out of HA's live state.  Lives inside the
 # container, served via Supervisor Ingress.  See web_ui.py for details.
