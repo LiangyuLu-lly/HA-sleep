@@ -133,13 +133,17 @@ RUN echo "=== /app contents (build-time) ===" && ls -la /app && echo "=== /app/s
 # CACHE_BUST: 改这行可以强制 buildx 重做整个 RUN（绕过 layer cache）。
 # 当 Supervisor 的 buildx cache 残留了旧 layer 时，
 # 增加 v 后缀（v3、v4...）即可让所有缓存全部 miss。
-ARG CACHE_BUST=v5
+ARG CACHE_BUST=v6
 RUN set -eux; \
     echo "cache-bust=${CACHE_BUST}"; \
     sed -i 's|https\?://dl-cdn.alpinelinux.org|https://mirrors.aliyun.com|g' /etc/apk/repositories || true; \
     apk add --no-cache \
         python3 py3-pip \
-        bash jq tini; \
+        bash jq tini \
+        # v3.0.0: gcompat provides the glibc shim layer that lets
+        # manylinux wheels (onnxruntime) run on Alpine musl.
+        # libstdc++ is needed by the onnxruntime C++ runtime.
+        gcompat libstdc++; \
     # Supervisor 已加载的 AppArmor profile 缓存了旧版本，新 profile 文件
     # 修改后必须完全 uninstall + reinstall 才会被内核重载——但 uninstall
     # 会丢 /data。这里用兼容方案：
@@ -156,11 +160,22 @@ RUN set -eux; \
     python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn --break-system-packages 2>/dev/null || true; \
     python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip wheel; \
     python3 -m pip install --no-cache-dir --break-system-packages --only-binary=:all: -r /app/requirements-runtime.txt; \
-    # v3.0.0: onnxruntime has no musllinux aarch64 wheel on PyPI.
-    # Install it best-effort; src/stage_predictor.py gracefully degrades
-    # when the import fails (R11.3).  On amd64 the wheel exists and this
-    # succeeds; on aarch64 it silently skips.
-    python3 -m pip install --no-cache-dir --break-system-packages 'onnxruntime>=1.16,<2.0' 2>/dev/null || true; \
+    # v3.0.0: onnxruntime has no musllinux wheel but DOES have a
+    # manylinux_2_17_aarch64 wheel.  With gcompat installed above,
+    # the manylinux wheel runs fine on Alpine.  We use
+    # --platform manylinux_2_17_aarch64 + --target to force pip to
+    # grab the glibc wheel, then move it into site-packages.
+    # On amd64 the regular install works directly (musllinux_1_2_x86_64
+    # wheel exists).
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        --platform manylinux_2_17_aarch64 \
+        --only-binary=:all: --target /tmp/ort \
+        'onnxruntime>=1.16,<2.0' 2>/dev/null \
+    && cp -r /tmp/ort/* "$(python3 -c 'import site; print(site.getsitepackages()[0])')/" \
+    && rm -rf /tmp/ort \
+    || python3 -m pip install --no-cache-dir --break-system-packages \
+        'onnxruntime>=1.16,<2.0' 2>/dev/null \
+    || true; \
     find /usr -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \
     find /usr -name '*.pyc' -delete 2>/dev/null || true; \
