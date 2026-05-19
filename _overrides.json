@@ -1,8 +1,0 @@
-{
-  "sleep_stage_source": "sensor.degree_smh013_eb3f_realtime_sleepstage",
-  "temperature_source": "sensor.bme680_indoor_temperature",
-  "humidity_source": "sensor.bme680_indoor_humidity",
-  "light_targets": ["light.aimore_230915_5469_light"],
-  "climate_target": "climate.xiaomi_mt6_de77_air_conditioner",
-  "fan_target": "fan.xiaomi_mt6_de77_air_fresh"
-}
