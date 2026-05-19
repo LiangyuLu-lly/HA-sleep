@@ -1,0 +1,16 @@
+{
+  "sleep_stage_source": "sensor.degree_smh013_eb3f_realtime_sleepstage",
+  "temperature_source": "sensor.bme680_indoor_temperature",
+  "humidity_source": "sensor.bme680_indoor_humidity",
+  "light_targets": ["light.aimore_230915_5469_light"],
+  "climate_target": "climate.xiaomi_mt6_de77_air_conditioner",
+  "fan_target": "fan.xiaomi_mt6_de77_air_fresh",
+  "dry_run": true,
+  "bayesian_optimizer_enabled": true,
+  "causal_attribution_enabled": true,
+  "population_prior_enabled": true,
+  "stage_predictor_enabled": true,
+  "user_profile_age_band": "26-35",
+  "user_profile_sex": "M",
+  "user_profile_chronotype": "neutral"
+}
