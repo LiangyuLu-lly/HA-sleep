@@ -2,7 +2,7 @@
 import asyncio, json, os, aiohttp
 
 TOKEN = os.environ["HA_TOKEN"]
-TARGET = "3.0.0"
+TARGET = "3.0.2"
 SLUG = "0c614d55_sleep_classifier"
 
 async def main():

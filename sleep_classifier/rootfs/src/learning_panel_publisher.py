@@ -32,7 +32,7 @@ inside the learner / controller, not here.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Tuple
 
 from src.preference_learner import EnvironmentParams, PreferenceLearner
 from src.sleep_debt import SleepDebtTracker
@@ -90,7 +90,22 @@ class LearningPanelPublisher:
         try:
             sessions = self.learner.sessions()
             tracker = SleepDebtTracker.from_sessions(self.profile, sessions)
-            plan = tracker.plan_recovery(wake_window=self.wake_window_strs)
+            # ``SleepDebtTracker.plan_recovery`` expects either ``None``
+            # 或一个 2-tuple ``("HH:MM", "HH:MM")``。Add-on 配置里
+            # wake_window_start / wake_window_end 默认空字符串，
+            # 此处会得到空列表 / 含空串的列表 — 任意非法形态都用
+            # ``None`` 兜底，避免 ``IndexError``（v3.0.2 修复）。
+            ww: Optional[Tuple[str, str]] = None
+            if (
+                len(self.wake_window_strs) >= 2
+                and self.wake_window_strs[0]
+                and self.wake_window_strs[1]
+            ):
+                ww = (
+                    str(self.wake_window_strs[0]),
+                    str(self.wake_window_strs[1]),
+                )
+            plan = tracker.plan_recovery(wake_window=ww)
             await self.publisher.publish_debt(
                 plan.current_debt_hours,
                 severity=plan.severity.value,

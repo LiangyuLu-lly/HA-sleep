@@ -330,6 +330,20 @@ class HomeAssistantClient:
             body["attributes"] = dict(attributes)
         path = f"{self.REST_PREFIX}/states/{entity_id}"
         raw = await self._rest("POST", path, json_body=body)
+        # HA 在首次 publish 时偶尔会返回空 body（content_length=0）/ None，
+        # 而不是预期的 entity dict — 这并不代表写入失败：HA 已经把状态
+        # 落到 state machine 里。我们在这种情况下合成一个最小可用的
+        # HAEntity（state + attributes 来自我们刚提交的 body），避免
+        # publisher 把这种成功路径误标成 ``Unexpected payload`` warning
+        # 而把整个 v3 sensor 的发布链路打成 failure（v3.0.2 修复）。
+        if raw is None:
+            return HAEntity(
+                entity_id=entity_id,
+                state=str(state),
+                attributes=dict(attributes or {}),
+                last_changed=None,
+                last_updated=None,
+            )
         if not isinstance(raw, dict):
             raise HAAPIError(
                 f"Unexpected /api/states/{entity_id} payload (not a dict)"

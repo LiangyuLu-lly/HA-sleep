@@ -788,7 +788,9 @@ class SleepStatePublisher:
                 )
             )
             attrs["skipped_by_capability"] = ordered
-        truncated = (summary or "—")[:255]
+        # 使用 ASCII 占位符避免 HA 前端在某些编码路径下把
+        # U+2014 显示成乱码 ``â`` (v3.0.2 修复)。
+        truncated = (summary or "-")[:255]
         await self._safe_update(ENTITY_LAST_ACTION, truncated, attrs)
 
     # ------------------------------------------------------------------ #
@@ -870,7 +872,7 @@ class SleepStatePublisher:
         await self._safe_update(ENTITY_QUALITY, 0.0, _STATIC_ATTRS_QUALITY)
         await self._safe_update(ENTITY_DURATION, 0, _STATIC_ATTRS_DURATION)
         await self._safe_update(
-            ENTITY_LAST_ACTION, "—", _STATIC_ATTRS_LAST_ACTION,
+            ENTITY_LAST_ACTION, "-", _STATIC_ATTRS_LAST_ACTION,
         )
         # Natural-sleep entities — these are still safe to publish even
         # if the user didn't enable the corresponding module: the values
@@ -1539,12 +1541,33 @@ class SleepStatePublisher:
     ) -> None:
         """Aggregate the 4 module health states into a single sensor.
 
-        Mapping follows design.md §6.3:
+        Semantics (revised v3.0.2 — fresh-install friendly):
 
-        * ``green`` — all 4 modules healthy
-        * ``amber`` — at least 1 degraded but none disabled
-        * ``red`` — at least 1 disabled while at least 1 healthy
-        * ``disabled`` — all 4 modules disabled (v2.1.0 equivalent)
+        * ``green``  — at least 2 modules healthy and no module degraded.
+                       Modules disabled because their training artifact
+                       (PP pickle / EMST ONNX) is missing are treated as
+                       a graceful no-op rather than a fault — typical
+                       state on a brand-new install with no offline
+                       training run.
+        * ``amber``  — at least 1 module reports ``degraded``
+                       (error_count ≥ 3 / EMST auto-disabled).
+        * ``red``    — fewer than 2 healthy modules and not the
+                       all-disabled case below; indicates a real
+                       configuration problem (e.g. BAO + CAE both
+                       failed to initialise).
+        * ``disabled`` — all 4 modules disabled (config-disabled or
+                         no artifacts present); equivalent to v2.1.0
+                         behaviour.
+
+        Why not "any disabled ⇒ red"?
+            On first install PP (cohort prior pickle) and EMST
+            (stage_predictor.onnx) are intentionally absent — these
+            artefacts ship out-of-band via the optional offline
+            training pipeline. BAO + CAE alone still deliver the
+            adaptive-learning value proposition; flagging the system
+            as ``red`` would scare new users into thinking the add-on
+            is broken when it is in fact running its supported
+            cold-start configuration.
         """
         statuses: Dict[str, str] = {
             "bao": self._classify_bao_status(bao),
@@ -1552,17 +1575,18 @@ class SleepStatePublisher:
             "pp": self._classify_pp_status(prior_repo),
             "emst": self._classify_emst_status(predictor),
         }
-        all_disabled = all(s == "disabled" for s in statuses.values())
-        any_disabled = any(s == "disabled" for s in statuses.values())
-        any_degraded = any(s == "degraded" for s in statuses.values())
-        if all_disabled:
+        n_disabled = sum(1 for s in statuses.values() if s == "disabled")
+        n_degraded = sum(1 for s in statuses.values() if s == "degraded")
+        n_healthy = sum(1 for s in statuses.values() if s == "healthy")
+
+        if n_disabled == len(statuses):
             state = "disabled"
-        elif any_disabled:
-            state = "red"
-        elif any_degraded:
+        elif n_degraded >= 1:
             state = "amber"
-        else:
+        elif n_healthy >= 2:
             state = "green"
+        else:
+            state = "red"
 
         attrs = dict(_STATIC_ATTRS_V3_HEALTH_SUMMARY)
         attrs.update(statuses)
