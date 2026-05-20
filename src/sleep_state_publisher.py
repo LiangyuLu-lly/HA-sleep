@@ -759,6 +759,7 @@ class SleepStatePublisher:
         *,
         executed: bool,
         skipped_by_capability: Optional[Dict[str, int]] = None,
+        live_state_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Surface the most recent device action (or 'planned only' in dry-run).
 
@@ -775,6 +776,12 @@ class SleepStatePublisher:
         ``set_temperature`` support — a strong hint that the
         entity_id in Configuration is pointing at a preset-only
         device and should be rebound.
+
+        ``live_state_stats`` (v1.7.1) is an opaque dict from
+        :class:`src.live_state_cache.LiveStateCache.stats` that exposes
+        unavailable / overridden / auto-turn-on counts so the user can
+        diagnose "why didn't my AC move" from the Lovelace attributes
+        panel.  Surfaced as a sub-attribute; ``None`` skips publication.
         """
         attrs = dict(_STATIC_ATTRS_LAST_ACTION)
         attrs["executed"] = bool(executed)
@@ -788,6 +795,10 @@ class SleepStatePublisher:
                 )
             )
             attrs["skipped_by_capability"] = ordered
+        if live_state_stats:
+            # Surface as a sub-attribute, not flattened, so future fields
+            # added by ``LiveStateCache.stats`` show up automatically.
+            attrs["live_state_stats"] = dict(live_state_stats)
         # 使用 ASCII 占位符避免 HA 前端在某些编码路径下把
         # U+2014 显示成乱码 ``â`` (v3.0.2 修复)。
         truncated = (summary or "-")[:255]

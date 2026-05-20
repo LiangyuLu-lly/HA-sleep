@@ -133,7 +133,7 @@ RUN echo "=== /app contents (build-time) ===" && ls -la /app && echo "=== /app/s
 # CACHE_BUST: 改这行可以强制 buildx 重做整个 RUN（绕过 layer cache）。
 # 当 Supervisor 的 buildx cache 残留了旧 layer 时，
 # 增加 v 后缀（v3、v4...）即可让所有缓存全部 miss。
-ARG CACHE_BUST=v8
+ARG CACHE_BUST=v9
 RUN set -eux; \
     echo "cache-bust=${CACHE_BUST}"; \
     # v3.0.0: switched to python:3.12-slim-bookworm (Debian glibc) so
@@ -151,8 +151,21 @@ RUN set -eux; \
     # PyPI on failure (|| true).
     python3 -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages 2>/dev/null || true; \
     python3 -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn --break-system-packages 2>/dev/null || true; \
-    python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip wheel; \
-    python3 -m pip install --no-cache-dir --break-system-packages -r /app/requirements-runtime.txt; \
+    # 网络超时 / retries 加到 v3.0.2：Pi 4B 国内网络访问 files.pythonhosted.org
+    # 偶发 ReadTimeout，--timeout=300 + --retries=10 显著提高单次 build
+    # 成功率。--prefer-binary 避免在 wheel 取不到时 fallback 到 sdist
+    # 而在 add-on 镜像里跑 numpy 源码编译（aarch64 上要 30+ min 还会 OOM）。
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        --timeout 300 --retries 10 --upgrade pip wheel; \
+    # 第一次尝试用清华源；失败则 fall back 到 PyPI 官方源（aliyun 也行，
+    # 但 onnxruntime aarch64 wheel 仅 PyPI 主仓和 pythonhosted 有完整副本）。
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        --timeout 300 --retries 10 --prefer-binary \
+        -r /app/requirements-runtime.txt \
+        || python3 -m pip install --no-cache-dir --break-system-packages \
+        --timeout 300 --retries 10 --prefer-binary \
+        --index-url https://pypi.org/simple \
+        -r /app/requirements-runtime.txt; \
     # Strip Python cache to keep image slim.
     find /usr -type d -name '__pycache__' -prune \
         -exec rm -rf {} + 2>/dev/null || true; \

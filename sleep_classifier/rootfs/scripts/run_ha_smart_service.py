@@ -1430,181 +1430,19 @@ class SmartSleepService:
     ) -> None:
         try:
             while not self.stop_event.is_set():
-                stage, conf = engine.infer()
-
-                # v1.6.3 — stale stage-source guard.  If the bound HA
-                # entity hasn't reported a new state in a long time
-                # (wearable dead, integration broken, user took the
-                # watch off), the subscriber keeps returning the last
-                # known stage forever.  Without this guard the
-                # controller would lock the bedroom into e.g. DEEP
-                # setpoints for a whole day; the session-lifecycle
-                # state machine would miss the wake transition and
-                # never close the session.  When stale we:
-                #   1) skip updating stage_counts / stage_sequence —
-                #      we don't know what's really happening;
-                #   2) skip the effective-stage substitution + apply()
-                #      — don't push new setpoints based on stale data;
-                #   3) still publish to HA (with is_stale=true) so the
-                #      user sees "tracker not reporting" on the chip;
-                #   4) log once per edge transition, not every tick.
-                is_stale = engine.is_stale()
-                if is_stale and not self._stage_source_was_stale:
-                    logger.warning(
-                        _L(
-                            "Stage source %s has not updated for > %d s; "
-                            "pausing control loop until the tracker comes "
-                            "back online.",
-                            "Stage source stale / 睡眠阶段源已断开: %s has not updated for > %d s; "
-                            "pausing control loop.",
-                        ),
-                        engine.stage_entity_id,
-                        int(engine._stale_after),
+                # v3.0.2 修复：在 inference 主体外层包一层 try/except，让任何
+                # 单 tick 内的非预期异常（例如 publisher API 漂移、HA 调用瞬
+                # 时 500）只丢这一 tick 而不让整个 task 静默崩溃。BLE001
+                # 是有意的 ── 我们要求所有未知错误都进日志而不是默默吞掉，
+                # 而且日志带 stack trace 方便远程 debug。
+                try:
+                    await self._inference_tick(engine, controller, ha)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:    # noqa: BLE001
+                    logger.exception(
+                        "inference_loop tick raised; continuing after backoff",
                     )
-                    self._stage_source_was_stale = True
-                elif not is_stale and self._stage_source_was_stale:
-                    logger.info(
-                        _L(
-                            "Stage source %s is live again — resuming control.",
-                            "Stage source live again / 睡眠阶段源已恢复: %s — resuming control.",
-                        ),
-                        engine.stage_entity_id,
-                    )
-                    self._stage_source_was_stale = False
-
-                if is_stale:
-                    # Still publish the diagnostic sensor so HA shows
-                    # the staleness, but skip every mutation.
-                    if self.publisher is not None:
-                        await self.publisher.publish_stage(
-                            stage, conf,
-                            env_temperature_c=self.last_env.temperature_c,
-                            env_humidity_pct=self.last_env.humidity_pct,
-                            env_brightness_pct=self.last_env.brightness_pct,
-                        )
-                    try:
-                        await asyncio.wait_for(
-                            self.stop_event.wait(),
-                            timeout=self.args.infer_interval,
-                        )
-                        return     # stop_event fired — exit the task
-                    except asyncio.TimeoutError:
-                        continue   # next tick — re-check is_stale
-
-                # v1.6.3 — session lifecycle state machine.  Runs BEFORE
-                # counts are updated so the first tick past onset/wake
-                # doesn't bleed into the next session.  Note that
-                # _maybe_advance_session_lifecycle may call
-                # _persist_session + _reset_session_state mid-tick
-                # when it detects a wake.
-                self._maybe_advance_session_lifecycle(stage, controller)
-
-                if self._in_session:
-                    self.stage_counts[stage.name] = (
-                        self.stage_counts.get(stage.name, 0) + 1
-                    )
-                    self.stage_sequence.append(stage)
-                    # v1.5.0 — snapshot the env at every stage *entry*
-                    # so the preference learner can later compute
-                    # personalised AWAKE/LIGHT/DEEP/REM deltas.
-                    self._track_per_stage_env(stage)
-                    # v1.7.0 — append a breathing-signal sample per
-                    # tick so the apnea detector has ~30 s hops to
-                    # look at.  No-op when apnea disabled or the
-                    # relevant rate/amplitude entities aren't bound.
-                    self.apnea.tick()
-
-                logger.info(
-                    "infer stage=%s conf=%.2f  env(T=%s H=%s)%s",
-                    stage.name, conf,
-                    self.last_env.temperature_c, self.last_env.humidity_pct,
-                    "" if self._in_session else "  [pre-onset]",
-                )
-                # v1.4.0 — wind-down substitution.  When the user is
-                # still AWAKE but we are within `wind_down_minutes` of
-                # the learned bedtime, the controller treats them as
-                # already in LIGHT so the AC starts pre-cooling before
-                # they actually lie down.  The published sensor still
-                # reflects the truthful AWAKE — only the control path
-                # substitutes, so users aren't confused by a sensor
-                # that lies.
-                effective_stage = self._effective_control_stage(stage)
-                # v3.0.0 task 8.1 — refresh the slot the BAO setpoint
-                # provider closure reads on every call.  We feed the
-                # *raw* stage (not effective) so BAO sees what the user
-                # actually is doing, and then BAO's own
-                # ``in_wind_down`` flag picks up the substitution
-                # signal independently.
-                self._v3_update_runtime_state(current_stage=stage)
-                if effective_stage is not stage:
-                    logger.info(
-                        "  wind-down active: controlling as %s instead of %s",
-                        effective_stage.name, stage.name,
-                    )
-                # v1.6.4 — feed the controller a freshness-masked copy
-                # of last_env.  Stale sensors appear as None and the
-                # deadband logic already treats None as "unknown"
-                # (always-outside-deadband), so we fall back to stage
-                # defaults rather than fighting a reading that's no
-                # longer reflective of the room.
-                safe_env = self._safe_last_env()
-                actions = await controller.apply(effective_stage, safe_env)
-                if actions:
-                    logger.info("  → %d HA action(s) planned", len(actions))
-
-                # v3.0.0 (task 8.2) — auto-degradation health check.
-                # After the controller tick (which invokes BAO.recommend
-                # via the setpoint provider), inspect error counts on
-                # all v3 modules and disable any that hit the threshold.
-                await self._v3_check_health_and_degrade(controller)
-
-                # Mirror diagnostics back to HA so users see the result on
-                # their Lovelace dashboard.  Failures are swallowed inside
-                # the publisher so they never break the inference loop.
-                if self.publisher is not None:
-                    await self.publisher.publish_stage(
-                        stage, conf,
-                        env_temperature_c=self.last_env.temperature_c,
-                        env_humidity_pct=self.last_env.humidity_pct,
-                        env_brightness_pct=self.last_env.brightness_pct,
-                    )
-                    await self.publisher.publish_duration(
-                        time.time() - self.session_started_at,
-                    )
-                    if actions:
-                        # ``actions`` is a list of ControlAction dataclasses
-                        # (see src/smart_environment_controller.py), not a
-                        # list of dicts — calling .get() on a dataclass
-                        # raises AttributeError.  A dataclass fallback is
-                        # robust against any future field renames.
-                        first = actions[0]
-                        summary = (
-                            f"{first.domain}.{first.service} → "
-                            f"{first.entity_id}"
-                        )
-                        await self.publisher.publish_last_action(
-                            summary,
-                            executed=not self.ctrl_cfg.dry_run,
-                            # v1.6.2: let the user see *why* some
-                            # devices aren't being controlled even
-                            # though they're bound in Configuration.
-                            skipped_by_capability=controller.capability_stats(),
-                            # v1.7.1: show unavailability / override /
-                            # auto-turn-on counts so the user can
-                            # diagnose "why didn't my AC move"
-                            # without reading the Supervisor log.
-                            live_state_stats=self.live_state.stats(),
-                        )
-
-                # --- Smart-wake tick -------------------------------- #
-                await self._wake_tick(ha, stage, conf)
-
-                # --- Soundscape tick -------------------------------- #
-                await self._soundscape_tick(ha, stage, conf)
-
-                # v1.3.0: no rolling buffer to checkpoint anymore — the
-                # subscriber holds a single most-recent stage so a power
-                # loss costs at most one ``infer_interval`` tick.
 
                 try:
                     await asyncio.wait_for(
@@ -1615,6 +1453,199 @@ class SmartSleepService:
                     continue
         except asyncio.CancelledError:
             raise
+
+    async def _inference_tick(
+        self,
+        engine: _Engine,
+        controller: SmartEnvironmentController,
+        ha: "HomeAssistantClient",
+    ) -> None:
+        """One tick of the inference loop.
+
+        Extracted from :meth:`_task_inference_loop` in v3.0.2 so any
+        unexpected exception inside this body propagates to the outer
+        loop's catch-all logger and the loop survives — instead of the
+        task silently dying mid-night because (e.g.) a publisher API
+        signature changed.
+        """
+        if self.stop_event.is_set():
+            return
+        stage, conf = engine.infer()
+
+        # v1.6.3 — stale stage-source guard.  If the bound HA
+        # entity hasn't reported a new state in a long time
+        # (wearable dead, integration broken, user took the
+        # watch off), the subscriber keeps returning the last
+        # known stage forever.  Without this guard the
+        # controller would lock the bedroom into e.g. DEEP
+        # setpoints for a whole day; the session-lifecycle
+        # state machine would miss the wake transition and
+        # never close the session.  When stale we:
+        #   1) skip updating stage_counts / stage_sequence —
+        #      we don't know what's really happening;
+        #   2) skip the effective-stage substitution + apply()
+        #      — don't push new setpoints based on stale data;
+        #   3) still publish to HA (with is_stale=true) so the
+        #      user sees "tracker not reporting" on the chip;
+        #   4) log once per edge transition, not every tick.
+        is_stale = engine.is_stale()
+        if is_stale and not self._stage_source_was_stale:
+            logger.warning(
+                _L(
+                    "Stage source %s has not updated for > %d s; "
+                    "pausing control loop until the tracker comes "
+                    "back online.",
+                    "Stage source stale / 睡眠阶段源已断开: %s has not updated for > %d s; "
+                    "pausing control loop.",
+                ),
+                engine.stage_entity_id,
+                int(engine._stale_after),
+            )
+            self._stage_source_was_stale = True
+        elif not is_stale and self._stage_source_was_stale:
+            logger.info(
+                _L(
+                    "Stage source %s is live again — resuming control.",
+                    "Stage source live again / 睡眠阶段源已恢复: %s — resuming control.",
+                ),
+                engine.stage_entity_id,
+            )
+            self._stage_source_was_stale = False
+
+        if is_stale:
+            # Still publish the diagnostic sensor so HA shows
+            # the staleness, but skip every mutation.
+            if self.publisher is not None:
+                await self.publisher.publish_stage(
+                    stage, conf,
+                    env_temperature_c=self.last_env.temperature_c,
+                    env_humidity_pct=self.last_env.humidity_pct,
+                    env_brightness_pct=self.last_env.brightness_pct,
+                )
+            # v3.0.2 修复：is_stale 分支以前在这里 await + return /
+            # continue。提取成 _inference_tick 后由外层 _task_inference_loop
+            # 统一控制每 tick 间隔，本函数只 ``return`` 即可让外层 sleep
+            # 一个 infer_interval 然后 re-check。
+            return
+
+        # v1.6.3 — session lifecycle state machine.  Runs BEFORE
+        # counts are updated so the first tick past onset/wake
+        # doesn't bleed into the next session.  Note that
+        # _maybe_advance_session_lifecycle may call
+        # _persist_session + _reset_session_state mid-tick
+        # when it detects a wake.
+        self._maybe_advance_session_lifecycle(stage, controller)
+
+        if self._in_session:
+            self.stage_counts[stage.name] = (
+                self.stage_counts.get(stage.name, 0) + 1
+            )
+            self.stage_sequence.append(stage)
+            # v1.5.0 — snapshot the env at every stage *entry*
+            # so the preference learner can later compute
+            # personalised AWAKE/LIGHT/DEEP/REM deltas.
+            self._track_per_stage_env(stage)
+            # v1.7.0 — append a breathing-signal sample per
+            # tick so the apnea detector has ~30 s hops to
+            # look at.  No-op when apnea disabled or the
+            # relevant rate/amplitude entities aren't bound.
+            self.apnea.tick()
+
+        logger.info(
+            "infer stage=%s conf=%.2f  env(T=%s H=%s)%s",
+            stage.name, conf,
+            self.last_env.temperature_c, self.last_env.humidity_pct,
+            "" if self._in_session else "  [pre-onset]",
+        )
+        # v1.4.0 — wind-down substitution.  When the user is
+        # still AWAKE but we are within `wind_down_minutes` of
+        # the learned bedtime, the controller treats them as
+        # already in LIGHT so the AC starts pre-cooling before
+        # they actually lie down.  The published sensor still
+        # reflects the truthful AWAKE — only the control path
+        # substitutes, so users aren't confused by a sensor
+        # that lies.
+        effective_stage = self._effective_control_stage(stage)
+        # v3.0.0 task 8.1 — refresh the slot the BAO setpoint
+        # provider closure reads on every call.  We feed the
+        # *raw* stage (not effective) so BAO sees what the user
+        # actually is doing, and then BAO's own
+        # ``in_wind_down`` flag picks up the substitution
+        # signal independently.
+        self._v3_update_runtime_state(current_stage=stage)
+        if effective_stage is not stage:
+            logger.info(
+                "  wind-down active: controlling as %s instead of %s",
+                effective_stage.name, stage.name,
+            )
+        # v1.6.4 — feed the controller a freshness-masked copy
+        # of last_env.  Stale sensors appear as None and the
+        # deadband logic already treats None as "unknown"
+        # (always-outside-deadband), so we fall back to stage
+        # defaults rather than fighting a reading that's no
+        # longer reflective of the room.
+        safe_env = self._safe_last_env()
+        actions = await controller.apply(effective_stage, safe_env)
+        if actions:
+            logger.info("  → %d HA action(s) planned", len(actions))
+
+        # v3.0.0 (task 8.2) — auto-degradation health check.
+        # After the controller tick (which invokes BAO.recommend
+        # via the setpoint provider), inspect error counts on
+        # all v3 modules and disable any that hit the threshold.
+        await self._v3_check_health_and_degrade(controller)
+
+        # Mirror diagnostics back to HA so users see the result on
+        # their Lovelace dashboard.  Failures are swallowed inside
+        # the publisher so they never break the inference loop.
+        if self.publisher is not None:
+            await self.publisher.publish_stage(
+                stage, conf,
+                env_temperature_c=self.last_env.temperature_c,
+                env_humidity_pct=self.last_env.humidity_pct,
+                env_brightness_pct=self.last_env.brightness_pct,
+            )
+            await self.publisher.publish_duration(
+                time.time() - self.session_started_at,
+            )
+            if actions:
+                # ``actions`` is a list of ControlAction dataclasses
+                # (see src/smart_environment_controller.py), not a
+                # list of dicts — calling .get() on a dataclass
+                # raises AttributeError.  A dataclass fallback is
+                # robust against any future field renames.
+                first = actions[0]
+                summary = (
+                    f"{first.domain}.{first.service} → "
+                    f"{first.entity_id}"
+                )
+                await self.publisher.publish_last_action(
+                    summary,
+                    executed=not self.ctrl_cfg.dry_run,
+                    # v1.6.2: let the user see *why* some
+                    # devices aren't being controlled even
+                    # though they're bound in Configuration.
+                    skipped_by_capability=controller.capability_stats(),
+                    # v1.7.1: show unavailability / override /
+                    # auto-turn-on counts so the user can
+                    # diagnose "why didn't my AC move"
+                    # without reading the Supervisor log.
+                    live_state_stats=self.live_state.stats(),
+                )
+
+        # --- Smart-wake tick -------------------------------- #
+        await self._wake_tick(ha, stage, conf)
+
+        # --- Soundscape tick -------------------------------- #
+        await self._soundscape_tick(ha, stage, conf)
+
+        # v1.3.0: no rolling buffer to checkpoint anymore — the
+        # subscriber holds a single most-recent stage so a power
+        # loss costs at most one ``infer_interval`` tick.
+
+        # v3.0.2 修复：tick 间隔由 _task_inference_loop 外层统一控
+        # 制；本函数返回后外层会 ``await asyncio.wait_for(stop_event,
+        # timeout=infer_interval)``。
 
     async def _task_session_checkpoint(
         self,
